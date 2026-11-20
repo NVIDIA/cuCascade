@@ -151,7 +151,8 @@ class fused_lane_set {
    * @brief Issue @p read on a free lane, chosen round-robin.
    *
    * Returns false, with @p read untouched, only when no lane is free.  Otherwise @p read is
-   * moved into the lane and its outcome is reported by a later @ref reap or @ref drain --
+   * moved into the lane (its @c copies then holds an empty buffer the caller may reuse for
+   * the next read, so recycling a @c lane_read allocates nothing) and its outcome is reported by a later @ref reap or @ref drain --
    * including failures at submission (a refused @c cuFileReadAsync, a failed enqueue of the
    * gate wait, a copy or the completion, or a malformed read), which are reported only once
    * the lane is known idle, and which also call @c wake.  Never throws.  @p read.gate need

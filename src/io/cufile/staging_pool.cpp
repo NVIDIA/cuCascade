@@ -240,8 +240,18 @@ staging_usage staging_pool::usage(int device) const noexcept
 
 std::size_t reserve_staging(int device, std::size_t slots, config const& cfg) noexcept
 {
+  return reserve_staging_slots(
+    device, slots, cfg.staging_slot_bytes(), cfg.max_staging_bytes_per_device, true);
+}
+
+std::size_t reserve_staging_slots(int device,
+                                  std::size_t slots,
+                                  std::size_t slot_bytes,
+                                  std::size_t cap_bytes,
+                                  bool require_registered) noexcept
+{
   auto& pool       = detail::staging_pool::instance();
-  auto const bytes = cfg.staging_slot_bytes();
+  auto const bytes = slot_bytes;
   std::vector<detail::staging_slot> taken;
   try {
     taken.reserve(slots);
@@ -251,7 +261,7 @@ std::size_t reserve_staging(int device, std::size_t slots, config const& cfg) no
   // Leasing takes free slots first, so leasing `slots` and handing them back
   // leaves at least that many registered slots on the device.
   for (std::size_t i = 0; i < slots; ++i) {
-    auto slot = pool.acquire(device, bytes, cfg.max_staging_bytes_per_device, true);
+    auto slot = pool.acquire(device, bytes, cap_bytes, require_registered);
     if (!slot) { break; }
     taken.push_back(slot);
   }

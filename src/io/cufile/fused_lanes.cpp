@@ -322,7 +322,12 @@ bool fused_lane_set::submit(lane_read&& read) noexcept
   auto const bit   = lane_bit(index);
   auto& l          = _lanes[index];
   _free &= ~bit;
+  // Hand the lane's previous copy buffer back through `read`, so a caller that recycles its
+  // lane_read allocates nothing per read.
+  auto spare  = std::move(l.read.copies);
   l.read      = std::move(read);
+  read.copies = std::move(spare);
+  read.copies.clear();
   l.resubmits = 0;
   l.started   = std::chrono::steady_clock::now();
   if (l.read.gate != nullptr) _gated |= bit;

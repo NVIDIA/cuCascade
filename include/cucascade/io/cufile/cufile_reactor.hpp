@@ -19,6 +19,7 @@
 #pragma once
 
 #include <cucascade/cuda/event.hpp>
+#include <cucascade/io/concurrent_queue.hpp>
 #include <cucascade/io/cufile/config.hpp>
 #include <cucascade/io/io_request.hpp>
 #include <cucascade/io/object_identity.hpp>
@@ -30,7 +31,9 @@
 
 #include <cufile.h>
 
+#include <array>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -169,6 +172,14 @@ struct reactor_placement {
   int device{-1};         ///< Home GPU (CUDA ordinal); -1 = serves any device.
   std::vector<int> cpus;  ///< CPUs the worker is pinned to; empty = not pinned.
   int numa_node{-1};      ///< The home GPU's NUMA node; -1 = unknown.
+  /// May serve device reads through fused stream lanes; honoured only when
+  /// @c config::fused_reads is enabled.  A flat pool leaves it on for every reactor; a
+  /// planned pool sets it on its lane reactors only.
+  bool fused_lanes{true};
+  /// May serve host reads through cuFile's batch API; honoured only when
+  /// @c config::host_batch is enabled.  A flat pool leaves it on for every reactor; a
+  /// planned pool sets it on its batch reactors only.
+  bool host_batch{true};
 };
 
 /**
@@ -202,27 +213,70 @@ struct reactor_stats {
   /// Device-write bodies cuFile wrote from the caller's source directly.
   std::uint64_t direct_writes{0};
   std::uint64_t direct_write_bytes{0};  ///< Their bytes.
+  /// Fused-lane reads (@c cuFileReadAsync into a lane slot + device copies) that succeeded.
+  std::uint64_t lane_reads{0};
+  std::uint64_t lane_bytes{0};         ///< Their caller payload bytes.
+  std::uint64_t lane_issued_bytes{0};  ///< Bytes their aligned windows covered.
+  std::uint64_t lane_parts{0};         ///< Caller pieces they served (one per unfused slice).
+  std::uint64_t lane_resubmits{0};     ///< Short-read continuations they needed.
+  /// Lane reads that failed and were re-served through the synchronous paths (also counted
+  /// in @c cufile_failures).
+  std::uint64_t lane_failures{0};
+  /// Of @c lane_reads, those whose copies waited on the GPU for the caller's stream.
+  std::uint64_t lane_gated_reads{0};
+  std::uint64_t batch_reads{0};     ///< Host reads served by cuFile batch entries.
+  std::uint64_t batch_bytes{0};     ///< Their bytes.
+  std::uint64_t batch_failures{0};  ///< Batch entries that failed or came back short.
+
+  /// Every counter, so the arithmetic below cannot miss one.
+  [[nodiscard]] static constexpr auto fields() noexcept
+  {
+    return std::array{&reactor_stats::staged_reads,       &reactor_stats::staged_bytes,
+                      &reactor_stats::early_staged_reads, &reactor_stats::fused_slices,
+                      &reactor_stats::direct_reads,       &reactor_stats::direct_bytes,
+                      &reactor_stats::posix_device_reads, &reactor_stats::posix_device_bytes,
+                      &reactor_stats::host_reads,         &reactor_stats::host_bytes,
+                      &reactor_stats::cufile_failures,    &reactor_stats::parked_slices,
+                      &reactor_stats::staged_writes,      &reactor_stats::staged_write_bytes,
+                      &reactor_stats::direct_writes,      &reactor_stats::direct_write_bytes,
+                      &reactor_stats::lane_reads,         &reactor_stats::lane_bytes,
+                      &reactor_stats::lane_issued_bytes,  &reactor_stats::lane_parts,
+                      &reactor_stats::lane_resubmits,     &reactor_stats::lane_failures,
+                      &reactor_stats::lane_gated_reads,   &reactor_stats::batch_reads,
+                      &reactor_stats::batch_bytes,        &reactor_stats::batch_failures};
+  }
 
   reactor_stats& operator+=(reactor_stats const& other) noexcept
   {
-    staged_reads += other.staged_reads;
-    staged_bytes += other.staged_bytes;
-    early_staged_reads += other.early_staged_reads;
-    fused_slices += other.fused_slices;
-    direct_reads += other.direct_reads;
-    direct_bytes += other.direct_bytes;
-    posix_device_reads += other.posix_device_reads;
-    posix_device_bytes += other.posix_device_bytes;
-    host_reads += other.host_reads;
-    host_bytes += other.host_bytes;
-    cufile_failures += other.cufile_failures;
-    parked_slices += other.parked_slices;
-    staged_writes += other.staged_writes;
-    staged_write_bytes += other.staged_write_bytes;
-    direct_writes += other.direct_writes;
-    direct_write_bytes += other.direct_write_bytes;
+    for (auto const field : fields()) {
+      this->*field += other.*field;
+    }
     return *this;
   }
+
+  /// Subtract @p other field by field, saturating at 0 (for per-interval deltas).
+  reactor_stats& operator-=(reactor_stats const& other) noexcept
+  {
+    for (auto const field : fields()) {
+      this->*field = this->*field > other.*field ? this->*field - other.*field : 0;
+    }
+    return *this;
+  }
+
+  [[nodiscard]] friend reactor_stats operator+(reactor_stats lhs, reactor_stats const& rhs) noexcept
+  {
+    lhs += rhs;
+    return lhs;
+  }
+
+  /// @p lhs minus @p rhs field by field, saturating at 0.
+  [[nodiscard]] friend reactor_stats operator-(reactor_stats lhs, reactor_stats const& rhs) noexcept
+  {
+    lhs -= rhs;
+    return lhs;
+  }
+
+  bool operator==(reactor_stats const&) const = default;
 };
 
 /**
@@ -307,6 +361,28 @@ struct reactor_stats {
  * synchronization; the caller owns the destination (or source) memory until the
  * future settles.
  *
+ * Fused stream lanes (@c config::fused_reads, on reactors whose placement allows them):
+ * @c cufile_ioctx packs the device reads of a request into 4 KiB-aligned windows of at most
+ * a lane slot (@c plan_fused_reads), and the reactor issues each such lane read as one
+ * @c cuFileReadAsync into a free lane's registered slot on the lane's own registered stream,
+ * followed on that stream by the device-to-device copies into the caller's destinations
+ * (waiting on the GPU for the caller's stream when its gate is still pending) and a stream
+ * callback.  The worker keeps up to a lane set's capacity of such reads in flight per device
+ * and settles each when its callback reported it: a lane read's slice settles only once its
+ * copies completed, so the contract is the synchronous path's (host-complete, the bytes
+ * visible from any stream).  A short read is continued on its lane; a failed one is re-served
+ * through the synchronous paths (and counted in @c lane_failures); after
+ * @c fused_read_config::failure_limit consecutive failures the reactor stops using lanes for
+ * @c fused_read_config::cooldown_s.  A lane read that finds no free lane waits in a
+ * one-element backlog and the worker stops taking slices until a lane frees, so excess reads
+ * wait in the queue, where priorities still apply.
+ *
+ * One wait point: the worker sleeps only on a semaphore that @ref enqueue, lane completion
+ * callbacks, write-interval wakeups and @ref shutdown signal (coalesced by a pending flag),
+ * with a timeout that is the idle wait when nothing is in flight, the poll interval while
+ * copies, parked slices or polled lanes need polling, and 1 ms while only callback-driven
+ * lanes are in flight.
+ *
  * Fragmented (cache-chunk) destinations are not served: the reactor's pinned
  * scratch is not shaped like cache chunks, so it opts out of the prefetching
  * cache (@c reactor_traits::supports_vector_host_read is false).
@@ -365,13 +441,11 @@ class cufile_reactor {
     void ensure_engine(int device) noexcept;
     void notify_engines() const noexcept;
 
-    /// The registered-staging cap of @p device, in bytes (0 = none).
-    [[nodiscard]] std::size_t staging_cap(int device) const noexcept
-    {
-      auto const index = static_cast<std::size_t>(device);
-      return device >= 0 && index < _staging_caps.size() ? _staging_caps[index]
-                                                         : _config.max_staging_bytes_per_device;
-    }
+    /// The registered-staging cap of @p device, in bytes (0 = none), as the staging pool
+    /// enforces it: the plan's cap for a planned device (it includes the fused-read lanes);
+    /// otherwise @c config::max_staging_bytes_per_device plus the lanes' registered bytes
+    /// (@c fused_lane_staging_bytes), 0 staying 0.
+    [[nodiscard]] std::size_t staging_cap(int device) const noexcept;
 
    private:
     config _config;
@@ -606,16 +680,21 @@ class cufile_reactor {
     ~engine_publication() { publish(); }
   };
 
-  /// Turn one slice into cuFile reads or a POSIX pread.  Never throws --
+  /// Turn one slice into a lane read, cuFile reads or a POSIX pread.  Never throws --
   /// errors are reported through the slice's completion and coordinator.  A
   /// device-only slice whose stream still has queued work is parked (see
   /// @ref park_if_stream_busy) unless @p stream_ready says its gate passed.
+  /// @p allow_lanes false keeps a slice off the fused lanes (a lane read's fallback);
+  /// @p lane_owned is set when a lane (or the lane backlog) took the slice, whose queued
+  /// bytes then stay counted until its lane read settles.
   void dispatch_slice(std::shared_ptr<const io_object> const& obj,
                       prepared_io_slice slice,
                       std::shared_ptr<grouped_coordinator> const& coordinator,
                       bool stream_ready = false,
                       bool* handed_off = nullptr,
-                      engine_publication* publication = nullptr) noexcept;
+                      engine_publication* publication = nullptr,
+                      bool allow_lanes = true,
+                      bool* lane_owned = nullptr) noexcept;
 
   /// When the slice's stream still has queued work, record an event on it and
   /// park the slice in @ref _waiting; returns whether it was parked.  For a slice
@@ -797,6 +876,16 @@ class cufile_reactor {
     std::atomic<std::uint64_t> staged_write_bytes{0};
     std::atomic<std::uint64_t> direct_writes{0};
     std::atomic<std::uint64_t> direct_write_bytes{0};
+    std::atomic<std::uint64_t> lane_reads{0};
+    std::atomic<std::uint64_t> lane_bytes{0};
+    std::atomic<std::uint64_t> lane_issued_bytes{0};
+    std::atomic<std::uint64_t> lane_parts{0};
+    std::atomic<std::uint64_t> lane_resubmits{0};
+    std::atomic<std::uint64_t> lane_failures{0};
+    std::atomic<std::uint64_t> lane_gated_reads{0};
+    std::atomic<std::uint64_t> batch_reads{0};
+    std::atomic<std::uint64_t> batch_bytes{0};
+    std::atomic<std::uint64_t> batch_failures{0};
   };
   counters _counters;
 
@@ -839,6 +928,63 @@ class cufile_reactor {
   std::vector<std::unique_ptr<device_staging>> _staging;
   /// Staged scatter copies still waiting for their caller's stream.
   std::size_t _staged_inflight{0};
+
+  // -- The one wait point ----------------------------------------------------
+
+  /// Wake the worker from any thread (enqueue, lane callbacks on CUDA's callback thread,
+  /// write wakeups, shutdown).  The caller publishes its work first.
+  void notify_worker() noexcept;
+
+  /// Sleep until @ref notify_worker, at most @p timeout_us.  Returns at once when a source
+  /// already has work: a stop request, completed asynchronous I/O, or -- with
+  /// @p requests_count -- a queued request.
+  void wait_for_work(std::int64_t timeout_us,
+                     bool requests_count,
+                     std::stop_token const& stop_token) noexcept;
+
+  lightweight_semaphore _wake;
+  std::atomic<bool> _wake_pending{false};
+
+  // -- Asynchronous I/O facilities (fused lanes; the host batch plugs in here) --------
+
+  /// Fused-lane state (defined in the source); null unless fused reads are enabled and the
+  /// placement allows them.  Worker-only.
+  struct lane_state;
+  std::unique_ptr<lane_state> _lanes;
+
+  /// Reap every asynchronous facility once (no blocking): settle finished lane reads,
+  /// refill lanes from the backlog, run fallbacks.  Called every worker pass.
+  void reap_async() noexcept;
+  /// Whether asynchronous I/O is in flight (lane reads issued and not yet reaped).
+  [[nodiscard]] bool async_in_flight() const noexcept;
+  /// Whether an asynchronous facility has completions to reap now.
+  [[nodiscard]] bool async_completions_pending() const noexcept;
+  /// Whether a slice waits for an asynchronous facility (the lane backlog): the worker then
+  /// takes no more slices.
+  [[nodiscard]] bool async_backlog_pending() const noexcept;
+  /// How long the worker may sleep while asynchronous I/O is in flight (-1: no constraint).
+  [[nodiscard]] std::int64_t async_wait_limit_us() const noexcept;
+  /// Shutdown: cancel the backlog, wait for every read in flight and settle it (no
+  /// fallback), and release the facilities.  Worker thread, after the loop.
+  void drain_async(grouped_coordinator::error_type const& terminal_error) noexcept;
+
+  /// What @ref try_lane_read did with a slice.
+  enum class lane_dispatch : std::uint8_t {
+    declined,  ///< not a lane read here: the synchronous paths serve it (slice untouched)
+    parked,    ///< parked behind its caller's stream (see @ref park_on_gate)
+    taken,     ///< issued on a lane, or waiting in the lane backlog
+  };
+
+  /// Serve @p slice through a lane of @p device_id when it is a lane read and lanes are
+  /// usable.  The calling thread's current device must be @p device_id.
+  /// @throws as @ref dispatch_slice's body does, only while the slice is still the caller's.
+  [[nodiscard]] lane_dispatch try_lane_read(std::shared_ptr<const io_object> const& obj,
+                                   cufile_io_object const& file,
+                                   prepared_io_slice& slice,
+                                   std::shared_ptr<grouped_coordinator> const& coordinator,
+                                   int device_id,
+                                   std::size_t clamped,
+                                   bool stream_ready);
 };
 
 }  // namespace cucascade::io::cufile

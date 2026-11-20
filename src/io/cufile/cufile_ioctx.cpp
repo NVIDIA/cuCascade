@@ -18,8 +18,10 @@
 
 #include <cucascade/cuda/event.hpp>
 #include <cucascade/error.hpp>
+#include <cucascade/io/cufile/cufile_api.hpp>
 #include <cucascade/io/cufile/cufile_ioctx.hpp>
 #include <cucascade/io/cufile/device_engine.hpp>
+#include <cucascade/io/cufile/fused_read_plan.hpp>
 #include <cucascade/io/cufile/cufile_reactor.hpp>
 #include <cucascade/io/cufile/placement.hpp>
 #include <cucascade/io/cufile/platform.hpp>
@@ -108,15 +110,31 @@ namespace {
     }
     return reactors;
   }
+  // Per GPU its lane reactors first, then its synchronous ones; the batch reactors, shared
+  // by every GPU, after all groups.  Roles are exclusive in a planned pool.
   for (auto const& group : plan.groups) {
+    for (std::size_t i = 0; i < group.lane_reactors; ++i) {
+      reactor_placement placement{group.device, group.cpus, group.numa_node, true, false};
+      reactors.push_back(std::make_unique<cufile_reactor>(
+        ctx,
+        "cufile-g" + std::to_string(group.device) + "-lane" + std::to_string(i),
+        std::move(placement)));
+      ++index;
+    }
     for (std::size_t i = 0; i < group.n_reactors; ++i) {
-      reactor_placement placement{group.device, group.cpus, group.numa_node};
+      reactor_placement placement{group.device, group.cpus, group.numa_node, false, false};
       reactors.push_back(std::make_unique<cufile_reactor>(
         ctx,
         "cufile-g" + std::to_string(group.device) + "-" + std::to_string(i),
         std::move(placement)));
       ++index;
     }
+  }
+  for (std::size_t i = 0; i < plan.host_batch_reactors; ++i) {
+    reactor_placement placement{-1, {}, -1, false, true};
+    reactors.push_back(std::make_unique<cufile_reactor>(
+      ctx, "cufile-batch-" + std::to_string(i), std::move(placement)));
+    ++index;
   }
   return reactors;
 }
@@ -239,14 +257,39 @@ cufile_ioctx::cufile_ioctx(pool_plan plan, std::shared_ptr<cufile_reactor::react
   }
   std::size_t first = 0;
   for (auto const& group : _plan.groups) {
-    _groups.push_back(group_range{group.device, first, group.n_reactors});
-    first += group.n_reactors;
+    auto const count = group.lane_reactors + group.n_reactors;
+    _groups.push_back(group_range{group.device, first, count, group.lane_reactors});
+    first += count;
   }
+  _batch_first = first;
+  _batch_count = _plan.host_batch_reactors;
 }
 
 void cufile_ioctx::start()
 {
   if (_started) return;
+  // Lane slots first: the plan budgets them before the synchronous staging.
+  for (auto const& group : _plan.groups) {
+    if (group.lane_slots == 0 || _plan.lane_slot_bytes == 0) continue;
+    auto const reserved = reserve_staging_slots(group.device,
+                                                group.lane_slots,
+                                                _plan.lane_slot_bytes,
+                                                group.staging_cap_bytes,
+                                                /*require_registered=*/gds_available());
+    if (reserved < group.lane_slots) {
+      CUCASCADE_LOG_WARN(
+        "cufile: reserved {} of {} fused-read lane slots on GPU {}; its lane reactors run "
+        "with fewer lanes",
+        reserved,
+        group.lane_slots,
+        group.device);
+    } else {
+      CUCASCADE_LOG_INFO("cufile: reserved {} fused-read lane slots ({} MiB) on GPU {}",
+                         reserved,
+                         (reserved * (_plan.lane_slot_bytes + (64UL << 10))) >> 20,
+                         group.device);
+    }
+  }
   for (auto const& group : _plan.groups) {
     if (group.staging_slots == 0) continue;
     auto cfg                         = _config;
@@ -313,24 +356,87 @@ reactor_stats cufile_ioctx::stats(int device) const noexcept
   return total;
 }
 
-std::vector<cufile_reactor*> cufile_ioctx::next_reactor(
-  [[maybe_unused]] cufile_io_object const& object,
-  std::size_t n_slices,
-  io_op_type type,
-  int device_id)
+bool cufile_ioctx::fused_reads_usable() const noexcept
 {
-  // The candidates: the reactors of the destination's GPU, or every reactor.
-  std::size_t first = 0;
-  std::size_t count = _reactors.size();
+  if (!_config.fused_reads.enabled) return false;
+  auto const* api = cufile_api::get();
+  return api != nullptr && api->has_async_read;
+}
+
+bool cufile_ioctx::has_lane_read(cufile_io_object const& object,
+                                 std::span<prepared_io_slice const> slices) const noexcept
+{
+  if (!object.cufile_registered() || !fused_reads_usable()) return false;
+  auto const file_size = object.size();
+  for (auto const& slice : slices) {
+    if (is_lane_read(slice, file_size, _config.fused_reads.slot_bytes) &&
+        lane_window(slice).size >= _config.gds_threshold) {
+      return true;
+    }
+  }
+  return false;
+}
+
+std::vector<std::size_t> cufile_ioctx::candidates(reactor_role role, int device_id) const
+{
+  std::vector<std::size_t> out;
+  auto add = [&](std::size_t first, std::size_t count) {
+    for (std::size_t i = first; i < first + count; ++i) {
+      out.push_back(i);
+    }
+  };
+  group_range const* group = nullptr;
   if (device_id >= 0) {
-    for (auto const& group : _groups) {
-      if (group.device == device_id && group.count != 0) {
-        first = group.first;
-        count = group.count;
+    for (auto const& entry : _groups) {
+      if (entry.device == device_id && entry.count != 0) {
+        group = &entry;
         break;
       }
     }
   }
+  // Every reactor without lanes and without a batch role: the synchronous ones.
+  auto add_all_sync = [&] {
+    for (auto const& entry : _groups) {
+      add(entry.first + entry.lanes, entry.count - entry.lanes);
+    }
+  };
+  switch (role) {
+    case reactor_role::lane:
+      if (group != nullptr) {
+        add(group->first, group->lanes != 0 ? group->lanes : group->count);
+      } else {
+        add_all_sync();
+      }
+      break;
+    case reactor_role::host:
+      if (_batch_count != 0) {
+        add(_batch_first, _batch_count);
+      } else {
+        add_all_sync();
+      }
+      break;
+    case reactor_role::sync:
+      if (group != nullptr) {
+        if (group->count > group->lanes) {
+          add(group->first + group->lanes, group->count - group->lanes);
+        } else {
+          add(group->first, group->count);
+        }
+      } else {
+        add_all_sync();
+      }
+      break;
+  }
+  if (out.empty()) add(0, _reactors.size());
+  return out;
+}
+
+std::vector<cufile_reactor*> cufile_ioctx::rank(std::vector<std::size_t> const& candidates,
+                                                std::size_t n_slices,
+                                                io_op_type type,
+                                                int device_id)
+{
+  auto const count = candidates.size();
   if (count == 0) return {};
 
   // Rotation breaks backlog ties and keeps synchronous reads off reactor zero.
@@ -338,7 +444,8 @@ std::vector<cufile_reactor*> cufile_ioctx::next_reactor(
   std::vector<std::pair<std::size_t, std::size_t>> ranked;
   ranked.reserve(count);
   for (std::size_t distance = 0; distance < count; ++distance) {
-    ranked.emplace_back(_reactors[first + (start + distance) % count]->queued_bytes(), distance);
+    ranked.emplace_back(_reactors[candidates[(start + distance) % count]]->queued_bytes(),
+                        distance);
   }
   // A vectored read with more slices than the default fan-out gets every
   // candidate; anything else the two least backlogged.  A host-only vectored
@@ -354,9 +461,23 @@ std::vector<cufile_reactor*> cufile_ioctx::next_reactor(
   std::vector<cufile_reactor*> result;
   result.reserve(selected);
   for (std::size_t i = 0; i < selected; ++i) {
-    result.push_back(_reactors[first + (start + ranked[i].second) % count].get());
+    result.push_back(_reactors[candidates[(start + ranked[i].second) % count]].get());
   }
   return result;
+}
+
+std::vector<cufile_reactor*> cufile_ioctx::next_reactor(
+  [[maybe_unused]] cufile_io_object const& object,
+  std::size_t n_slices,
+  io_op_type type,
+  int device_id)
+{
+  // A read without a device destination is host-only; everything else is served by the
+  // synchronous reactors of its GPU (every reactor of a flat pool).
+  bool const read = type == io_op_type::host || type == io_op_type::host_async ||
+                    type == io_op_type::host_vector_async;
+  auto const role = read && device_id < 0 ? reactor_role::host : reactor_role::sync;
+  return rank(candidates(role, device_id), n_slices, type, device_id);
 }
 
 std::vector<cufile_reactor*> cufile_ioctx::select_reactors(
@@ -365,7 +486,13 @@ std::vector<cufile_reactor*> cufile_ioctx::select_reactors(
   io_op_type operation,
   int device_id)
 {
-  auto selected = next_reactor(object, slices.size(), operation, device_id);
+  auto selected = operation == io_op_type::host_vector_async && device_id >= 0 &&
+                      has_lane_read(object, slices)
+                    ? rank(candidates(reactor_role::lane, device_id),
+                           slices.size(),
+                           operation,
+                           device_id)
+                    : next_reactor(object, slices.size(), operation, device_id);
   if (operation == io_op_type::write_vector_async && !selected.empty()) {
     for (auto const& slice : slices)
       if (slice.backend_owner &&
@@ -433,6 +560,18 @@ void cufile_ioctx::prepare_device_slices(io_object const& object,
     if (auto const pieces = split_pieces(slice, file_size, split_bytes); pieces > 1) {
       piece_count += pieces - 1;
     }
+  }
+  // Fused reads replace the split and the legacy fusion: the planner packs and splits the
+  // device slices into lane reads of at most a slot.
+  auto const* file = dynamic_cast<cufile_io_object const*>(&object);
+  if (file != nullptr && file->cufile_registered() && fused_reads_usable()) {
+    fused_plan_options options;
+    options.window_bytes   = _config.fused_reads.slot_bytes;
+    options.gap_bytes      = _config.fused_reads.fuse_gap_bytes;
+    options.fuse           = _config.fused_reads.fuse;
+    options.min_read_bytes = align_up_block(_config.gds_threshold);
+    std::ignore            = plan_fused_reads(slices, file_size, options);
+    return;
   }
   if (piece_count == 0) {
     fuse_device_slices(slices, file_size);
@@ -588,12 +727,21 @@ std::shared_ptr<cufile_ioctx> make_cufile_ioctx(std::size_t n_reactors, config c
   std::vector<std::size_t> caps;
   for (auto const& group : plan.groups) {
     auto const index = static_cast<std::size_t>(group.device);
-    if (caps.size() <= index) caps.resize(index + 1, effective.max_staging_bytes_per_device);
+    // Devices the plan does not cover get what reactor_context::staging_cap gives them.
+    auto const unplanned = effective.max_staging_bytes_per_device == 0
+                             ? std::size_t{0}
+                             : effective.max_staging_bytes_per_device +
+                                 fused_lane_staging_bytes(effective);
+    if (caps.size() <= index) caps.resize(index + 1, unplanned);
     caps[index] = group.staging_cap_bytes;
   }
   if (n_reactors != 0) {
+    // A flat pool: no groups, so no lane or batch roles (every reactor has every enabled
+    // capability) and no lane slots reserved up front.
     plan.groups.clear();
-    plan.flat_reactors = n_reactors;
+    plan.host_batch_reactors = 0;
+    plan.lane_slot_bytes     = 0;
+    plan.flat_reactors       = n_reactors;
     plan.reason        = "flat pool of " + std::to_string(n_reactors) + " reactors (configured)";
   }
   CUCASCADE_LOG_INFO("{}", describe(plan));

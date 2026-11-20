@@ -56,6 +56,25 @@ struct staging_usage {
                                           std::size_t slots,
                                           config const& cfg) noexcept;
 
+/**
+ * @brief Make sure @p device holds at least @p slots staging slots of @p slot_bytes, within
+ *        @p cap_bytes of staging on the device (0 = no cap).
+ *
+ * The general form of @ref reserve_staging, also used for the fused-read lane slots.  New
+ * slots are registered with cuFile when it can register memory; with
+ * @p require_registered only registered slots count (and none is allocated when
+ * registration is impossible).  Opens the cuFile driver.  Requires a CUDA device; never
+ * throws.
+ *
+ * @return How many slots of that size (registered ones only, with @p require_registered)
+ *         @p device holds afterwards.
+ */
+[[nodiscard]] std::size_t reserve_staging_slots(int device,
+                                                std::size_t slots,
+                                                std::size_t slot_bytes,
+                                                std::size_t cap_bytes,
+                                                bool require_registered = true) noexcept;
+
 /// What @p device holds for staging now.  Never throws.
 [[nodiscard]] staging_usage staging_usage_of(int device) noexcept;
 

@@ -24,7 +24,9 @@
 #include <cucascade/io/templated_ioctx.hpp>
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -65,6 +67,20 @@ namespace cucascade::io::cufile {
  * - a device-only read larger than @c config::staging_piece_bytes is split into
  *   pieces on 4 KiB boundaries, so several reactors read it at once.
  *
+ * With fused reads (@c config::fused_reads enabled, @c cuFileReadAsync available and the
+ * object registered with cuFile) the last step is @c plan_fused_reads instead of that split
+ * and the legacy fusion (@c config::fuse_gap_bytes): the device slices are packed, in file
+ * order, into 4 KiB-aligned windows of at most a lane slot, each one lane read that a lane
+ * reactor issues as one @c cuFileReadAsync plus device copies (see @c cufile_reactor).
+ * A planned pool then has, per GPU, @c fused_read_config::reactors_per_device lane reactors
+ * ahead of its synchronous ones, and @c host_batch_config::reactors batch reactors shared
+ * by every GPU; requests are routed by role: a request with a lane read goes to the lane
+ * reactors of its GPU, a host-only read to the batch reactors (else every reactor without
+ * lanes), anything else (writes, flushes, other device reads) to the synchronous reactors
+ * of its GPU.  Routing is a preference: every reactor can serve every slice through its
+ * synchronous paths.  A flat pool gives every reactor every enabled capability and routes
+ * as without them.
+ *
  * A device write is prepared the same way (its GPU from the source pointer, a
  * gate on its stream), so it reaches its source GPU's group and is staged
  * through that GPU's slots; it is split by @c config::write_split_bytes.
@@ -99,8 +115,11 @@ class cufile_ioctx : public templated_ioctx<cufile_reactor> {
    *
    * A cuFile reactor serves one transfer at a time (synchronous cuFile and POSIX
    * calls), so a request's queue depth is the number of reactors it is spread
-   * over.  The candidates are the reactors of @p device_id's group (every
-   * reactor when the pool is flat or the request is host-only); a vectored read
+   * over.  The candidates are, by role (see the class comment): for a host-only read
+   * the batch reactors (else every reactor without lanes); for anything else the
+   * synchronous reactors of @p device_id's group (its whole group when it has none;
+   * every synchronous reactor when the pool is flat or the GPU has no group).  Requests
+   * with a lane read are routed by @ref select_reactors to the lane reactors.  A vectored read
    * with more slices than the base's two gets every candidate, least backlogged
    * first, a host-only vectored write the least backlogged one (its page-cache
    * writes with early writeback keep the device busy, and interleaving writers
@@ -145,6 +164,17 @@ class cufile_ioctx : public templated_ioctx<cufile_reactor> {
   /// The plan the pool was built from (one flat group when built from a count).
   [[nodiscard]] pool_plan const& plan() const noexcept { return _plan; }
 
+  /// Reactors in the pool, in build order: per GPU its lane reactors then its synchronous
+  /// ones, then the host-batch reactors.
+  [[nodiscard]] std::size_t reactor_count() const noexcept { return _reactors.size(); }
+
+  /// Reactor @p index (see @ref reactor_count), for per-reactor statistics, placement and
+  /// backlog.  @throws std::out_of_range for an index past the pool.
+  [[nodiscard]] cufile_reactor const& reactor(std::size_t index) const
+  {
+    return *_reactors.at(index);
+  }
+
   std::size_t host_write_io(io_object const& object,
                             std::size_t offset,
                             std::size_t size,
@@ -167,12 +197,36 @@ class cufile_ioctx : public templated_ioctx<cufile_reactor> {
                                                         write_open_options options) override;
 
  private:
-  /// The reactors of one GPU: @c _reactors[first, first + count).
+  /// The reactors of one GPU: @c _reactors[first, first + count), of which the first
+  /// @c lanes are its lane reactors and the rest its synchronous ones.
   struct group_range {
     int device{-1};
     std::size_t first{0};
     std::size_t count{0};
+    std::size_t lanes{0};
   };
+
+  /// What a request needs of the reactors serving it (see the class comment).
+  enum class reactor_role : std::uint8_t { lane, sync, host };
+
+  /// The reactors (indices into @c _reactors) of @p role for @p device_id, by the rules of
+  /// the class comment; never empty when the pool has reactors.
+  [[nodiscard]] std::vector<std::size_t> candidates(reactor_role role, int device_id) const;
+
+  /// The reactors of @p candidates a request of @p n_slices slices of @p type gets: every
+  /// candidate for a vectored read of more than two slices, else the two least backlogged
+  /// (one for a host-only vectored write), least backlogged first.
+  [[nodiscard]] std::vector<cufile_reactor*> rank(std::vector<std::size_t> const& candidates,
+                                                  std::size_t n_slices,
+                                                  io_op_type type,
+                                                  int device_id);
+
+  /// Whether a request with @p slices of @p object has a lane read for the fused lanes.
+  [[nodiscard]] bool has_lane_read(cufile_io_object const& object,
+                                   std::span<prepared_io_slice const> slices) const noexcept;
+
+  /// Whether fused reads are enabled and the loaded cuFile offers @c cuFileReadAsync.
+  [[nodiscard]] bool fused_reads_usable() const noexcept;
 
   /// Resolve the GPU, stream gate and split of every device slice (see the class
   /// comment).  @throws on a capturing stream or a CUDA failure.
@@ -190,6 +244,9 @@ class cufile_ioctx : public templated_ioctx<cufile_reactor> {
 
   pool_plan _plan;
   std::vector<group_range> _groups;
+  /// The host-batch reactors of a planned pool: @c _reactors[_batch_first, + _batch_count).
+  std::size_t _batch_first{0};
+  std::size_t _batch_count{0};
 };
 
 /**
@@ -200,8 +257,9 @@ class cufile_ioctx : public templated_ioctx<cufile_reactor> {
  * not), plans a pool per GPU with @ref plan_cufile_pool, logs the plan at INFO and
  * each of its warnings at WARN, applies the plan's staging piece size and
  * per-device staging caps, and builds the pool from the plan.  With a positive
- * @p n_reactors, builds one flat pool of that many reactors from @p cfg as is.
- * The ioctx is not started.
+ * @p n_reactors, builds one flat pool of that many reactors from @p cfg as is (every
+ * reactor then has every enabled capability: fused lanes, host batch).
+ * The returned ioctx is not started: call @c start() before submitting I/O.
  *
  * @throws std::invalid_argument / std::runtime_error when @p cfg is malformed or
  *         a reactor cannot be built (the registry's factory reports the same as a

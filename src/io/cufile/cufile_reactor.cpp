@@ -16,6 +16,7 @@
  * limitations under the License.
  */
 
+#include "io/cufile/fused_lanes.hpp"
 #include "io/cufile/staging_pool.hpp"
 #include "io/detail/local_descriptor.hpp"
 
@@ -26,11 +27,13 @@
 #include <cucascade/io/cufile/cufile_reactor.hpp>
 #include <cucascade/io/cufile/detail.hpp>
 #include <cucascade/io/cufile/device_engine.hpp>
+#include <cucascade/io/cufile/fused_read_plan.hpp>
 #include <cucascade/io/cufile/mount_policy.hpp>
 #include <cucascade/io/cufile/runtime.hpp>
 #include <cucascade/io/range_plan.hpp>
 #include <array>
 #include <map>
+#include <cucascade/io/cufile/placement.hpp>
 #include <cucascade/io/cufile/platform.hpp>
 #include <cucascade/io/cufile/staging.hpp>
 #include <cucascade/io/io_errors.hpp>
@@ -75,6 +78,7 @@
 #include <string_view>
 #include <system_error>
 #include <thread>
+#include <unordered_set>
 #include <tuple>
 #include <utility>
 #include <variant>
@@ -1216,10 +1220,14 @@ cufile_reactor::cufile_reactor(std::shared_ptr<reactor_context> ctx,
     throw std::invalid_argument("cufile_reactor: reactor_context must be non-null");
   }
   _config = _ctx->cfg();
-  _write_wakeup->notify = [this] {
-    // A null queue entry only interrupts the timed dequeue; it is never dispatched.
-    static_cast<void>(_requests.enqueue(nullptr, io_priority::high));
-  };
+  _config.fused_reads.validate();
+  _config.host_batch.validate();
+  if (_config.fused_reads.enabled && _config.async_engine.mode != engine_mode::legacy) {
+    throw std::invalid_argument(
+      "cufile_reactor: fused_reads and the async engine (async_engine.mode != legacy) are "
+      "mutually exclusive: both would serve the same device reads");
+  }
+  _write_wakeup->notify = [this] { notify_worker(); };
   if (_config.async_engine.mode != engine_mode::legacy) {
     _config.async_engine.validate();
     std::ignore = runtime::instance().ensure_initialized(_config.async_engine.process_params,
@@ -1243,6 +1251,9 @@ cufile_reactor::cufile_reactor(std::shared_ptr<reactor_context> ctx,
   // stream: a throwing push_back there would free the event the stream records.
   _inflight_copy.reserve(_config.max_inflight);
   _waiting.reserve(_config.max_inflight);
+  if (_config.fused_reads.enabled && _placement.fused_lanes) {
+    _lanes = std::make_unique<lane_state>();
+  }
 }
 
 reactor_stats cufile_reactor::stats() const noexcept
@@ -1267,6 +1278,16 @@ reactor_stats cufile_reactor::stats() const noexcept
   out.staged_write_bytes = load(_counters.staged_write_bytes);
   out.direct_writes      = load(_counters.direct_writes);
   out.direct_write_bytes = load(_counters.direct_write_bytes);
+  out.lane_reads         = load(_counters.lane_reads);
+  out.lane_bytes         = load(_counters.lane_bytes);
+  out.lane_issued_bytes  = load(_counters.lane_issued_bytes);
+  out.lane_parts         = load(_counters.lane_parts);
+  out.lane_resubmits     = load(_counters.lane_resubmits);
+  out.lane_failures      = load(_counters.lane_failures);
+  out.lane_gated_reads   = load(_counters.lane_gated_reads);
+  out.batch_reads        = load(_counters.batch_reads);
+  out.batch_bytes        = load(_counters.batch_bytes);
+  out.batch_failures     = load(_counters.batch_failures);
   return out;
 }
 
@@ -1326,6 +1347,7 @@ void cufile_reactor::shutdown()
 
   if (_worker.joinable()) {
     _stop_source.request_stop();
+    notify_worker();
     _worker.join();
     // The worker is gone (and gave its staging slots back): release its pinned
     // scratch and copy streams now rather than with the reactor.
@@ -1371,9 +1393,37 @@ void cufile_reactor::enqueue(std::unique_ptr<grouped_io_request> request) noexce
       if (!enqueued) { _queued_bytes.fetch_sub(bytes, std::memory_order_relaxed); }
     }
   }
+  // The request is visible in the queue: wake the worker.
+  if (enqueued) {
+    notify_worker();
+    return;
+  }
   // Cancellation runs outside the lock: it invokes user callbacks and settles
   // promises inline, which may re-enter enqueue() on this reactor.
-  if (!enqueued && request != nullptr) { request->cancel_remaining(error); }
+  if (request != nullptr) { request->cancel_remaining(error); }
+}
+
+void cufile_reactor::notify_worker() noexcept
+{
+  if (!_wake_pending.exchange(true, std::memory_order_seq_cst)) _wake.signal();
+}
+
+void cufile_reactor::wait_for_work(std::int64_t timeout_us,
+                                   bool requests_count,
+                                   std::stop_token const& stop_token) noexcept
+{
+  // Clear the flag before re-checking the sources: a notifier publishes its work, then sets
+  // the flag; either the re-check below sees the work, or the flag was clear when the
+  // notifier set it and its permit ends the wait.
+  _wake_pending.store(false, std::memory_order_seq_cst);
+  while (_wake.tryWait()) {}
+  if (stop_token.stop_requested()) return;
+  if (requests_count && _requests.size_approx() != 0) return;
+  if (async_completions_pending()) return;
+  for (auto const& write : _write_waiting) {
+    if (write.ready->load(std::memory_order_acquire)) return;
+  }
+  std::ignore = _wake.wait(timeout_us);
 }
 
 // ---------------------------------------------------------------------------
@@ -1541,7 +1591,9 @@ void cufile_reactor::dispatch_slice(std::shared_ptr<const io_object> const& obj,
                                     std::shared_ptr<grouped_coordinator> const& coordinator,
                                     bool stream_ready,
                                     bool* handed_off,
-                                    engine_publication* publication) noexcept
+                                    engine_publication* publication,
+                                    bool allow_lanes,
+                                    bool* lane_owned) noexcept
 {
   // Every terminal path must either finish `request` (finish_success / finish_error,
   // exactly once) or, before `request` exists, settle the slice's completion and one
@@ -1612,6 +1664,18 @@ void cufile_reactor::dispatch_slice(std::shared_ptr<const io_object> const& obj,
     }
     std::optional<rmm::cuda_set_device_raii> guard;
     if (slice.has_device_request()) guard.emplace(rmm::cuda_device_id{device_id});
+
+    // A lane read goes to a fused stream lane (or parks behind its caller's stream); the
+    // synchronous paths below serve everything else, and lane reads lanes cannot take.
+    if (allow_lanes && _lanes != nullptr && is_read && device_only && clamped != 0) {
+      switch (try_lane_read(obj, *file, slice, coordinator, device_id, clamped, stream_ready)) {
+        case lane_dispatch::declined: break;
+        case lane_dispatch::parked: return;
+        case lane_dispatch::taken:
+          if (lane_owned != nullptr) *lane_owned = true;
+          return;
+      }
+    }
 
     // A device-only slice (a read into or a write from device memory) must not
     // touch its buffer before the work queued on its stream before the call has
@@ -1724,7 +1788,13 @@ void cufile_reactor::dispatch_slice(std::shared_ptr<const io_object> const& obj,
         single.d_buffer      = slice.d_buffer;
         single.d_buffer.data = part.data;
         single.priority      = slice.priority;
-        dispatch_slice(obj, std::move(single), coordinator, /*stream_ready=*/true);
+        dispatch_slice(obj,
+                       std::move(single),
+                       coordinator,
+                       /*stream_ready=*/true,
+                       nullptr,
+                       nullptr,
+                       /*allow_lanes=*/false);
       }
       request->finish_success();
       return;
@@ -2772,17 +2842,27 @@ void cufile_reactor::poll_completions() noexcept
     for (auto& [waiting, status] : ready) {
       grouped_coordinator::error_type error{canceled_error()};
       if (status == cudaSuccess && waiting.coordinator->should_continue()) {
-        if (served_bytes >= _config.max_op_bytes) {
+        // A lane read waiting for a free lane holds the others back, as in a worker pass.
+        if (served_bytes >= _config.max_op_bytes || async_backlog_pending()) {
           // No more than were parked before this scan: the capacity holds them.
           _waiting.push_back(std::move(waiting));
           continue;
         }
         auto const bytes = waiting.slice.size();
         served_bytes += bytes;
-        // Counted while its transfer runs, as in a worker pass.
+        // Counted while its transfer runs, as in a worker pass; a lane read stays counted
+        // until it settles.
         _queued_bytes.fetch_add(bytes, std::memory_order_relaxed);
-        dispatch_slice(waiting.obj, std::move(waiting.slice), waiting.coordinator, true);
-        _queued_bytes.fetch_sub(bytes, std::memory_order_relaxed);
+        bool lane_owned = false;
+        dispatch_slice(waiting.obj,
+                       std::move(waiting.slice),
+                       waiting.coordinator,
+                       true,
+                       nullptr,
+                       nullptr,
+                       /*allow_lanes=*/true,
+                       &lane_owned);
+        if (!lane_owned) _queued_bytes.fetch_sub(bytes, std::memory_order_relaxed);
         continue;
       }
       if (status != cudaSuccess) error = status;
@@ -2877,6 +2957,446 @@ void cufile_reactor::drain_inflight(grouped_coordinator::error_type const& termi
 }
 
 // ---------------------------------------------------------------------------
+// cufile_reactor: fused stream lanes
+// ---------------------------------------------------------------------------
+
+/// Worker-only state of the fused lanes: one lane set per device read into, a slab of
+/// lane-read records (the token a lane read carries is its index), the one-element backlog,
+/// and the failure cooldown.
+struct cufile_reactor::lane_state {
+  /// What one lane read owns until it settles.
+  struct op {
+    std::shared_ptr<const io_object> obj;
+    /// The caller's slice: destinations, gate and stream owner stay alive with it.
+    prepared_io_slice slice;
+    std::unique_ptr<io_op_request> request;
+    /// The read while it waits in the backlog; afterwards a spare copy buffer (see
+    /// @c fused_lane_set::submit), so a recycled record allocates nothing per read.
+    detail::lane_read read;
+    std::size_t queued_bytes{0};  ///< What it holds in @c _queued_bytes until it settles.
+    std::size_t payload{0};
+    std::size_t issued{0};
+    std::size_t parts{0};
+    int device{-1};
+    bool gated{false};
+  };
+
+  std::vector<op> ops;
+  std::vector<std::uint32_t> free_ops;
+  /// Lane sets by device id; a set of capacity 0 means "no lanes on that device".
+  std::vector<std::unique_ptr<detail::fused_lane_set>> sets;
+  std::size_t total_capacity{0};
+  std::optional<std::uint32_t> backlog;
+  /// Results reaped in one pass; reserved to @ref total_capacity.
+  std::vector<detail::lane_result> results;
+  std::size_t consecutive_failures{0};
+  bool cooling{false};
+  std::chrono::steady_clock::time_point cooldown_until{};
+  std::chrono::steady_clock::time_point last_stall_warning{};
+  std::unordered_set<std::string> failed_files;  ///< Logged once each.
+
+  /// A free record; may throw (std::bad_alloc) before anything was issued.
+  [[nodiscard]] std::uint32_t acquire_op()
+  {
+    if (free_ops.empty()) {
+      ops.emplace_back();
+      // Room for every record to be freed without allocating.
+      free_ops.reserve(ops.size());
+      return static_cast<std::uint32_t>(ops.size() - 1);
+    }
+    auto const index = free_ops.back();
+    free_ops.pop_back();
+    return index;
+  }
+
+  /// Return a record; keeps its spare copy buffer.
+  void release_op(std::uint32_t index) noexcept
+  {
+    auto& record = ops[index];
+    record.obj.reset();
+    record.slice = prepared_io_slice{};
+    record.request.reset();
+    record.gated = false;
+    free_ops.push_back(index);  // capacity reserved in acquire_op
+  }
+
+  [[nodiscard]] std::size_t in_flight() const noexcept
+  {
+    std::size_t count = 0;
+    for (auto const& set : sets) {
+      if (set != nullptr) count += set->in_flight();
+    }
+    return count;
+  }
+
+  /// The lane set of @p device, created on first use with @p device current; null when the
+  /// device has no lanes.  May throw before the set exists.
+  [[nodiscard]] detail::fused_lane_set* set_for(cufile_reactor& reactor, int device)
+  {
+    auto const index = static_cast<std::size_t>(device);
+    if (sets.size() <= index) sets.resize(index + 1);
+    auto& set = sets[index];
+    if (set == nullptr) {
+      auto const& fused = reactor._config.fused_reads;
+      // Reserved first: nothing may allocate once lane reads complete.
+      results.reserve(total_capacity + std::min(fused.lanes_per_reactor,
+                                                detail::fused_lane_set::max_lanes));
+      detail::lane_set_options options;
+      options.device            = device;
+      options.lanes             = fused.lanes_per_reactor;
+      options.slot_bytes        = fused.slot_bytes;
+      options.staging_cap_bytes = reactor._ctx->staging_cap(device);
+      options.max_device_lanes  = fused.max_lanes_per_device;
+      options.register_streams  = fused.register_streams;
+      options.completion        = fused.completion;
+      options.max_resubmits     = fused.max_resubmits;
+      options.wake              = [](void* context) noexcept {
+        static_cast<cufile_reactor*>(context)->notify_worker();
+      };
+      options.wake_context = &reactor;
+      set                  = std::make_unique<detail::fused_lane_set>(options);
+      total_capacity += set->capacity();
+      if (set->capacity() == 0) {
+        CUCASCADE_LOG_INFO(
+          "cufile_reactor '{}': no fused lanes on GPU {} (lane budget, staging cap or "
+          "cuFileReadAsync unavailable); its reads take the synchronous paths",
+          reactor._tname,
+          device);
+      } else {
+        CUCASCADE_LOG_DEBUG("cufile_reactor '{}': {} fused lanes of {} KiB on GPU {}",
+                            reactor._tname,
+                            set->capacity(),
+                            fused.slot_bytes >> 10,
+                            device);
+      }
+    }
+    return set->capacity() != 0 ? set.get() : nullptr;
+  }
+};
+
+cufile_reactor::lane_dispatch cufile_reactor::try_lane_read(
+  std::shared_ptr<const io_object> const& obj,
+  cufile_io_object const& file,
+  prepared_io_slice& slice,
+  std::shared_ptr<grouped_coordinator> const& coordinator,
+  int device_id,
+  std::size_t clamped,
+  bool stream_ready)
+{
+  auto& lanes        = *_lanes;
+  auto const& fused  = _config.fused_reads;
+  if (slice.on_complete != nullptr || !file.cufile_registered() || device_id < 0) {
+    return lane_dispatch::declined;
+  }
+  if (lanes.cooling) {
+    if (std::chrono::steady_clock::now() < lanes.cooldown_until) return lane_dispatch::declined;
+    lanes.cooling = false;
+    CUCASCADE_LOG_INFO("cufile_reactor '{}': fused lanes resume after their cooldown", _tname);
+  }
+  if (!is_lane_read(slice, file.size(), fused.slot_bytes)) return lane_dispatch::declined;
+  auto const window = lane_window(slice);
+  if (window.size < _config.gds_threshold) return lane_dispatch::declined;
+  auto* set = lanes.set_for(*this, device_id);
+  if (set == nullptr) return lane_dispatch::declined;
+  // Only one read waits for a lane (the worker takes no slice while one does); a second
+  // one -- possible only from a parked slice -- is served synchronously instead.
+  if (set->free_lanes() == 0 && lanes.backlog.has_value()) return lane_dispatch::declined;
+
+  // The read writes only the lane's slot; its copies write the caller's memory and must
+  // follow the work queued on the caller's stream before the call.
+  bool gated = false;
+  if (!stream_ready) {
+    switch (gate_of(slice)) {
+      case gate_state::ready: break;
+      case gate_state::pending:
+        if (set->gated() < fused.gated_lane_limit()) {
+          gated = true;
+          break;
+        }
+        park_on_gate(obj, std::move(slice), coordinator);
+        return lane_dispatch::parked;
+      case gate_state::unchecked:
+        if (park_if_stream_busy(obj, slice, coordinator)) return lane_dispatch::parked;
+        break;
+    }
+  }
+
+  // Everything that can throw happens before the slice is taken.
+  auto const index = lanes.acquire_op();
+  auto& record     = lanes.ops[index];
+  try {
+    auto request         = std::make_unique<io_op_request>();
+    request->obj         = obj;
+    request->coordinator = coordinator;
+    request->io_rng      = range{slice.rng.offset, clamped};
+    request->device_copy = std::make_unique<device_cpy_request>();
+    request->device_copy->req_rng   = slice.rng;
+    request->device_copy->d_buffer  = slice.d_buffer;
+    request->device_copy->device_id = device_id;
+    record.read.copies.clear();
+    record.read.copies.reserve(std::max<std::size_t>(1, slice.fused.size()));
+    record.request = std::move(request);
+  } catch (...) {
+    lanes.release_op(index);
+    throw;
+  }
+
+  auto& read  = record.read;
+  read.handle = file.cufile_handle();
+  read.window = window;
+  read.gate   = gated ? slice.d_buffer.ready_gate->get() : nullptr;
+  read.token  = index;
+  if (slice.is_fused()) {
+    for (auto const& part : slice.fused) {
+      read.copies.push_back(detail::lane_copy{part.data, part.rng.offset, part.rng.size});
+    }
+  } else {
+    read.copies.push_back(detail::lane_copy{slice.d_buffer.data, slice.rng.offset, clamped});
+  }
+  record.queued_bytes = slice.size();
+  record.payload      = slice.payload_bytes();
+  record.issued       = window.size;
+  record.parts        = std::max<std::size_t>(1, slice.fused.size());
+  record.device       = device_id;
+  record.gated        = gated;
+  record.obj          = obj;
+  record.slice        = std::move(slice);
+
+  if (!set->submit(std::move(read))) lanes.backlog = index;
+  return lane_dispatch::taken;
+}
+
+void cufile_reactor::reap_async() noexcept
+{
+  if (_lanes == nullptr) return;
+  auto& lanes = *_lanes;
+  lanes.results.clear();
+  for (auto const& set : lanes.sets) {
+    if (set == nullptr || set->in_flight() == 0) continue;
+    // Capacity reserved in set_for: collecting a result never allocates.
+    std::ignore = set->reap([&](detail::lane_result const& result) noexcept {
+      lanes.results.push_back(result);
+    });
+  }
+
+  // Refill first: the backlog's read takes a lane freed above, or settles if cancelled.
+  if (lanes.backlog.has_value()) {
+    auto const index = *lanes.backlog;
+    auto& record     = lanes.ops[index];
+    if (!record.request->coordinator->should_continue()) {
+      lanes.backlog.reset();
+      auto request     = std::move(record.request);
+      auto const bytes = record.queued_bytes;
+      lanes.release_op(index);
+      request->finish_error(canceled_error());
+      _queued_bytes.fetch_sub(bytes, std::memory_order_relaxed);
+    } else if (lanes.sets[static_cast<std::size_t>(record.device)]->submit(
+                 std::move(record.read))) {
+      lanes.backlog.reset();
+    }
+  }
+
+  for (auto const& result : lanes.results) {
+    auto const index = static_cast<std::uint32_t>(result.token);
+    auto& record     = lanes.ops[index];
+    auto request     = std::move(record.request);
+    auto obj         = std::move(record.obj);
+    auto slice       = std::move(record.slice);
+    auto const bytes   = record.queued_bytes;
+    auto const payload = record.payload;
+    auto const issued  = record.issued;
+    auto const parts   = record.parts;
+    auto const gated   = record.gated;
+    lanes.release_op(index);
+
+    auto const& coordinator = request->coordinator;
+    if (result.outcome == detail::lane_result::status::ok) {
+      _counters.lane_reads.fetch_add(1, std::memory_order_relaxed);
+      _counters.lane_bytes.fetch_add(payload, std::memory_order_relaxed);
+      _counters.lane_issued_bytes.fetch_add(issued, std::memory_order_relaxed);
+      _counters.lane_parts.fetch_add(parts, std::memory_order_relaxed);
+      _counters.lane_resubmits.fetch_add(result.resubmits, std::memory_order_relaxed);
+      if (gated) _counters.lane_gated_reads.fetch_add(1, std::memory_order_relaxed);
+      lanes.consecutive_failures = 0;
+      request->finish_success();
+    } else if (!coordinator->should_continue()) {
+      // Cancelled meanwhile: nothing more is read for it.
+      request->finish_error(canceled_error());
+    } else {
+      _counters.lane_failures.fetch_add(1, std::memory_order_relaxed);
+      _counters.cufile_failures.fetch_add(1, std::memory_order_relaxed);
+      try {
+        if (lanes.failed_files.insert(obj->object_path()).second) {
+          CUCASCADE_LOG_WARN(
+            "cufile_reactor '{}': a fused-lane read of '{}' failed ({}, io_result {}, {}); "
+            "re-serving it through the synchronous path (logged once per file; see "
+            "lane_failures)",
+            _tname,
+            obj->object_path(),
+            result.outcome == detail::lane_result::status::io_failed ? "cuFile" : "CUDA",
+            result.io_result,
+            cudaGetErrorName(result.cuda_status));
+        }
+      } catch (...) {
+        // Logging is best effort.
+      }
+      if (++lanes.consecutive_failures >= _config.fused_reads.failure_limit) {
+        lanes.consecutive_failures = 0;
+        lanes.cooling              = true;
+        lanes.cooldown_until =
+          std::chrono::steady_clock::now() + std::chrono::seconds{_config.fused_reads.cooldown_s};
+        CUCASCADE_LOG_WARN(
+          "cufile_reactor '{}': {} consecutive fused-lane reads failed; lanes unused for {} s",
+          _tname,
+          _config.fused_reads.failure_limit,
+          _config.fused_reads.cooldown_s);
+      }
+      // A read that failed before its copies were queued may not have waited for its
+      // gate: the fallback writes the destinations itself, so it must.
+      if (gated && slice.d_buffer.ready_gate != nullptr) {
+        std::ignore = slice.d_buffer.ready_gate->synchronize_no_throw();
+      }
+      // Each destination takes a credit of its own before this read gives its one back, so
+      // the request cannot settle in between (as for a fused slice that cannot be staged).
+      if (slice.is_fused()) {
+        coordinator->add_tasks(slice.fused.size());
+        for (auto const& part : slice.fused) {
+          prepared_io_slice single;
+          single.rng           = part.rng;
+          single.d_buffer      = slice.d_buffer;
+          single.d_buffer.data = part.data;
+          single.priority      = slice.priority;
+          dispatch_slice(obj,
+                         std::move(single),
+                         coordinator,
+                         /*stream_ready=*/true,
+                         nullptr,
+                         nullptr,
+                         /*allow_lanes=*/false);
+        }
+      } else {
+        coordinator->add_tasks(1);
+        dispatch_slice(obj,
+                       std::move(slice),
+                       coordinator,
+                       /*stream_ready=*/true,
+                       nullptr,
+                       nullptr,
+                       /*allow_lanes=*/false);
+      }
+      request->finish_success();
+    }
+    _queued_bytes.fetch_sub(bytes, std::memory_order_relaxed);
+  }
+  lanes.results.clear();
+
+  // A hung storage client is otherwise invisible: warn, at most once per stall_warn_s.
+  if (auto const warn_s = _config.fused_reads.stall_warn_s; warn_s != 0) {
+    auto const limit = std::chrono::seconds{warn_s};
+    auto const now   = std::chrono::steady_clock::now();
+    if (now - lanes.last_stall_warning >= limit) {
+      for (auto const& set : lanes.sets) {
+        if (set == nullptr || set->in_flight() == 0) continue;
+        auto const age = set->oldest_in_flight();
+        if (age < limit) continue;
+        lanes.last_stall_warning = now;
+        CUCASCADE_LOG_WARN(
+          "cufile_reactor '{}': a fused-lane read on GPU {} has been in flight for {} s; "
+          "the storage client may be stuck",
+          _tname,
+          set->device(),
+          std::chrono::duration_cast<std::chrono::seconds>(age).count());
+        break;
+      }
+    }
+  }
+}
+
+bool cufile_reactor::async_in_flight() const noexcept
+{
+  return _lanes != nullptr && _lanes->in_flight() != 0;
+}
+
+bool cufile_reactor::async_completions_pending() const noexcept
+{
+  if (_lanes == nullptr) return false;
+  // Polled lanes report pending whenever a read flies; the poll interval drives them.
+  if (_config.fused_reads.completion == lane_completion::poll) return false;
+  for (auto const& set : _lanes->sets) {
+    if (set != nullptr && set->completions_pending()) return true;
+  }
+  return false;
+}
+
+bool cufile_reactor::async_backlog_pending() const noexcept
+{
+  return _lanes != nullptr && _lanes->backlog.has_value();
+}
+
+std::int64_t cufile_reactor::async_wait_limit_us() const noexcept
+{
+  if (!async_in_flight()) return -1;
+  // Callback lanes wake the worker themselves; 1 ms only bounds a lost wake-up and paces
+  // the stall check.  Polled lanes need the poll interval.
+  if (_config.fused_reads.completion == lane_completion::poll) {
+    return std::max<std::int64_t>(1, static_cast<std::int64_t>(_config.poll_interval_us));
+  }
+  return 1000;
+}
+
+void cufile_reactor::drain_async(grouped_coordinator::error_type const& terminal_error) noexcept
+{
+  if (_lanes == nullptr) return;
+  auto& lanes = *_lanes;
+  if (lanes.backlog.has_value()) {
+    auto const index = *lanes.backlog;
+    lanes.backlog.reset();
+    auto request     = std::move(lanes.ops[index].request);
+    auto const bytes = lanes.ops[index].queued_bytes;
+    lanes.release_op(index);
+    request->finish_error(terminal_error);
+    _queued_bytes.fetch_sub(bytes, std::memory_order_relaxed);
+  }
+  for (auto const& set : lanes.sets) {
+    if (set == nullptr) continue;
+    lanes.results.clear();
+    set->drain([&](detail::lane_result const& result) noexcept {
+      lanes.results.push_back(result);
+    });
+    for (auto const& result : lanes.results) {
+      auto const index = static_cast<std::uint32_t>(result.token);
+      auto request     = std::move(lanes.ops[index].request);
+      auto const bytes = lanes.ops[index].queued_bytes;
+      lanes.release_op(index);
+      switch (result.outcome) {
+        case detail::lane_result::status::ok: request->finish_success(); break;
+        case detail::lane_result::status::io_failed:
+          request->finish_error(std::make_error_code(std::errc::io_error));
+          break;
+        case detail::lane_result::status::device_failed:
+          request->finish_error(result.cuda_status != cudaSuccess
+                                  ? grouped_coordinator::error_type{result.cuda_status}
+                                  : terminal_error);
+          break;
+      }
+      _queued_bytes.fetch_sub(bytes, std::memory_order_relaxed);
+    }
+  }
+  lanes.results.clear();
+  // Destroyed here, on the worker, with every lane idle.
+  lanes.sets.clear();
+  lanes.total_capacity = 0;
+}
+
+std::size_t cufile_reactor::reactor_context::staging_cap(int device) const noexcept
+{
+  auto const index = static_cast<std::size_t>(device);
+  if (device >= 0 && index < _staging_caps.size()) return _staging_caps[index];
+  auto const cap = _config.max_staging_bytes_per_device;
+  return cap == 0 ? 0 : cap + fused_lane_staging_bytes(_config);
+}
+
+// ---------------------------------------------------------------------------
 // cufile_reactor: worker loop
 // ---------------------------------------------------------------------------
 
@@ -2900,6 +3420,7 @@ void cufile_reactor::worker_loop(std::stop_token const& stop_token)
   request_scheduler scheduler{_requests, _config.low_service_interval, pass_slices};
   auto const poll_interval =
     std::chrono::microseconds{static_cast<std::int64_t>(_config.poll_interval_us)};
+  auto const poll_interval_us = std::max<std::int64_t>(1, poll_interval.count());
 
   auto cancel_request = [this](request_ptr& request,
                                grouped_coordinator::error_type const& error) noexcept {
@@ -2920,6 +3441,8 @@ void cufile_reactor::worker_loop(std::stop_token const& stop_token)
   try {
     while (!stop_token.stop_requested()) {
       poll_completions();
+      // Settle finished asynchronous reads and refill their lanes before taking new work.
+      reap_async();
 
       // Keep the queue moving instead of grinding on a request that already failed;
       // a preempted low request that failed meanwhile is dropped too, rather than
@@ -2946,7 +3469,8 @@ void cufile_reactor::worker_loop(std::stop_token const& stop_token)
       for (std::size_t dispatched = 0;
            dispatched < pass_slices && pass_bytes < _config.max_op_bytes &&
            scheduler.active != nullptr && !scheduler.active->empty() &&
-           inflight_count() < _config.max_inflight && !stop_token.stop_requested();) {
+           inflight_count() < _config.max_inflight && !async_backlog_pending() &&
+           !stop_token.stop_requested();) {
         if (!scheduler.active->coordinator->should_continue()) {
           cancel_request(scheduler.active, canceled_error());
           break;
@@ -2956,36 +3480,43 @@ void cufile_reactor::worker_loop(std::stop_token const& stop_token)
         pass_bytes += bytes;
         scheduler.on_slice_dispatched();
         bool handed_off = false;
-        dispatch_slice(scheduler.active->obj, std::move(slice), scheduler.active->coordinator,
-                       false, &handed_off, batch);
-        if (handed_off) pass_bytes -= bytes;
-        else ++dispatched;
+        bool lane_owned = false;
+        dispatch_slice(scheduler.active->obj,
+                       std::move(slice),
+                       scheduler.active->coordinator,
+                       false,
+                       &handed_off,
+                       batch,
+                       /*allow_lanes=*/true,
+                       &lane_owned);
+        // Neither an engine hand-off nor a lane read runs on this worker.
+        if (handed_off || lane_owned) pass_bytes -= bytes;
+        if (!handed_off) ++dispatched;
         // Counted until here: the transfer runs on this worker, and a reactor busy with a long
-        // one must not look idle to the ioctx's reactor selection.
-        _queued_bytes.fetch_sub(bytes, std::memory_order_relaxed);
+        // one must not look idle to the ioctx's reactor selection.  A lane read stays counted
+        // until it settles.
+        if (!lane_owned) _queued_bytes.fetch_sub(bytes, std::memory_order_relaxed);
       }
       publication.publish();
       if (scheduler.active != nullptr && scheduler.active->empty()) { scheduler.active.reset(); }
 
-      bool const has_capacity = inflight_count() < _config.max_inflight;
+      // A full in-flight window or a lane read waiting for a lane stops the worker from
+      // taking more slices until something completes.
+      bool const has_capacity = inflight_count() < _config.max_inflight && !async_backlog_pending();
       if (scheduler.active != nullptr && has_capacity) {
         continue;  // The quantum ran out with slices left: take another pass.
       }
-      if (scheduler.active == nullptr && has_capacity) {
-        if (scheduler.take_next()) continue;
-        // Nothing queued.  Block for a request, but only as long as an in-flight
-        // completion or a parked slice can afford to wait.
-        request_ptr next;
-        auto const timeout_us = inflight_count() == 0 && _waiting.empty() && _write_waiting.empty()
-                                  ? idle_wait_us
-                                  : static_cast<std::int64_t>(_config.poll_interval_us);
-        if (_requests.wait_dequeue_timed(next, timeout_us) && next != nullptr) {
-          scheduler.activate(std::move(next));
-        }
-      } else {
-        // The in-flight window is full: let the GPU make progress before polling.
-        std::this_thread::sleep_for(poll_interval);
+      if (scheduler.active == nullptr && has_capacity && scheduler.take_next()) continue;
+
+      // Nothing can be dispatched now: sleep at the one wait point, only as long as in-flight
+      // copies, parked slices and asynchronous reads can afford to wait.
+      bool const polling =
+        inflight_count() != 0 || !_waiting.empty() || !_write_waiting.empty();
+      auto timeout_us = polling ? poll_interval_us : idle_wait_us;
+      if (auto const limit = async_wait_limit_us(); limit >= 0) {
+        timeout_us = std::min(timeout_us, limit);
       }
+      wait_for_work(timeout_us, scheduler.active == nullptr && has_capacity, stop_token);
     }
   } catch (...) {
     fatal_error = std::current_exception();
@@ -3006,6 +3537,9 @@ void cufile_reactor::worker_loop(std::stop_token const& stop_token)
   // Slices waiting for their stream have issued nothing: settle them at once
   // rather than wait for other callers' GPU work.
   cancel_waiting(terminal_error);
+  // Reads in flight on lanes cannot be recalled: wait for them, settle them with their real
+  // results and release the lanes, here on the worker.
+  drain_async(terminal_error);
 
   // On a clean stop, give outstanding reads a chance to finish so their
   // coordinators settle with real byte counts; on a fatal error, or if they do
