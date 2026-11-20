@@ -448,6 +448,42 @@ struct fused_read_config {
 };
 
 /**
+ * @brief When a host batch reader may call @c cuFileBatchIOSubmit, and how it reaps
+ *        (@ref host_batch_config).
+ *
+ * libcufile 1.17.1 in compatibility mode has a use-after-free in @c cuFileBatchIOGetStatus: a
+ * call that returns fewer events than the handle has in flight (a poll that finds nothing, a
+ * timeout, a partial return) leaves a dangling internal pointer, and the process crashes in a
+ * later @c GetStatus once the calling thread's allocator reused that memory (measured on 2x RTX
+ * 6000 Ada: 5 of 5 runs of a raw-API reproducer, and of a refill-while-pending workload).  The
+ * wave policies avoid such returns: a reader submits a wave only once its previous wave was fully
+ * reaped and waits for the whole wave in one call.
+ *
+ * Anything but @ref exclusive must first be qualified on the target stack (library, mode,
+ * filesystem) with the hidden test `cucascade_io_tests "[host_batch_quirk]"`, which runs each
+ * policy (and the raw reproducer) in child processes and reports their crash counts.  Mixing
+ * policies among the batch readers alive at the same time in one process is unsupported: the
+ * readers that exist first fix the process policy, and a reader configured differently meanwhile
+ * logs a warning once and uses the process policy.
+ */
+enum class batch_submit_policy : std::uint8_t {
+  /// Whole waves, one in flight process-wide: a reader submits only while no other reader's wave
+  /// is in flight (a process-wide gate, released as soon as the wave completed).  Readers
+  /// alternate; entries staged meanwhile wait.  The default and the most conservative shape.
+  exclusive,
+  /// Whole waves per reader: a reader submits a wave only when its own previous wave was fully
+  /// reaped; readers do not coordinate, so waves of different readers overlap.  The shape the
+  /// raw GDS-host benchmark ran (threads x waves on separate handles) at io_uring parity.  Never
+  /// crashed in compatibility mode on libcufile 1.17.1 (also with heap spraying), but qualify it
+  /// on the target stack first.
+  per_reader,
+  /// Refill while entries are pending (libaio style): staged entries are submitted at once and
+  /// completions reaped as they come (@c min_nr 1).  Fastest where the library supports it;
+  /// crashes in compatibility mode on libcufile 1.17.1 (the partial returns above).
+  continuous,
+};
+
+/**
  * @brief Host reads through cuFile's batch API.
  *
  * A host-only read whose body is 4 KiB-aligned in file offset, length and destination
@@ -476,12 +512,18 @@ struct host_batch_config {
   /// Aligned bodies smaller than this keep the synchronous path.
   std::size_t min_bytes{64UL << 10};
 
-  /// Longest the reactor blocks in @c cuFileBatchIOGetStatus waiting for a completion, in
-  /// microseconds: a request queued meanwhile waits at most this long to be seen.
+  /// Longest the reactor worker sleeps, in microseconds, while batch entries are in flight
+  /// without hearing from them.  The reader's helper thread wakes the worker when a wave
+  /// completed, so this only bounds a lost wake-up; it never delays a request (the worker
+  /// never blocks in cuFile for the batch).
   unsigned poll_us{200};
 
   /// Consecutive rejected submits after which a reactor gives up batching for good.
   unsigned failure_limit{4};
+
+  /// When submits may run.  Keep @c exclusive unless the target stack was qualified for
+  /// another policy (see @ref batch_submit_policy).
+  batch_submit_policy submit_policy{batch_submit_policy::exclusive};
 
   bool operator==(host_batch_config const&) const = default;
 
@@ -505,6 +547,11 @@ struct host_batch_config {
     }
     if (failure_limit == 0) {
       throw std::invalid_argument("host_batch.failure_limit must be positive");
+    }
+    if (submit_policy != batch_submit_policy::exclusive &&
+        submit_policy != batch_submit_policy::per_reader &&
+        submit_policy != batch_submit_policy::continuous) {
+      throw std::invalid_argument("host_batch.submit_policy is not a batch_submit_policy");
     }
   }
 };

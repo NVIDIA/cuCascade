@@ -45,6 +45,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -58,6 +59,7 @@
 #include <fstream>
 #include <memory>
 #include <mutex>
+#include <limits>
 #include <optional>
 #include <random>
 #include <string>
@@ -240,9 +242,11 @@ struct batch_script {
   struct fake_entry {
     void* cookie;
     std::size_t size;
+    CUfileBatchHandle_t handle;
+    std::chrono::steady_clock::time_point submitted;
   };
   std::deque<fake_entry> pending;
-  std::deque<CUfileIOEvents_t> ready;
+  std::deque<std::pair<CUfileBatchHandle_t, CUfileIOEvents_t>> ready;
   int next_handle{1};
 
   /// Back to a clean script serving @p table's batch calls (fake: none).
@@ -334,10 +338,12 @@ CUfileError_t scripted_submit(CUfileBatchHandle_t handle,
     if (s.outstanding + nr > s.capacity) { s.over_capacity = true; }
     if (s.fake) {
       for (unsigned i = 0; i < nr; ++i) {
-        s.pending.push_back({params[i].cookie, params[i].u.batch.size});
+        s.pending.push_back(
+          {params[i].cookie, params[i].u.batch.size, handle, std::chrono::steady_clock::now()});
       }
       s.outstanding += nr;
       s.max_outstanding = std::max(s.max_outstanding, s.outstanding);
+      s.cv.notify_all();
       return status_of(CU_FILE_SUCCESS);
     }
   }
@@ -372,11 +378,33 @@ CUfileError_t scripted_get_status(CUfileBatchHandle_t handle,
                           ? std::chrono::nanoseconds{5s}
                           : std::chrono::seconds{timeout->tv_sec} +
                               std::chrono::nanoseconds{timeout->tv_nsec};
-      s.cv.wait_for(lock, wait, [&] { return s.ready.size() >= min_nr; });
+      // A test that failed before completing its entries must not hang in the reader's
+      // destructor: entries pending for 10 s complete as cancelled.
+      auto const now = std::chrono::steady_clock::now();
+      for (auto it = s.pending.begin(); it != s.pending.end();) {
+        if (it->handle == handle && now - it->submitted > 10s) {
+          CUfileIOEvents_t event{};
+          event.cookie = it->cookie;
+          event.status = CUFILE_CANCELED;
+          s.ready.emplace_back(handle, event);
+          it = s.pending.erase(it);
+        } else {
+          ++it;
+        }
+      }
+      auto ready_for_handle = [&] {
+        return static_cast<std::size_t>(std::count_if(
+          s.ready.begin(), s.ready.end(), [&](auto const& e) { return e.first == handle; }));
+      };
+      s.cv.wait_for(lock, wait, [&] { return ready_for_handle() >= min_nr; });
       unsigned count = 0;
-      while (count < *nr && !s.ready.empty()) {
-        events[count++] = s.ready.front();
-        s.ready.pop_front();
+      for (auto it = s.ready.begin(); it != s.ready.end() && count < *nr;) {
+        if (it->first != handle) {
+          ++it;
+          continue;
+        }
+        events[count++] = it->second;
+        it              = s.ready.erase(it);
       }
       s.outstanding -= count;
       *nr = count;
@@ -409,8 +437,9 @@ CUfileError_t scripted_cancel(CUfileBatchHandle_t handle)
     std::lock_guard lock(s.mutex);
     ++s.cancels;
     if (s.fake) {
-      s.outstanding -= s.pending.size();
-      s.pending.clear();
+      auto const before = s.pending.size();
+      std::erase_if(s.pending, [&](auto const& e) { return e.handle == handle; });
+      s.outstanding -= before - s.pending.size();
       return status_of(CU_FILE_SUCCESS);
     }
   }
@@ -424,9 +453,10 @@ void scripted_destroy(CUfileBatchHandle_t handle)
     std::lock_guard lock(s.mutex);
     ++s.destroys;
     if (s.fake) {
-      s.outstanding = 0;
-      s.pending.clear();
-      s.ready.clear();
+      auto const before = s.pending.size() + s.ready.size();
+      std::erase_if(s.pending, [&](auto const& e) { return e.handle == handle; });
+      std::erase_if(s.ready, [&](auto const& e) { return e.first == handle; });
+      s.outstanding -= before - s.pending.size() - s.ready.size();
       return;
     }
   }
@@ -476,11 +506,23 @@ class scripted_batch {
 
   /// Fake mode: complete the @p n oldest pending entries with @p status (ret: the size, or
   /// @p ret when given).
+  static constexpr std::size_t all = std::numeric_limits<std::size_t>::max();
+
+  /// Fake mode: wait (bounded) until @p n entries were submitted and are pending.
+  [[nodiscard]] bool wait_pending(std::size_t n) const
+  {
+    auto& s = script();
+    std::unique_lock lock(s.mutex);
+    return s.cv.wait_for(lock, 5s, [&] { return s.pending.size() >= n; });
+  }
+
   void complete(std::size_t n, CUfileStatus_t status = CUFILE_COMPLETE, std::optional<std::size_t> ret = {})
   {
     auto& s = script();
     {
-      std::lock_guard lock(s.mutex);
+      std::unique_lock lock(s.mutex);
+      // The reader's helper thread submits asynchronously: wait (bounded) for the entries.
+      if (n != all) s.cv.wait_for(lock, 5s, [&] { return s.pending.size() >= n; });
       for (std::size_t i = 0; i < n && !s.pending.empty(); ++i) {
         auto const entry = s.pending.front();
         s.pending.pop_front();
@@ -488,7 +530,7 @@ class scripted_batch {
         event.cookie = entry.cookie;
         event.status = status;
         event.ret    = ret.value_or(entry.size);
-        s.ready.push_back(event);
+        s.ready.emplace_back(entry.handle, event);
       }
     }
     s.cv.notify_all();
@@ -640,7 +682,7 @@ TEST_CASE("host batch reader refills entries as they complete", "[io][cufile][ho
     reader.flush();
     while (done_count < reads && clock_type::now() < deadline) {
       std::ignore = reader.reap(5ms, done);
-      issue();  // refilled while the rest of the wave is in flight: staged, deferred
+      issue();  // refilled once the wave was reported whole
       reader.flush();
     }
     reader.drain(done);
@@ -649,7 +691,6 @@ TEST_CASE("host batch reader refills entries as they complete", "[io][cufile][ho
     CHECK(max_used <= depth);
     CHECK(reader.counters().completed == reads);
     CHECK(reader.counters().submits > 1);
-    CHECK(reader.counters().deferred_flushes > 0);
   }
   intercept.with([&](batch_script& s) {
     CHECK(s.max_outstanding <= depth);
@@ -974,17 +1015,78 @@ TEST_CASE("host batch readers on several threads stay exclusive", "[io][cufile][
 }
 
 /// The workload that crashes libcufile 1.17.1 (compatibility mode) when submits overlap entries
-/// in flight; run in a child process by the test below.
-TEST_CASE("host batch continuous-submit crash probe (child)", "[.][host_batch_crash_child]")
+/// in flight: three readers on three threads, each doing 1500 mixed reads of up to 4 MiB at
+/// depth 32, with the policy named by CUCASCADE_HOST_BATCH_CRASH_CHILD.  Run in child processes
+/// by the test below.
+TEST_CASE("host batch submit-policy crash probe (child)", "[.][host_batch_crash_child]")
 {
-  if (std::getenv("CUCASCADE_HOST_BATCH_CRASH_CHILD") == nullptr) { SKIP("child process only"); }
+  auto const* name = std::getenv("CUCASCADE_HOST_BATCH_CRASH_CHILD");
+  if (name == nullptr) { SKIP("child process only"); }
   if (real_batch_api() == nullptr) { SKIP("libcufile with the batch API is unavailable"); }
+  if (std::string{name} == "raw_partial") {
+    // The library bug itself, through the raw API: a GetStatus that returns fewer events than
+    // are in flight, then any allocation on this thread reusing the chunk cuFile freed, then the
+    // next GetStatus.
+    auto const* api   = cufile_api::get();
+    pattern_file const file{64UL << 20};
+    auto const object = open_registered(file);
+    if (!object) { SKIP("cuFile cannot register the test file"); }
+    host_memory memory(32UL << 20, false);
+    CUfileBatchHandle_t handle{nullptr};
+    REQUIRE(api->batch_setup(&handle, 8).err == CU_FILE_SUCCESS);
+    std::vector<void*> spray;
+    for (int round = 0; round < 50; ++round) {
+      std::array<CUfileIOParams_t, 4> params{};
+      std::array<std::size_t, 4> const sizes{block, 4UL << 20, 8UL << 20, 1UL << 20};
+      for (std::size_t i = 0; i < 4; ++i) {
+        params[i].mode                  = CUFILE_BATCH;
+        params[i].opcode                = CUFILE_READ;
+        params[i].fh                    = object->cufile_handle();
+        params[i].u.batch.devPtr_base   = memory.data() + i * (8UL << 20);
+        params[i].u.batch.file_offset   = static_cast<off_t>(((static_cast<std::size_t>(round) * 4 + i) % 6) * (8UL << 20));
+        params[i].u.batch.size          = sizes[i];
+        params[i].cookie                = reinterpret_cast<void*>(i + 1);
+      }
+      REQUIRE(api->batch_submit(handle, 4, params.data(), 0).err == CU_FILE_SUCCESS);
+      unsigned done = 0;
+      std::array<CUfileIOEvents_t, 8> events{};
+      while (done < 4) {
+        unsigned nr = 8;
+        timespec timeout{2, 0};
+        REQUIRE(api->batch_get_status(handle, 1, &nr, events.data(), &timeout).err == CU_FILE_SUCCESS);
+        done += nr;
+        if (done < 4) {
+          for (std::size_t size = 16; size <= 2048; size += 16) {
+            auto* chunk = static_cast<std::uint64_t*>(std::malloc(size));
+            std::fill(chunk, chunk + size / 8, std::uint64_t{0x40000});
+            spray.push_back(chunk);
+          }
+        }
+      }
+    }
+    api->batch_destroy(handle);
+    for (auto* chunk : spray) std::free(chunk);
+    return;
+  }
+  auto const policy = std::string{name} == "continuous"   ? batch_submit_policy::continuous
+                      : std::string{name} == "per_reader" ? batch_submit_policy::per_reader
+                                                          : batch_submit_policy::exclusive;
   pattern_file const file{64UL << 20};
   auto const object = open_registered(file);
   if (!object) { SKIP("cuFile cannot register the test file"); }
-  for (std::uint64_t seed = 1; seed <= 3; ++seed) {
-    auto const out = run_stress(file, object->cufile_handle(), 3000, 32, 4UL << 20, seed,
-                                batch_submit_policy::continuous, has_cuda_device());
+  constexpr std::size_t threads = 3;
+  std::vector<stress_outcome> outcomes(threads);
+  std::vector<std::thread> workers;
+  for (std::size_t t = 0; t < threads; ++t) {
+    workers.emplace_back([&, t] {
+      outcomes[t] = run_stress(
+        file, object->cufile_handle(), 1500, 32, 4UL << 20, 1 + t, policy, has_cuda_device());
+    });
+  }
+  for (auto& worker : workers) {
+    worker.join();
+  }
+  for (auto const& out : outcomes) {
     CHECK(out.bad == 0);
   }
 }
@@ -992,25 +1094,95 @@ TEST_CASE("host batch continuous-submit crash probe (child)", "[.][host_batch_cr
 TEST_CASE("cuFile batch crashes when submits overlap entries in flight (why exclusive)",
           "[.][host_batch_quirk]")
 {
-  // Documents why batch_submit_policy::exclusive is the default.  Hidden: each child run may
-  // dump core.  Reports how many continuous-submit children died; never fails on that count.
+  // Qualifies the submit policies on this stack (see batch_submit_policy): runs the probe above
+  // in child processes per policy, plus the raw-API reproducer of the libcufile bug the wave
+  // policies avoid ("raw_partial": GetStatus returning part of what is in flight, then heap
+  // reuse), and reports how many died.  Hidden: a child may dump core.  Never fails on a crash
+  // count; fails only when a child hangs.
   if (real_batch_api() == nullptr) { SKIP("libcufile with the batch API is unavailable"); }
-  int crashed = 0, passed = 0;
-  for (int run = 0; run < 5; ++run) {
-    cucascade::test::child_test_runner child("host batch continuous-submit crash probe (child)",
-                                             {{"CUCASCADE_HOST_BATCH_CRASH_CHILD", "1"}});
-    if (!child.wait_for(std::chrono::milliseconds{120'000})) {
+  auto const policy =
+    GENERATE(as<std::string>{}, "exclusive", "per_reader", "continuous", "raw_partial");
+  constexpr int runs = 5;
+  int crashed = 0, passed = 0, failed = 0;
+  for (int run = 0; run < runs; ++run) {
+    cucascade::test::child_test_runner child("host batch submit-policy crash probe (child)",
+                                             {{"CUCASCADE_HOST_BATCH_CRASH_CHILD", policy}});
+    if (!child.wait_for(std::chrono::milliseconds{180'000})) {
       child.stop();
-      FAIL("crash probe child hung");
+      FAIL("crash probe child hung (policy " << policy << ")");
     }
     if (WIFSIGNALED(child.status())) {
       ++crashed;
     } else if (WIFEXITED(child.status()) && WEXITSTATUS(child.status()) == 0) {
       ++passed;
+    } else {
+      ++failed;
     }
   }
-  WARN("libcufile " << cufile_api::version() << ": " << crashed << " of 5 continuous-submit runs "
-                    << "crashed, " << passed << " passed");
+  WARN("libcufile " << cufile_api::version() << ", policy " << policy << ": " << crashed << " of "
+                    << runs << " runs crashed, " << failed << " failed, " << passed << " passed");
+}
+
+TEST_CASE("host batch readers under per_reader submit waves independently",
+          "[io][cufile][host_batch]")
+{
+  scripted_batch fake(true);
+  host_memory memory(8 * block, false);
+  host_batch_reader a(4, 4, batch_submit_policy::per_reader);
+  host_batch_reader b(4, 4, batch_submit_policy::per_reader);
+  REQUIRE(a.policy() == batch_submit_policy::per_reader);
+  REQUIRE(b.policy() == batch_submit_policy::per_reader);
+  result_log log;
+  a.add(fake_read(memory.data(), 0));
+  a.flush();
+  REQUIRE(fake.wait_pending(1));
+  b.add(fake_read(memory.data() + block, 1));
+  b.flush();
+  REQUIRE(fake.wait_pending(2));  // no gate: b's wave overlaps a's
+  a.add(fake_read(memory.data() + 2 * block, 2));
+  a.flush();
+  CHECK(a.staged() == 1);  // a's own wave is still in flight
+  CHECK(a.in_flight() == 1);
+  fake.complete(2);
+  CHECK(a.reap(5s, log) == 1);
+  // Reporting a's wave handed the deferred entry over.
+  CHECK(a.staged() == 0);
+  CHECK(a.in_flight() == 1);
+  REQUIRE(reap_all(b, log, 5s));
+  fake.complete(1);
+  REQUIRE(reap_all(a, log, 5s));
+  CHECK(log.results.size() == 3);
+  fake.with([](batch_script& s) {
+    CHECK(s.submits_while_pending > 0);
+    return 0;
+  });
+}
+
+TEST_CASE("host batch readers alive together share the first reader's policy",
+          "[io][cufile][host_batch]")
+{
+  scripted_batch fake(true);
+  {
+    host_batch_reader first(4, 4, batch_submit_policy::per_reader);
+    host_batch_reader second(4, 4, batch_submit_policy::continuous);
+    CHECK(first.policy() == batch_submit_policy::per_reader);
+    CHECK(second.policy() == batch_submit_policy::per_reader);
+  }
+  // All gone: the next reader fixes the policy again.
+  host_batch_reader later(4, 4, batch_submit_policy::continuous);
+  CHECK(later.policy() == batch_submit_policy::continuous);
+}
+
+TEST_CASE("host batch config validates the submit policy", "[io][cufile][host_batch]")
+{
+  cucascade::io::cufile::host_batch_config config;
+  config.enabled = true;
+  CHECK(config.submit_policy == batch_submit_policy::exclusive);
+  CHECK_NOTHROW(config.validate());
+  config.submit_policy = batch_submit_policy::per_reader;
+  CHECK_NOTHROW(config.validate());
+  config.submit_policy = static_cast<batch_submit_policy>(7);
+  CHECK_THROWS_AS(config.validate(), std::invalid_argument);
 }
 
 TEST_CASE("cuFile batch ignores devPtr_offset on host memory (why entries use offset 0)",
@@ -1246,13 +1418,14 @@ TEST_CASE("host batch reader recovers from a rejected submit", "[io][cufile][hos
       reader.add(read_at(i));
     }
     reader.flush();
+    // The helper submits, sees the rejection, recreates the handle, then reports.
+    REQUIRE(reap_all(reader, log));
     CHECK(reader.in_flight() == 0);
-    CHECK(reader.pending_failures() == 4);
     CHECK(reader.available());
     CHECK(intercept.with([](batch_script& s) { return s.cancels; }) == 1);
     CHECK(intercept.with([](batch_script& s) { return s.destroys; }) == 1);
     CHECK(intercept.with([](batch_script& s) { return s.setups; }) == 2);
-    CHECK(reader.reap(0us, log) == 4);
+    CHECK(log.results.size() == 4);
     CHECK(log.count(batch_result::status::failed) == 4);
     for (auto const& r : log.results) {
       CHECK(r.error == static_cast<int>(CU_FILE_BATCH_FULL));
@@ -1289,16 +1462,16 @@ TEST_CASE("host batch reader reports a rejected submit after the entries in flig
   reader.add(fake_read(memory.data() + block, 1));
   reader.flush();
   REQUIRE(reader.in_flight() == 2);
+  REQUIRE(fake.wait_pending(2));  // submitted by the helper
   fake.with([](batch_script& s) { return s.reject_submits = 1; });
   reader.add(fake_read(memory.data() + 2 * block, 2));
   reader.add(fake_read(memory.data() + 3 * block, 3));
   reader.flush();
-  CHECK(reader.free_entries() == 0);  // until the handle is reset
   CHECK(reader.available());
-  CHECK(reader.pending_failures() == 2);
   result_log log;
   // Not reported while the handle that rejected them still has entries in flight.
-  CHECK(reader.reap(0us, log) == 0);
+  CHECK(reader.reap(50ms, log) == 0);
+  CHECK(fake.with([](batch_script& s) { return s.rejected; }) == 1);
   CHECK(fake.with([](batch_script& s) { return s.destroys; }) == 0);
   fake.complete(2);
   REQUIRE(reap_all(reader, log, 5s));
@@ -1375,9 +1548,9 @@ TEST_CASE("host batch reader gives up when the handle cannot be recreated",
   REQUIRE(reader.available());
   reader.add(fake_read(memory.data(), 0));
   reader.flush();
-  CHECK_FALSE(reader.available());
   result_log log;
   reader.drain(log);
+  CHECK_FALSE(reader.available());
   REQUIRE(log.results.size() == 1);
   CHECK(log.results[0].outcome == batch_result::status::failed);
 }
@@ -1392,11 +1565,11 @@ TEST_CASE("host batch reader aborts the handle on a GetStatus error", "[io][cufi
     for (std::size_t i = 0; i < 5; ++i) {
       reader.add(fake_read(memory.data() + i * block, i));
     }
+    fake.with([](batch_script& s) { return s.get_status_error = true; });
     reader.flush();
     reader.add(fake_read(memory.data() + 5 * block, 5));  // staged, not flushed
-    fake.with([](batch_script& s) { return s.get_status_error = true; });
     result_log log;
-    auto const reported = reader.reap(10ms, log);
+    auto const reported = reader.reap(5s, log);
     CHECK(reported == 6);
     CHECK(log.count(batch_result::status::failed) == 6);
     for (auto const& r : log.results) {
@@ -1424,10 +1597,10 @@ TEST_CASE("host batch reader aborts the handle on a GetStatus error", "[io][cufi
       for (std::size_t i = 0; i < 8; ++i) {
         reader.add(batch_read{object->cufile_handle(), memory.data() + i * entry_bytes, range{i * entry_bytes, entry_bytes}, i});
       }
-      reader.flush();
       intercept.with([](batch_script& s) { return s.get_status_error = true; });
+      reader.flush();
       result_log log;
-      std::ignore = reader.reap(1ms, log);
+      std::ignore = reader.reap(5s, log);
       CHECK(log.results.size() == 8);
       CHECK(log.count(batch_result::status::failed) == 8);
       CHECK_FALSE(reader.available());
@@ -1562,3 +1735,4 @@ TEST_CASE("host batch reader throughput vs pread", "[.][host_batch_bench]")
                  << " GB/s");
   }
 }
+

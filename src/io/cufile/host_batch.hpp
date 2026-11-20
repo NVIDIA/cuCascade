@@ -18,6 +18,7 @@
 
 #pragma once
 
+#include <cucascade/io/cufile/config.hpp>
 #include <cucascade/io/types.hpp>
 
 #include <cufile.h>
@@ -26,6 +27,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <thread>
 #include <tuple>
 #include <utility>
 
@@ -63,87 +65,102 @@ struct batch_result {
   int error{};          ///< failed: the cuFile entry status or the cuFile error code; else 0.
 };
 
-/**
- * @brief When a @ref host_batch_reader may call @c cuFileBatchIOSubmit.
- *
- * libcufile 1.17.1 in compatibility mode corrupts its batch state when a @c Submit runs while
- * batch entries are in flight -- on the same handle or on another handle of the process -- and
- * later crashes inside @c cuFileBatchIOGetStatus (SIGSEGV; measured on 2x RTX 6000 Ada: 30-85%
- * of 3000-read runs at 32-64 entries in flight, also with one entry per submit).  Submitting a
- * whole wave only while nothing is in flight in the process never crashed.
- */
-enum class batch_submit_policy : std::uint8_t {
-  /// Submit only while no batch entry of any reader of the process is in flight: a reader takes
-  /// a process-wide gate for one wave of entries and releases it once the wave has completed.
-  /// Entries staged meanwhile wait (see @ref host_batch_reader::flush).  The safe default.
-  exclusive,
-  /// Submit whenever entries are staged, also while others are in flight (the batch API's
-  /// documented semantics).  Only for a libcufile that handles it.  Ignores the gate, so do not
-  /// mix it with exclusive readers in one process.
-  continuous,
-};
+/// The submit policy lives in the public configuration (cufile/config.hpp).
+using cucascade::io::cufile::batch_submit_policy;
 
 /// Diagnostic counters of a @ref host_batch_reader (plain integers, read by its owner).
 struct host_batch_counters {
-  std::uint64_t submits{0};           ///< Successful @c cuFileBatchIOSubmit calls.
+  std::uint64_t submits{0};            ///< Successful @c cuFileBatchIOSubmit calls.
   std::uint64_t submitted_entries{0};  ///< Entries those calls carried.
-  std::uint64_t rejected_submits{0};  ///< Submit calls cuFile rejected.
-  std::uint64_t completed{0};         ///< Entries reported @c ok.
-  std::uint64_t short_reads{0};       ///< Entries reported @c short_read.
-  std::uint64_t failed{0};            ///< Entries reported @c failed (for any reason).
-  std::uint64_t bytes{0};             ///< Bytes delivered by @c ok and @c short_read entries.
-  std::uint64_t handle_resets{0};     ///< Batch handles recreated after a rejected submit.
-  std::uint64_t deferred_flushes{0};  ///< Flushes that left entries staged (exclusive policy).
-  std::uint64_t submit_ns{0};         ///< Time spent inside cuFileBatchIOSubmit.
+  std::uint64_t rejected_submits{0};   ///< Submit calls cuFile rejected.
+  std::uint64_t completed{0};          ///< Entries reported @c ok.
+  std::uint64_t short_reads{0};        ///< Entries reported @c short_read.
+  std::uint64_t failed{0};             ///< Entries reported @c failed (for any reason).
+  std::uint64_t bytes{0};              ///< Bytes delivered by @c ok and @c short_read entries.
+  std::uint64_t handle_resets{0};      ///< Batch handles recreated after a rejected submit.
+  std::uint64_t deferred_flushes{0};   ///< Flushes that left entries staged (wave policies).
+  std::uint64_t submit_ns{0};          ///< Time spent inside cuFileBatchIOSubmit.
+  /// @c GetStatus calls that returned fewer events than were in flight although the policy
+  /// waits for the whole wave (a wave slower than the 1 s per-call timeout); see the class
+  /// comment for why they matter.
+  std::uint64_t partial_status{0};
 };
 
 /**
  * @brief Keeps up to @ref capacity aligned host reads in flight through one cuFile batch
  *        handle (@c cuFileBatchIOSetUp / @c Submit / @c GetStatus / @c Cancel / @c Destroy).
  *
- * Usage, on one thread: @ref add entries while @ref free_entries is non-zero, @ref flush them
- * (one @c Submit), and @ref reap completions; @ref drain before destruction.  The parameter,
- * event and bookkeeping arrays are allocated once by the constructor; the cookie of an entry
- * is its index (+1), so a completion is found in O(1).  Nothing on the hot path allocates or
- * locks, and no call blocks longer than the wait it is given.
+ * Usage, on one owner thread: @ref add entries while @ref free_entries is non-zero, @ref flush
+ * them, and @ref reap completions; @ref drain before destruction.  The cookie of an entry is its
+ * index (+1), so a completion is found in O(1).  Every array is allocated by the constructor.
+ *
+ * A helper thread owned by the reader makes the @c Submit and @c GetStatus calls: the owner hands
+ * it a wave (one mutex-protected hand-off per wave, no allocation) and collects the completions
+ * it publishes; the helper calls the wake callback after each publication, so the owner need not
+ * poll.  The owner thread therefore never blocks in cuFile (a compatibility-mode @c Submit does
+ * much of the I/O synchronously).  The helper never allocates.
+ *
+ * Why waves reaped whole: libcufile 1.17.1 (compatibility mode, measured on 2x RTX 6000 Ada)
+ * leaves a dangling internal pointer whenever @c cuFileBatchIOGetStatus returns fewer events than
+ * the handle has in flight -- a poll that finds nothing, a timeout, or a partial return with
+ * @c min_nr below the outstanding count.  The next completion dereferences it, and if the calling
+ * thread's allocator reused that chunk meanwhile the process crashes in @c GetStatus (SIGSEGV).
+ * Under @ref batch_submit_policy::exclusive and @ref batch_submit_policy::per_reader the helper
+ * submits a wave only when the previous one was fully reaped and waits with @c min_nr equal to the
+ * whole wave (1 s per call; a slower wave is counted in @c partial_status), so such returns do not
+ * occur; waves of different readers may overlap (measured safe with heap spraying).
+ * @ref batch_submit_policy::continuous refills while entries are pending and reaps with
+ * @c min_nr 1, which exposes the bug on that library.
  *
  * Every entry passes its own destination as @c devPtr_base with @c devPtr_offset 0: libcufile
  * 1.17 in compatibility mode silently ignores a non-zero @c devPtr_offset on host memory and
  * lands every entry at the base.
  *
  * Failures:
- * - A rejected @c Submit fails every entry of that call.  The handle is then recreated
- *   (@c Cancel, @c Destroy, @c SetUp) as soon as nothing else is in flight on it, and only
- *   then are the rejected entries reported (by @ref reap) -- so cuFile can no longer touch their
- *   destinations when the owner sees the failure.  Meanwhile @ref free_entries is 0.  After
- *   @c failure_limit consecutive rejected submits (a successful one resets the count), or when
- *   the recreation fails, the reader becomes unavailable for good (logged once).
- * - A @c GetStatus error breaks the handle: it is cancelled and destroyed at once and every
+ * - A rejected @c Submit fails every entry of that call.  The helper recreates the handle
+ *   (@c Cancel, @c Destroy, @c SetUp) once nothing else is in flight on it, and only then are the
+ *   rejected entries reported -- so cuFile can no longer touch their destinations when the owner
+ *   sees the failure.  After @c failure_limit consecutive rejected submits (a successful one resets
+ *   the count), or when the recreation fails, the reader becomes unavailable for good (logged
+ *   once).
+ * - A @c GetStatus error breaks the handle: the helper cancels and destroys it at once and every
  *   outstanding or staged entry is reported @c failed; the reader is unavailable for good.
  *
- * Not thread-safe: every call, including destruction, on the owner's thread.
+ * Not thread-safe: every call, including destruction, on the owner's thread (the wake callback
+ * runs on the helper thread).
  */
 class host_batch_reader {
  public:
+  /// Called on the helper thread after it published completions; must be noexcept and cheap.
+  using wake_fn = void (*)(void* context) noexcept;
+
   /**
    * @brief Set up one batch handle of @p depth entries, clamped to cuFile's
-   *        @c max_batch_io_size when that is reported.
+   *        @c max_batch_io_size when that is reported, and start the helper thread.
    *
    * Opens the cuFile driver (@c cufile_api::open_driver) first.  Never throws, never blocks on
-   * I/O: without the cuFile batch group, with @p depth 0, or when @c SetUp or the allocation
-   * fails, @ref available is false and @ref free_entries 0.  The cuFile table current at
+   * I/O: without the cuFile batch group, with @p depth 0, or when @c SetUp, the allocation or the
+   * thread fails, @ref available is false and @ref free_entries 0.  The cuFile table current at
    * construction (@c cufile_api::get()) serves the reader for its whole life.
    *
    * @param depth          entries in flight at most.
    * @param failure_limit  consecutive rejected submits before giving up (0 is taken as 1).
-   * @param policy         when submits may run; see @ref batch_submit_policy.
+   * @param policy         when submits may run; see @ref batch_submit_policy.  The readers
+   *                       alive first fix the process policy: a reader constructed with
+   *                       another one meanwhile logs a warning once and uses the process
+   *                       policy (@ref policy reports the one in effect).
+   * @param wake           called (with @p wake_context) on the helper thread after it published
+   *                       completions; may be null.
    */
   host_batch_reader(unsigned depth,
                     unsigned failure_limit,
-                    batch_submit_policy policy = batch_submit_policy::exclusive) noexcept;
+                    batch_submit_policy policy = batch_submit_policy::exclusive,
+                    wake_fn wake               = nullptr,
+                    void* wake_context         = nullptr) noexcept;
 
-  /// Destroys the handle.  Requires @ref in_flight() == 0 (@ref drain first; asserted in debug
-  /// builds; a release build cancels what is still in flight before destroying the handle).
+  /// Stops the helper (after any wave in flight completed: a destination is never abandoned) and
+  /// destroys the handle.  Requires @ref in_flight() == 0 (@ref drain first; asserted in debug
+  /// builds).  No allocation, no throw.
   ~host_batch_reader();
 
   host_batch_reader(host_batch_reader const&)            = delete;
@@ -151,34 +168,37 @@ class host_batch_reader {
   host_batch_reader(host_batch_reader&&)                 = delete;
   host_batch_reader& operator=(host_batch_reader&&)      = delete;
 
-  /// Whether the reader can take entries (now or once a pending handle reset is done).
+  /// Whether the reader can take entries.
   [[nodiscard]] bool available() const noexcept { return !_disabled; }
 
   /// Entries the handle holds: @c depth clamped to @c max_batch_io_size (0 when unavailable
   /// from the start).
   [[nodiscard]] std::size_t capacity() const noexcept { return _capacity; }
 
-  /// Entries submitted and not yet reported.
+  /// Entries handed to the helper (submitted, or about to be) and not yet reported.
   [[nodiscard]] std::size_t in_flight() const noexcept { return _in_flight; }
 
-  /// Entries added and not yet submitted (including a deferred wave).
+  /// Entries added and not yet handed to the helper (including a deferred wave).
   [[nodiscard]] std::size_t staged() const noexcept { return _staged; }
 
-  [[nodiscard]] batch_submit_policy policy() const noexcept { return _policy; }
-
-  /// Failed entries (rejected, or aborted with the handle) not yet reported by @ref reap.
+  /// Failed entries not yet reported by @ref reap.
   [[nodiscard]] std::size_t pending_failures() const noexcept { return _failed_count; }
 
-  /**
-   * @brief Entries @ref add can take now: capacity minus in flight, staged and unreported
-   *        failures; 0 while unavailable or while a rejected handle waits for its reset.
-   */
-  [[nodiscard]] std::size_t free_entries() const noexcept
-  {
-    return (_disabled || _needs_reset) ? 0 : _free_top;
-  }
+  /// Entries @ref add can take now: capacity minus in flight, staged and unreported failures;
+  /// 0 while unavailable.
+  [[nodiscard]] std::size_t free_entries() const noexcept { return _disabled ? 0 : _free_top; }
 
-  /// Diagnostic counters.
+  /// The submit policy in effect (see the constructor).
+  [[nodiscard]] batch_submit_policy policy() const noexcept { return _policy; }
+
+  /// Whether the helper published completions @ref reap has not collected yet.  Any thread.
+  [[nodiscard]] bool completions_pending() const noexcept;
+
+  /// Whether the last @ref flush left a wave staged (it waits for this reader's wave in flight
+  /// or, under @c exclusive, for another reader's); @ref reap retries it.
+  [[nodiscard]] bool deferred() const noexcept { return _deferred; }
+
+  /// Diagnostic counters (updated by @ref reap).
   [[nodiscard]] host_batch_counters const& counters() const noexcept { return _counters; }
 
   /**
@@ -192,33 +212,28 @@ class host_batch_reader {
   void add(batch_read const& read) noexcept;
 
   /**
-   * @brief Submit everything staged in one @c cuFileBatchIOSubmit.
+   * @brief Hand everything staged to the helper, which submits it in one
+   *        @c cuFileBatchIOSubmit.
    *
-   * On success the entries are in flight.  On rejection they are reported @c failed by a later
-   * @ref reap, after the handle was reset (see the class description).  No-op when nothing is
-   * staged.  Can take milliseconds in compatibility mode (cuFile does part of the work inside
-   * @c Submit).
-   *
-   * Under @ref batch_submit_policy::exclusive the submit is deferred -- the entries stay staged
-   * -- while this reader's previous wave is in flight or another reader holds the process-wide
-   * gate; @ref reap submits the deferred wave as soon as it may.
+   * No-op when nothing is staged.  Under @ref batch_submit_policy::exclusive and
+   * @ref batch_submit_policy::per_reader the hand-off is deferred -- the entries stay staged --
+   * while this reader's previous wave is not fully reported, and under @c exclusive also while
+   * another reader's wave holds the process-wide gate; @ref reap hands the deferred wave over as
+   * soon as it may.  Never blocks on I/O.
    */
   void flush() noexcept;
 
   /**
    * @brief Report finished entries through @p done.
    *
-   * With entries in flight, one @c cuFileBatchIOGetStatus: a non-blocking poll when @p wait is
-   * 0, else it waits up to @p wait for the first completion (returning as soon as there is
-   * one; never longer than @p wait).  Without entries in flight it returns at once, except that
-   * a deferred wave (exclusive policy) is retried, sleeping at most `min(wait, 100 us)` while
-   * another reader holds the gate.  Then it resets a rejected handle once nothing is in flight
-   * on it, reports the failed entries that became reportable, and submits a deferred wave that
-   * may now go.
+   * Collects what the helper published; when nothing is published and entries are in flight,
+   * waits up to @p wait for a publication (0: never waits).  A deferred wave is retried first,
+   * sleeping at most `min(wait, 100 us)` while another reader holds the gate and nothing of this
+   * reader is in flight.  Never blocks longer than about @p wait.
    *
    * Each entry's index is freed before @p done sees it, so @p done may @ref add (and
    * @ref flush) again.  @p done is called as `done(batch_result const&)`; it must not throw (a
-   * throwing @p done leaves the remaining events of this call unreported: the caller's bug) and
+   * throwing @p done leaves the remaining results of this call unreported: the caller's bug) and
    * must not call @ref reap or @ref drain.
    *
    * @return The number of entries reported.
@@ -226,8 +241,8 @@ class host_batch_reader {
   template <typename Done>
   std::size_t reap(std::chrono::microseconds wait, Done&& done)
   {
-    std::size_t reported = 0;
-    std::size_t const events = poll_events(retry_deferred(wait));
+    std::size_t reported     = 0;
+    std::size_t const events = collect(retry_deferred(wait));
     batch_result result;
     for (std::size_t i = 0; i < events; ++i) {
       if (take_event(i, result)) {
@@ -235,7 +250,6 @@ class host_batch_reader {
         done(std::as_const(result));
       }
     }
-    settle();
     while (take_failure(result)) {
       ++reported;
       done(std::as_const(result));
@@ -247,14 +261,14 @@ class host_batch_reader {
   /**
    * @brief Flush, then reap until nothing is staged, in flight or pending report.
    *
-   * Polls with a bounded wait per call and logs a warning every few seconds while entries stay
-   * outstanding; it never returns while cuFile may still write a destination.  Entries
+   * Waits with a bounded timeout per call and logs a warning every few seconds while entries
+   * stay outstanding; it never returns while cuFile may still write a destination.  Entries
    * @p done adds are flushed and drained too.  The reader stays usable afterwards.
    */
   template <typename Done>
   void drain(Done&& done)
   {
-    auto const start = std::chrono::steady_clock::now();
+    auto const start  = std::chrono::steady_clock::now();
     auto next_warning = start + drain_warning_interval;
     for (;;) {
       flush();
@@ -279,53 +293,51 @@ class host_batch_reader {
     int error{0};
   };
 
-  /// Exclusive policy: submit a deferred wave when allowed; with @p wait > 0 and nothing in
-  /// flight, sleep up to min(wait, 100 us) for the gate first.  Returns what is left of @p wait.
+  /// State shared with the helper thread (defined in the source).
+  struct shared_state;
+
+  /// Hand a deferred wave over when allowed; with @p wait > 0 and nothing in flight, sleep up
+  /// to min(wait, 100 us) for the gate first.  Returns what is left of @p wait.
   std::chrono::microseconds retry_deferred(std::chrono::microseconds wait) noexcept;
-  /// Whether a submit may run now (takes the process-wide gate under the exclusive policy).
+  /// Whether a wave may be handed over now (takes the process-wide gate under exclusive).
   bool may_submit() noexcept;
-  /// Release the gate once this reader's wave completed (exclusive policy).
-  void release_gate() noexcept;
   void stop_waiting() noexcept;
-  /// One GetStatus when entries are in flight (zero timeout when failures are ready to report);
-  /// returns the number of events in @c _events.  On a GetStatus error, aborts the handle.
-  std::size_t poll_events(std::chrono::microseconds wait) noexcept;
-  /// Turn event @p i into @p result and free its entry; false when the event is not final or
-  /// does not name an entry in flight.
+  /// Take what the helper published (waiting up to @p wait when nothing is and entries are in
+  /// flight): events into @c _events (returns their count), rejected and aborted entries into
+  /// the failure list, counters, and the helper's verdicts (disabled, aborted).
+  std::size_t collect(std::chrono::microseconds wait) noexcept;
+  /// Turn event @p i into @p result and free its entry; false when it does not name an entry in
+  /// flight.
   bool take_event(std::size_t i, batch_result& result) noexcept;
-  /// Pop one reportable failure into @p result and free its entry.
+  /// Pop one failure into @p result and free its entry.
   bool take_failure(batch_result& result) noexcept;
-  /// Reset a rejected handle once nothing is in flight on it.
-  void settle() noexcept;
-  /// Cancel and destroy the handle, fail everything outstanding and disable the reader.
-  void abort_handle(int error) noexcept;
   void mark_failed(std::uint32_t index, int error) noexcept;
   void disable(char const* why, int error) noexcept;
   void log_drain_stall(std::chrono::steady_clock::duration elapsed) const noexcept;
+  void helper_loop() noexcept;
 
   cufile_api const* _api{nullptr};
-  CUfileBatchHandle_t _handle{nullptr};
   std::size_t _capacity{0};
   unsigned _failure_limit{1};
 
-  std::unique_ptr<CUfileIOParams_t[]> _params;  ///< [0, _staged): the next submit.
-  std::unique_ptr<CUfileIOEvents_t[]> _events;
+  std::unique_ptr<CUfileIOParams_t[]> _params;  ///< [0, _staged): the next wave.
+  std::unique_ptr<CUfileIOEvents_t[]> _events;  ///< Events collected by the owner.
   std::unique_ptr<entry[]> _entries;
   std::unique_ptr<std::uint32_t[]> _free;    ///< [0, _free_top): free indices.
   std::unique_ptr<std::uint32_t[]> _failed;  ///< [0, _failed_count): failed, unreported.
+  std::unique_ptr<shared_state> _shared;
+  std::thread _helper;
 
   std::size_t _free_top{0};
   std::size_t _staged{0};
   std::size_t _in_flight{0};
   std::size_t _failed_count{0};
-  unsigned _consecutive_rejections{0};
   batch_submit_policy _policy{batch_submit_policy::exclusive};
-  bool _deferred{false};   ///< A flush left entries staged.
-  bool _owns_gate{false};  ///< This reader holds the process-wide submit gate.
-  bool _waiting{false};    ///< Counted in the gate's waiters.
-  std::chrono::steady_clock::time_point _yield_until{};
-  bool _needs_reset{false};  ///< A submit was rejected: reset once nothing is in flight.
   bool _disabled{true};
+  bool _deferred{false};    ///< A flush left entries staged.
+  bool _waiting{false};     ///< Counted in the gate's waiters.
+  bool _registered{false};  ///< Counted among the live readers of the process policy.
+  std::chrono::steady_clock::time_point _yield_until{};
 
   host_batch_counters _counters;
 };
