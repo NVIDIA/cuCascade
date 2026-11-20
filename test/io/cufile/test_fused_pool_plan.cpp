@@ -34,6 +34,7 @@
 using cucascade::io::cufile::config;
 using cucascade::io::cufile::describe;
 using cucascade::io::cufile::device_group_plan;
+using cucascade::io::cufile::fused_lane_staging_bytes;
 using cucascade::io::cufile::fused_read_config;
 using cucascade::io::cufile::host_batch_config;
 using cucascade::io::cufile::lane_completion;
@@ -182,12 +183,28 @@ TEST_CASE("pool plan counts lane and batch reactors", "[io][cufile][fused_plan][
   CHECK(plan.total_reactors() == 2 * (8 + 4) + 2);
 }
 
-TEST_CASE("pool plan with fused reads budgets lanes within the staging cap",
+TEST_CASE("fused_lane_staging_bytes is the registered memory the lanes want",
+          "[io][cufile][fused_plan][placement]")
+{
+  config cfg;
+  CHECK(fused_lane_staging_bytes(cfg) == 0);  // disabled
+  cfg.fused_reads.enabled = true;
+  CHECK(fused_lane_staging_bytes(cfg) == 128 * lane_footprint(8 * MiB));
+  CHECK(fused_lane_staging_bytes(cfg) == 1032 * MiB);
+  cfg.fused_reads.reactors_per_device = 2;
+  cfg.fused_reads.lanes_per_reactor   = 4;
+  cfg.fused_reads.slot_bytes          = 1 * MiB;
+  CHECK(fused_lane_staging_bytes(cfg) == 8 * lane_footprint(1 * MiB));
+  cfg.fused_reads.max_lanes_per_device = 5;
+  CHECK(fused_lane_staging_bytes(cfg) == 5 * lane_footprint(1 * MiB));
+}
+
+TEST_CASE("pool plan budgets fused lanes on top of the staging cap",
           "[io][cufile][fused_plan][placement][gpu]")
 {
   if (device_count() == 0) SKIP("no CUDA device");
 
-  SECTION("the default 1 GiB cap holds 127 of 128 lanes of 8 MiB")
+  SECTION("defaults: every lane, no warning")
   {
     auto const cfg  = fused_config();
     auto const plan = plan_cufile_pool(cfg, nullptr, quiet_platform());
@@ -196,30 +213,18 @@ TEST_CASE("pool plan with fused reads budgets lanes within the staging cap",
     auto const& group = plan.groups.front();
     CHECK(group.lane_reactors == 4);
     CHECK(group.lanes_per_reactor == 32);
-    CHECK(group.staging_cap_bytes == cfg.max_staging_bytes_per_device);
-    CHECK(group.lane_slots == (1UL << 30) / lane_footprint(8 * MiB));
-    CHECK(group.lane_slots == 127);
+    CHECK(group.lane_slots == 128);
     CHECK(group.staging_slots == 0);  // staging never
+    // The staging pool's cap counts the lanes on top of the configured cap.
+    CHECK(group.staging_cap_bytes == cfg.max_staging_bytes_per_device + 1032 * MiB);
     // The lanes carry the device reads: the synchronous reactors fall to the local count.
     CHECK(group.n_reactors == local_reactors_per_device);
     CHECK(plan.total_reactors() == local_reactors_per_device + 4);
     CHECK(plan.lane_slot_bytes == 8 * MiB);
     CHECK(plan.host_batch_reactors == 0);
-    // 128 x (8 MiB + 64 KiB) = 1032 MiB.
-    CHECK(any_contains(plan.warnings, "127 of 128 fused-read lanes"));
-    CHECK(any_contains(plan.warnings, "max_staging_bytes_per_device to at least 1032 MiB"));
+    CHECK(plan.warnings.empty());
   }
-  SECTION("a large enough cap holds every lane, without warnings")
-  {
-    auto cfg                         = fused_config();
-    cfg.max_staging_bytes_per_device = 2UL << 30;
-    auto const plan                  = plan_cufile_pool(cfg, nullptr, quiet_platform());
-    INFO(describe(plan));
-    REQUIRE(plan.groups.size() == 1);
-    CHECK(plan.groups.front().lane_slots == 128);
-    CHECK_FALSE(any_contains(plan.warnings, "fused-read"));
-  }
-  SECTION("no cap: every wanted lane")
+  SECTION("no cap and no hardware limit: no cap at all")
   {
     auto cfg                         = fused_config();
     cfg.max_staging_bytes_per_device = 0;
@@ -227,6 +232,16 @@ TEST_CASE("pool plan with fused reads budgets lanes within the staging cap",
     REQUIRE(plan.groups.size() == 1);
     CHECK(plan.groups.front().staging_cap_bytes == 0);
     CHECK(plan.groups.front().lane_slots == 128);
+  }
+  SECTION("a small configured cap does not cut lanes")
+  {
+    auto cfg                         = fused_config();
+    cfg.max_staging_bytes_per_device = 16 * MiB;
+    auto const plan                  = plan_cufile_pool(cfg, nullptr, quiet_platform());
+    REQUIRE(plan.groups.size() == 1);
+    CHECK(plan.groups.front().lane_slots == 128);
+    CHECK(plan.groups.front().staging_cap_bytes == 16 * MiB + 1032 * MiB);
+    CHECK(plan.warnings.empty());
   }
   SECTION("max_lanes_per_device bounds the lanes")
   {
@@ -240,6 +255,8 @@ TEST_CASE("pool plan with fused reads budgets lanes within the staging cap",
     CHECK(plan.groups.front().lane_reactors == 2);
     CHECK(plan.groups.front().lanes_per_reactor == 64);
     CHECK(plan.groups.front().lane_slots == 40);
+    CHECK(plan.groups.front().staging_cap_bytes ==
+          cfg.max_staging_bytes_per_device + 40 * lane_footprint(1 * MiB));
     CHECK(plan.lane_slot_bytes == 1 * MiB);
     CHECK(plan.warnings.empty());
   }
@@ -252,19 +269,45 @@ TEST_CASE("pool plan with fused reads budgets lanes within the staging cap",
     CHECK(plan.groups.front().n_reactors == 3);
     CHECK(plan.total_reactors() == 3 + 4);
   }
-  SECTION("cuFile's pinned limit binds: the warning says so")
+  SECTION("cuFile's pinned limit cuts lanes: the warning names it")
   {
     auto platform                          = quiet_platform();
     platform.max_device_pinned_mem_size_kb = 64 * 1024;  // 64 MiB
     auto const plan = plan_cufile_pool(fused_config(), nullptr, platform);
+    INFO(describe(plan));
     REQUIRE(plan.groups.size() == 1);
-    CHECK(plan.groups.front().staging_cap_bytes == 64 * MiB);
     CHECK(plan.groups.front().lane_slots == 7);
-    CHECK(any_contains(plan.warnings, "pinned-memory limit binds"));
+    // The rest of the hardware limit goes to the synchronous staging; the total stays in it.
+    CHECK(plan.groups.front().staging_cap_bytes == 64 * MiB);
+    CHECK(any_contains(plan.warnings, "max_device_pinned_mem_size"));
+    CHECK(any_contains(plan.warnings, "holds only 7 of 128 fused-read lanes"));
+    CHECK(any_contains(plan.warnings, "fewer lanes run"));
+    CHECK_FALSE(any_contains(plan.warnings, "max_staging_bytes_per_device"));
+  }
+  SECTION("a roomy hardware limit: lanes first, the staging cap within what is left")
+  {
+    auto platform                          = quiet_platform();
+    platform.max_device_pinned_mem_size_kb = 2048 * 1024;
+    platform.max_device_cache_size_kb      = 128 * 1024;  // hard limit 1920 MiB
+    auto cfg                               = fused_config();
+    auto plan                              = plan_cufile_pool(cfg, nullptr, platform);
+    REQUIRE(plan.groups.size() == 1);
+    CHECK(plan.groups.front().lane_slots == 128);
+    // min(1024, 1920 - 1032) + 1032 = 1920.
+    CHECK(plan.groups.front().staging_cap_bytes == 1920 * MiB);
+    CHECK(plan.warnings.empty());
+    // Without a configured cap the synchronous staging gets the rest of the hardware limit.
+    cfg.max_staging_bytes_per_device = 0;
+    plan                             = plan_cufile_pool(cfg, nullptr, platform);
+    CHECK(plan.groups.front().staging_cap_bytes == 1920 * MiB);
+    // A small configured cap stays below the hardware limit.
+    cfg.max_staging_bytes_per_device = 100 * MiB;
+    plan                             = plan_cufile_pool(cfg, nullptr, platform);
+    CHECK(plan.groups.front().staging_cap_bytes == 1132 * MiB);
   }
 }
 
-TEST_CASE("pool plan sizes synchronous staging from what the lanes leave",
+TEST_CASE("pool plan sizes synchronous staging from the cap and what the lanes leave",
           "[io][cufile][fused_plan][placement][gpu]")
 {
   if (device_count() == 0) SKIP("no CUDA device");
@@ -278,42 +321,55 @@ TEST_CASE("pool plan sizes synchronous staging from what the lanes leave",
   cfg.fused_reads.lanes_per_reactor   = 4;
   auto const slot_footprint           = cfg.staging_slot_bytes() + 64 * KiB;
   auto const lanes                    = 4 * lane_footprint(8 * MiB);
+  auto const pinned                   = [](std::size_t bytes) {
+    auto platform                          = quiet_platform();
+    platform.max_device_pinned_mem_size_kb = bytes / KiB;
+    return platform;
+  };
 
-  SECTION("room for every lane and every staging slot")
+  SECTION("the configured cap holds every staging slot")
   {
-    cfg.max_staging_bytes_per_device = lanes + 6 * slot_footprint;
+    cfg.max_staging_bytes_per_device = 6 * slot_footprint;
     auto const plan                  = plan_cufile_pool(cfg, nullptr, quiet_platform());
     INFO(describe(plan));
     REQUIRE(plan.groups.size() == 1);
     CHECK(plan.groups.front().lane_slots == 4);
     CHECK(plan.groups.front().staging_slots == 6);
+    CHECK(plan.groups.front().staging_cap_bytes == 6 * slot_footprint + lanes);
     CHECK(plan.warnings.empty());
   }
-  SECTION("the lanes leave the synchronous reactors three of six slots")
+  SECTION("the configured cap binds the synchronous staging only, as without lanes")
   {
-    cfg.max_staging_bytes_per_device = lanes + 3 * slot_footprint;
+    cfg.max_staging_bytes_per_device = 3 * slot_footprint;
     auto const plan                  = plan_cufile_pool(cfg, nullptr, quiet_platform());
     INFO(describe(plan));
     REQUIRE(plan.groups.size() == 1);
     CHECK(plan.groups.front().lane_slots == 4);
     CHECK(plan.groups.front().staging_slots == 3);
-    auto const needed_mib = (lanes + 6 * slot_footprint + MiB - 1) / MiB;
-    CHECK(any_contains(plan.warnings, "synchronous reactors 3 of 6 staging slots"));
-    CHECK(any_contains(plan.warnings,
-                       "at least " + std::to_string(needed_mib) + " MiB, or lower fused_reads"));
+    CHECK(plan.groups.front().staging_cap_bytes == 3 * slot_footprint + lanes);
+    CHECK(plan.warnings.empty());
   }
-  SECTION("the cap holds fewer lanes than wanted: the warning counts the staging too")
+  SECTION("the lanes leave the synchronous reactors three of six slots of the hardware limit")
   {
-    cfg.max_staging_bytes_per_device = 2 * lane_footprint(8 * MiB);
-    auto const plan                  = plan_cufile_pool(cfg, nullptr, quiet_platform());
+    auto const plan = plan_cufile_pool(cfg, nullptr, pinned(lanes + 3 * slot_footprint));
+    INFO(describe(plan));
+    REQUIRE(plan.groups.size() == 1);
+    CHECK(plan.groups.front().lane_slots == 4);
+    CHECK(plan.groups.front().staging_slots == 3);
+    CHECK(plan.groups.front().staging_cap_bytes == lanes + 3 * slot_footprint);
+    CHECK(any_contains(plan.warnings, "to its 3 synchronous reactors: 3 of 6 staging slots"));
+    CHECK_FALSE(any_contains(plan.warnings, "holds only"));
+  }
+  SECTION("the hardware limit holds fewer lanes than wanted and no staging slot")
+  {
+    auto const plan = plan_cufile_pool(cfg, nullptr, pinned(2 * lane_footprint(8 * MiB)));
     INFO(describe(plan));
     REQUIRE(plan.groups.size() == 1);
     CHECK(plan.groups.front().lane_slots == 2);
     CHECK(plan.groups.front().staging_slots == 0);
-    auto const needed_mib = (lanes + 6 * slot_footprint + MiB - 1) / MiB;
-    CHECK(any_contains(plan.warnings,
-                       "at least " + std::to_string(needed_mib) +
-                         " MiB to fit every lane plus the synchronous staging"));
+    CHECK(plan.groups.front().staging_cap_bytes == 2 * lane_footprint(8 * MiB));
+    CHECK(any_contains(plan.warnings, "holds only 2 of 4 fused-read lanes"));
+    CHECK(any_contains(plan.warnings, "0 of 6 staging slots"));
   }
 }
 
@@ -411,14 +467,15 @@ TEST_CASE("describe names the lanes, their slots and the batch reactors",
           "[io][cufile][fused_plan][placement][gpu]")
 {
   if (device_count() == 0) SKIP("no CUDA device");
-  auto cfg                         = fused_config();
-  cfg.max_staging_bytes_per_device = 2UL << 30;
-  cfg.host_batch.enabled           = true;
+  auto cfg               = fused_config();
+  cfg.host_batch.enabled = true;
   auto const plan                  = plan_cufile_pool(cfg, nullptr, quiet_platform());
   auto const text                  = describe(plan);
   INFO(text);
   CHECK(text.find("4 lane reactors x 32 lanes") != std::string::npos);
-  CHECK(text.find("128 lane slots of 8192 KiB") != std::string::npos);
+  CHECK(text.find("128 lane slots of 8192 KiB (1032 MiB registered, on top of the staging cap)") !=
+        std::string::npos);
+  CHECK(text.find("registered staging cap 2056 MiB, lanes included") != std::string::npos);
   CHECK(text.find("lane slots of 8192 KiB") != std::string::npos);
   CHECK(text.find("2 host-batch reactors") != std::string::npos);
   CHECK(text.find("(4 lane, 8 synchronous, 2 host-batch)") != std::string::npos);

@@ -354,15 +354,19 @@ struct fused_read_config {
   /// @ref reactors_per_device x this.
   std::size_t lanes_per_reactor{32};
 
-  /// Process-wide ceiling on lanes per GPU, over every ioctx together.  It guards the
-  /// storage: 128 asynchronous reads in flight is what was qualified on GPFS (a deeper run of
-  /// small reads crashed that client).  Lane sets that find the budget spent run with fewer
-  /// lanes, or serve through the synchronous paths.
+  /// Process-wide ceiling on lanes per GPU, counted over every ioctx together.  It guards
+  /// the storage: 128 asynchronous reads in flight is what was qualified on GPFS (a deeper
+  /// run of small reads crashed that client).  A lane set takes lanes only while the process
+  /// holds fewer than its own configured ceiling on that GPU: with different values in
+  /// different ioctxs, each set applies its own.  Lane sets that find the budget spent run
+  /// with fewer lanes, or serve through the synchronous paths.
   std::size_t max_lanes_per_device{128};
 
   /// Bytes of a lane's registered slot: the largest single read.  A multiple of 64 KiB.
-  /// Registered memory per GPU = lanes x (this + 64 KiB), inside
-  /// @c config::max_staging_bytes_per_device.
+  /// Registered memory per GPU = lanes x (this + 64 KiB), in addition to
+  /// @c config::max_staging_bytes_per_device (which bounds the synchronous staging only);
+  /// account for it when sizing a GPU memory pool.  Half the GPU's free BAR1 and cuFile's
+  /// pinned-memory limit still bound the total.
   std::size_t slot_bytes{8UL << 20};
 
   /// Fuse neighbouring slices into one read.  When false a slice is only split at the slot

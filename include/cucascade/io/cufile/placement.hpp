@@ -52,10 +52,12 @@ struct device_group_plan {
   std::size_t n_reactors{0};
   std::vector<int> cpus;         ///< CPUs those reactors are pinned to; empty = unpinned.
   std::size_t staging_slots{0};  ///< Registered staging slots reserved for it at start.
-  /// Cap on registered staging for this device, in bytes (0 = none): the config's
-  /// cap, half of the BAR1 free at planning time, and cuFile's pinned-memory limit.
-  /// Computed when the pool stages or runs fused-read lanes (both lease from the
-  /// same pool); 0 otherwise.
+  /// Cap on all registered staging of this device, in bytes (0 = none), as the staging
+  /// pool enforces it.  Without fused reads: the config's cap, half of the BAR1 free at
+  /// planning time, and cuFile's pinned-memory limit.  With fused reads: the synchronous
+  /// staging budget (the config's cap, within what those hardware limits leave after the
+  /// lanes) plus the lane slots' bytes, never above the hardware limits.  Computed when
+  /// the pool stages or runs fused-read lanes; 0 otherwise.
   std::size_t staging_cap_bytes{0};
   /// Fused-read lane reactors serving it (@c fused_read_config::reactors_per_device);
   /// 0 when fused reads are off.  Built before the synchronous reactors.
@@ -64,8 +66,10 @@ struct device_group_plan {
   std::size_t lanes_per_reactor{0};
   /// Registered lane slots (of @ref pool_plan::lane_slot_bytes) to reserve for this GPU
   /// at start: at most @ref lane_reactors x @ref lanes_per_reactor, at most
-  /// @c fused_read_config::max_lanes_per_device, and within @ref staging_cap_bytes.
-  /// The synchronous @ref staging_slots are sized from what the cap has left.
+  /// @c fused_read_config::max_lanes_per_device, and within half the free BAR1 and
+  /// cuFile's pinned-memory limit.  Budgeted on top of
+  /// @c config::max_staging_bytes_per_device, which bounds the synchronous
+  /// @ref staging_slots only.
   std::size_t lane_slots{0};
   std::string reason;  ///< How the numbers were chosen, in words.
 };
@@ -119,6 +123,18 @@ struct pool_plan {
 };
 
 /**
+ * @brief Registered device memory the fused-read lanes of one GPU want, in bytes, on top
+ *        of @c config::max_staging_bytes_per_device.
+ *
+ * 0 when @c cfg.fused_reads is disabled, else
+ * @c min(reactors_per_device x lanes_per_reactor, max_lanes_per_device) x
+ * (@c slot_bytes + 64 KiB).  A flat pool (no per-device plan) adds it to the configured
+ * cap; a planned pool may reserve fewer lanes when the hardware limits bind (see
+ * @ref device_group_plan::lane_slots).
+ */
+[[nodiscard]] std::size_t fused_lane_staging_bytes(config const& cfg) noexcept;
+
+/**
  * @brief Plan a cuFile pool from the discovered topology: a group of reactors per
  *        visible GPU, pinned to the CPUs local to it and sized by Little's law,
  *        with a registered staging budget the device can hold.
@@ -131,8 +147,10 @@ struct pool_plan {
  *   synchronous reactors serve writes and fallbacks.
  * - Fused-read lanes (@c cfg.fused_reads enabled): per GPU, @c reactors_per_device
  *   lane reactors of @c lanes_per_reactor lanes, and as many registered lane slots
- *   as @c max_lanes_per_device and the staging cap allow; they are budgeted before
- *   the synchronous staging slots.  An invalid @c fused_reads or @c host_batch
+ *   as @c max_lanes_per_device, half the free BAR1 and cuFile's pinned-memory limit
+ *   allow (see @ref fused_lane_staging_bytes).  Lanes are budgeted on top of
+ *   @c max_staging_bytes_per_device, before the synchronous staging slots, which get
+ *   what the hardware limits leave.  An invalid @c fused_reads or @c host_batch
  *   block is reported in the warnings and planned as disabled.
  * - Host batch (@c cfg.host_batch enabled): @c host_batch.reactors reactors shared
  *   by every GPU.
