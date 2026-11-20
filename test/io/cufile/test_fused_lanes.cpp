@@ -251,14 +251,12 @@ std::vector<lane_result> reap_n(fused_lane_set& set,
                                   std::vector<std::pair<std::size_t, std::size_t>> const& parts,
                                   std::uint8_t* dst,
                                   std::size_t gap      = 17,
-                                  std::uint64_t token  = 0,
-                                  cudaEvent_t gate     = nullptr)
+                                  std::uint64_t token  = 0)
 {
   lane_read read;
   read.handle = handle;
   read.window = window;
   read.token  = token;
-  read.gate   = gate;
   std::size_t pos = 3;
   for (auto const& [offset, bytes] : parts) {
     read.copies.push_back(lane_copy{dst + pos, offset, bytes});
@@ -285,38 +283,6 @@ void require_async_cufile()
   }
 }
 
-/// Releases a host-held stream when it goes out of scope, whatever happened.
-class stream_latch {
- public:
-  stream_latch() : _released(_promise.get_future().share()) {}
-  ~stream_latch() { release(); }
-  stream_latch(stream_latch const&)            = delete;
-  stream_latch& operator=(stream_latch const&) = delete;
-
-  /// Hold @p stream until @ref release (or 30 s, so a failing test cannot hang).
-  void hold(cudaStream_t stream)
-  {
-    auto* const waiter = new std::shared_future<void>(_released);
-    REQUIRE(cudaLaunchHostFunc(
-              stream,
-              [](void* arg) {
-                std::unique_ptr<std::shared_future<void>> const released{
-                  static_cast<std::shared_future<void>*>(arg)};
-                std::ignore = released->wait_for(30s);
-              },
-              waiter) == cudaSuccess);
-  }
-
-  void release()
-  {
-    if (!_done.exchange(true)) _promise.set_value();
-  }
-
- private:
-  std::promise<void> _promise;
-  std::shared_future<void> _released;
-  std::atomic<bool> _done{false};
-};
 
 // ---------------------------------------------------------------------------
 // A scripted cuFile: plain functions over one process-wide state.
@@ -538,6 +504,7 @@ struct seam_reset {
   {
     set_lane_callback_failure_for_testing(0);
     set_lane_copy_failure_for_testing(0);
+    cucascade::io::cufile::detail::set_lane_stream_create_failure_for_testing(0);
   }
 };
 
@@ -682,52 +649,90 @@ TEST_CASE("fused lanes: more reads than lanes, round-robin lane use",
   }
 }
 
-TEST_CASE("fused lanes: copies wait for the gate", "[io][cufile][fused_lanes][gpu]")
+/// @p read turned into a held read: its copies are returned for copy_out.
+[[nodiscard]] std::vector<lane_copy> make_held(lane_read& read)
+{
+  auto copies = std::move(read.copies);
+  read.copies.clear();
+  read.hold         = true;
+  read.needed_bytes = 0;
+  for (auto const& copy : copies) {
+    read.needed_bytes = std::max(read.needed_bytes, copy.offset + copy.bytes - read.window.offset);
+  }
+  return copies;
+}
+
+TEST_CASE("fused lanes: held reads", "[io][cufile][fused_lanes][gpu]")
 {
   require_async_cufile();
-  pattern_file const file{2 * MiB};
+  pattern_file const file{4 * MiB};
   auto const object = open_registered(file);
-  fused_lane_set set{make_options(2, 1 * MiB)};
-  REQUIRE(set.capacity() == 2);
-
+  waker wake;
+  std::optional<fused_lane_set> set;
+  set.emplace(make_options(2, 1 * MiB, &wake));
+  REQUIRE(set->capacity() == 2);
   device_memory dst{1 * MiB};
   dst.fill(0xAB);
-  cudaStream_t caller{};
-  REQUIRE(cudaStreamCreateWithFlags(&caller, cudaStreamNonBlocking) == cudaSuccess);
-  cudaEvent_t gate{};
-  REQUIRE(cudaEventCreateWithFlags(&gate, cudaEventDisableTiming) == cudaSuccess);
+  range const window{256 * KiB, 512 * KiB};
+  auto read = make_read(object->cufile_handle(),
+                        window,
+                        {{window.offset + 3, 200 * KiB}, {window.offset + 300 * KiB, 1000}},
+                        dst.get(),
+                        5,
+                        7);
+  auto copies       = make_held(read);
+  auto const wanted = copies;
+  REQUIRE(set->submit(std::move(read)));
+
+  // Phase one: the read only.  Nothing touches the destination.
+  auto results = reap_n(*set, 1);
+  REQUIRE(results.size() == 1);
+  CHECK(results[0].held);
+  CHECK(results[0].outcome == lane_result::status::ok);
+  CHECK(results[0].token == 7);
+  CHECK(set->held() == 1);
+  CHECK(set->active() == 0);
+  CHECK(set->in_flight() == 1);
+  CHECK(set->free_lanes() == 1);
+  CHECK(set->oldest_in_flight() == std::chrono::steady_clock::duration::zero());
+  auto const untouched = bytes_at(dst.get(), 1 * MiB);
+  CHECK(std::all_of(untouched.begin(), untouched.end(), [](std::uint8_t b) { return b == 0xAB; }));
+  // drain returns at once: a held lane has nothing queued.
+  std::size_t drained = 0;
+  set->drain([&](lane_result const&) { ++drained; });
+  CHECK(drained == 0);
+  CHECK(set->held() == 1);
+
+  SECTION("copy_out lands the bytes")
   {
-    stream_latch latch;
-    latch.hold(caller);
-    REQUIRE(cudaEventRecord(gate, caller) == cudaSuccess);
-
-    range const window{256 * KiB, 512 * KiB};
-    auto read = make_read(
-      object->cufile_handle(), window, {{window.offset + 3, 200 * KiB}}, dst.get(), 0, 7, gate);
-    auto const copies = read.copies;
-    REQUIRE(set.submit(std::move(read)));
-    CHECK(set.gated() == 1);
-
-    std::this_thread::sleep_for(300ms);
-    std::size_t early = 0;
-    std::ignore       = set.reap([&](lane_result const&) { ++early; });
-    CHECK(early == 0);
-    CHECK(set.in_flight() == 1);
-    CHECK(set.oldest_in_flight() >= 250ms);
-    auto const before = bytes_at(dst.get(), 1 * MiB);
-    CHECK(std::all_of(before.begin(), before.end(), [](std::uint8_t b) { return b == 0xAB; }));
-
-    latch.release();
-    auto const results = reap_n(set, 1);
-    REQUIRE(results.size() == 1);
+    auto const lane = results[0].lane;
+    CHECK_FALSE(set->copy_out(lane == 0 ? 1U : 0U, std::vector<lane_copy>{}));  // not held
+    REQUIRE(set->copy_out(lane, std::move(copies)));
+    CHECK(set->held() == 0);
+    results = reap_n(*set, 1);
+    CHECK_FALSE(results[0].held);
     CHECK(results[0].outcome == lane_result::status::ok);
-    CHECK(results[0].token == 7);
-    CHECK(set.gated() == 0);
-    CHECK(copies_match(copies, file));
+    CHECK(results[0].lane == lane);
+    CHECK(copies_match(wanted, file));
+    CHECK(set->in_flight() == 0);
   }
-  REQUIRE(cudaStreamSynchronize(caller) == cudaSuccess);
-  REQUIRE(cudaEventDestroy(gate) == cudaSuccess);
-  REQUIRE(cudaStreamDestroy(caller) == cudaSuccess);
+
+  SECTION("release drops the data and frees the lane")
+  {
+    set->release_held(results[0].lane);
+    CHECK(set->held() == 0);
+    CHECK(set->in_flight() == 0);
+    CHECK(set->free_lanes() == 2);
+    auto const after = bytes_at(dst.get(), 1 * MiB);
+    CHECK(std::all_of(after.begin(), after.end(), [](std::uint8_t b) { return b == 0xAB; }));
+  }
+
+  SECTION("the set is destroyed once its held lane is released")
+  {
+    set->release_held(results[0].lane);
+    set.reset();
+  }
+  CHECK(wake.count.load() >= 1);
 }
 
 TEST_CASE("fused lanes: scripted cuFile failures and short reads",
@@ -844,6 +849,56 @@ TEST_CASE("fused lanes: scripted cuFile failures and short reads",
     CHECK(cufile.calls().empty());
   }
 
+  SECTION("a held short read continues after copy_out")
+  {
+    cufile.script({{fake_action::kind::short_read, 2 * block + 100}});
+    auto r      = read();
+    auto copies = make_held(r);
+    auto const wanted = copies;
+    REQUIRE(set->submit(std::move(r)));
+    auto results = reap_n(*set, 1);
+    REQUIRE(results[0].held);
+    CHECK(cufile.calls().size() == 1);  // the continuation waits for copy_out
+    REQUIRE(set->copy_out(results[0].lane, std::move(copies)));
+    results = reap_n(*set, 1);
+    CHECK_FALSE(results[0].held);
+    CHECK(results[0].outcome == lane_result::status::ok);
+    CHECK(results[0].resubmits == 1);
+    CHECK(copies_match(wanted, file));
+    auto const calls = cufile.calls();
+    REQUIRE(calls.size() == 2);
+    CHECK(calls[1].file_offset == window.offset + 2 * block);
+    CHECK(calls[1].base == calls[0].base);
+  }
+
+  SECTION("a held read without progress fails without being held")
+  {
+    cufile.script({{fake_action::kind::short_read, 100}});
+    auto r = read();
+    std::ignore = make_held(r);
+    REQUIRE(set->submit(std::move(r)));
+    auto const results = reap_n(*set, 1);
+    CHECK_FALSE(results[0].held);
+    CHECK(results[0].outcome == lane_result::status::io_failed);
+    CHECK(set->held() == 0);
+  }
+
+  SECTION("many copies of one window go out in one call")
+  {
+    std::vector<std::pair<std::size_t, std::size_t>> many;
+    for (std::size_t i = 0; i < 8; ++i) {
+      many.emplace_back(window.offset + i * 8000 + 1, 3000);
+    }
+    auto r            = make_read(object->cufile_handle(), window, many, dst.get(), 9, 9);
+    auto const copies = r.copies;
+    auto const before = cucascade::io::cufile::detail::lane_copy_calls_for_testing();
+    REQUIRE(set->submit(std::move(r)));
+    auto const results = reap_n(*set, 1);
+    CHECK(results[0].outcome == lane_result::status::ok);
+    CHECK(cucascade::io::cufile::detail::lane_copy_calls_for_testing() - before == 1);
+    CHECK(copies_match(copies, file));
+  }
+
   // Whatever happened, the set works afterwards.
   cufile.every({fake_action::kind::normal, 0});
   auto r            = read();
@@ -853,8 +908,11 @@ TEST_CASE("fused lanes: scripted cuFile failures and short reads",
   CHECK(results[0].outcome == lane_result::status::ok);
   CHECK(copies_match(copies, file));
   check_calls_aligned(cufile.calls());
+  auto const retired = cucascade::io::cufile::detail::retired_lane_streams_for_testing();
   set.reset();
-  CHECK(cufile.stream_deregisters() == 2);
+  // Retired, never deregistered: cuFileStreamDeregister would wait for the whole device.
+  CHECK(cufile.stream_deregisters() == 0);
+  CHECK(cucascade::io::cufile::detail::retired_lane_streams_for_testing() - retired == 2);
 }
 
 TEST_CASE("fused lanes: callback and copy enqueue failures are device_failed",
@@ -1145,4 +1203,97 @@ TEST_CASE("fused lanes: stress with random windows and copies",
   WARN("fused lanes stress: " << total << " reads, " << bytes / MiB << " MiB copied in "
                               << seconds << " s (" << static_cast<double>(total) / seconds
                               << " reads/s, includes per-read verification)");
+}
+
+TEST_CASE("fused lanes: a lane whose stream cannot be re-created leaves the set",
+          "[io][cufile][fused_lanes][gpu]")
+{
+  require_async_cufile();
+  seam_reset const reset;
+  pattern_file const file{2 * MiB};
+  auto const object = open_registered(file);
+  fused_lane_set set{make_options(2, 512 * KiB)};
+  REQUIRE(set.capacity() == 2);
+  device_memory dst{1 * MiB};
+  range const window{0, 512 * KiB};
+  set_lane_callback_failure_for_testing(1);
+  cucascade::io::cufile::detail::set_lane_stream_create_failure_for_testing(1);
+  REQUIRE(set.submit(make_read(object->cufile_handle(), window, {{5, 1000}}, dst.get())));
+  auto const results = reap_n(set, 1);
+  CHECK(results[0].outcome == lane_result::status::device_failed);
+  CHECK(set.capacity() == 1);
+  CHECK(set.in_flight() == 0);
+  CHECK(set.free_lanes() == 1);
+  // The other lane still works.
+  auto read         = make_read(object->cufile_handle(), window, {{7, 3000}}, dst.get());
+  auto const copies = read.copies;
+  REQUIRE(set.submit(std::move(read)));
+  CHECK(reap_n(set, 1)[0].outcome == lane_result::status::ok);
+  CHECK(copies_match(copies, file));
+}
+
+TEST_CASE("fused lanes: a lane keeps working across files opened and closed",
+          "[io][cufile][fused_lanes][gpu]")
+{
+  require_async_cufile();
+  fused_lane_set set{make_options(1, 1 * MiB)};
+  REQUIRE(set.capacity() == 1);
+  device_memory dst{1 * MiB};
+  for (int round = 0; round < 4; ++round) {
+    INFO("round " << round);
+    pattern_file const file{2 * MiB};
+    auto object = open_registered(file);
+    range const window{256 * KiB, 512 * KiB};
+    auto read = make_read(object->cufile_handle(), window, {{window.offset + 3, 100 * KiB}}, dst.get());
+    auto const copies = read.copies;
+    REQUIRE(set.submit(std::move(read)));
+    auto const results = reap_n(set, 1);
+    CHECK(results[0].outcome == lane_result::status::ok);
+    CHECK(results[0].io_result >= 0);
+    CHECK(copies_match(copies, file));
+    object.reset();  // cuFileHandleDeregister
+  }
+}
+
+TEST_CASE("fused lanes: lane sets on threads of their own, one after another",
+          "[io][cufile][fused_lanes][gpu]")
+{
+  require_async_cufile();
+  device_memory dst{1 * MiB};
+  for (int round = 0; round < 6; ++round) {
+    INFO("round " << round);
+    pattern_file const file{2 * MiB};
+    auto object = open_registered(file);
+    std::size_t failures = 0;
+    std::size_t mismatches = 0;
+    // Each round's set lives on a thread of its own, as each reactor's does.
+    std::thread worker{[&] {
+      fused_lane_set set{make_options(2, 1 * MiB)};
+      for (int i = 0; i < 2; ++i) {
+        range const window{256 * KiB, 512 * KiB};
+        auto read = make_read(object->cufile_handle(), window, {{window.offset + 3, 100 * KiB}}, dst.get());
+        auto const copies = read.copies;
+        if (!set.submit(std::move(read))) { ++failures; continue; }
+        std::vector<lane_result> results;
+        auto const deadline = std::chrono::steady_clock::now() + 30s;
+        while (results.empty() && std::chrono::steady_clock::now() < deadline) {
+          std::ignore = set.reap([&](lane_result const& r) { results.push_back(r); });
+          std::this_thread::sleep_for(100us);
+        }
+        if (results.empty() || results[0].outcome != lane_result::status::ok) {
+          ++failures;
+          set.drain([](lane_result const&) {});
+          continue;
+        }
+        for (auto const& copy : copies) {
+          std::vector<std::uint8_t> got(copy.bytes);
+          std::ignore = cudaMemcpy(got.data(), copy.dst, copy.bytes, cudaMemcpyDeviceToHost);
+          if (std::memcmp(got.data(), file.data() + copy.offset, copy.bytes) != 0) ++mismatches;
+        }
+      }
+    }};
+    worker.join();
+    CHECK(failures == 0);
+    CHECK(mismatches == 0);
+  }
 }

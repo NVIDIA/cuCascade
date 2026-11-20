@@ -188,6 +188,12 @@ class cufile_ioctx : public templated_ioctx<cufile_reactor> {
                                                io_op_type operation,
                                                int device_id) override;
 
+  /// 1 for a lane read a lane reactor can take now, else 0: a request's lane reads go to
+  /// lane reactors and its other slices to the reactors their own role picks, under one
+  /// coordinator (see @c templated_ioctx::slice_class).
+  [[nodiscard]] std::size_t slice_class(cufile_io_object const& object,
+                                        prepared_io_slice const& slice) const override;
+
   /// Opens @p path with this ioctx's @c use_odirect / @c compat_mode, which the
   /// static @c cufile_reactor::create_io_object(path) cannot see.
   std::shared_ptr<io_object> create_io_object(std::string path) override;
@@ -227,6 +233,19 @@ class cufile_ioctx : public templated_ioctx<cufile_reactor> {
 
   /// Whether fused reads are enabled and the loaded cuFile offers @c cuFileReadAsync.
   [[nodiscard]] bool fused_reads_usable() const noexcept;
+
+  /// Visit the indices of the reactors that may own lanes for @p device_id (its group's
+  /// lane reactors; every reactor of a flat pool) until @p visit returns false.
+  template <typename Visit>
+  void for_each_lane_reactor(int device_id, Visit&& visit) const;
+
+  /// Whether some reactor can serve lane reads into @p device_id now (see
+  /// @c cufile_reactor::lanes_usable).
+  [[nodiscard]] bool lanes_routable(int device_id) const noexcept;
+
+  /// Whether @p slice is a lane read a lane reactor can take now.
+  [[nodiscard]] bool is_routable_lane_read(cufile_io_object const& object,
+                                           prepared_io_slice const& slice) const noexcept;
 
   /// Resolve the GPU, stream gate and split of every device slice (see the class
   /// comment).  @throws on a capturing stream or a CUDA failure.

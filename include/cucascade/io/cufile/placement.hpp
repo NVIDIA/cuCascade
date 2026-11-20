@@ -151,7 +151,8 @@ struct pool_plan {
  *   allow (see @ref fused_lane_staging_bytes).  Lanes are budgeted on top of
  *   @c max_staging_bytes_per_device, before the synchronous staging slots, which get
  *   what the hardware limits leave.  An invalid @c fused_reads or @c host_batch
- *   block is reported in the warnings and planned as disabled.
+ *   block is reported in the warnings (which say so) and planned as disabled; a context
+ *   built from that configuration refuses it (its reactors throw std::invalid_argument).
  * - Host batch (@c cfg.host_batch enabled): @c host_batch.reactors reactors shared
  *   by every GPU.
  * - CPUs: the GPU's CPU affinity from @p topology (matched by PCI bus ID, not by

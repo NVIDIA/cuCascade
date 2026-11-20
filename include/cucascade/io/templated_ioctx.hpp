@@ -767,11 +767,63 @@ class templated_ioctx : public ioctx {
       slice.priority = priority;
     }
 
-    auto reactors    = select_reactors(typed, slices, operation, device_id);
+    // Slices of different classes (see slice_class) are routed separately, all under the
+    // request's one coordinator.  A request of one class -- every request of a backend that
+    // does not classify -- is routed as a whole, exactly as before.
+    std::vector<std::pair<std::size_t, std::size_t>> spans;  // [first, last) per class
+    {
+      auto const first_class = slice_class(typed, slices.front());
+      bool mixed             = false;
+      for (std::size_t i = 1; i < slices.size() && !mixed; ++i) {
+        mixed = slice_class(typed, slices[i]) != first_class;
+      }
+      if (!mixed) {
+        spans.emplace_back(0, slices.size());
+      } else {
+        std::vector<std::size_t> classes(slices.size());
+        std::vector<std::size_t> order(slices.size());
+        for (std::size_t i = 0; i < slices.size(); ++i) {
+          classes[i] = slice_class(typed, slices[i]);
+          order[i]   = i;
+        }
+        std::stable_sort(order.begin(), order.end(), [&classes](std::size_t a, std::size_t b) {
+          return classes[a] < classes[b];
+        });
+        std::vector<prepared_io_slice> sorted;
+        sorted.reserve(slices.size());
+        spans.reserve(slices.size());
+        for (std::size_t i = 0; i < order.size(); ++i) {
+          if (i == 0 || classes[order[i]] != classes[order[i - 1]]) spans.emplace_back(i, i);
+          spans.back().second = i + 1;
+        }
+        // Nothing below throws: the slices move only once every allocation succeeded.
+        for (auto const index : order) {
+          sorted.push_back(std::move(slices[index]));
+        }
+        slices = std::move(sorted);
+      }
+    }
+    std::vector<std::vector<Reactor*>> routes;
+    routes.reserve(spans.size());
+    for (auto const& [first, last] : spans) {
+      std::span<prepared_io_slice const> const members{slices.data() + first, last - first};
+      auto class_device = device_id;
+      if (spans.size() > 1) {
+        // A class routes by its own first device slice's GPU (none: a host-only class).
+        class_device = -1;
+        for (auto const& slice : members) {
+          if (slice.has_device_request()) {
+            class_device = slice.d_buffer.device_id;
+            break;
+          }
+        }
+      }
+      routes.push_back(select_reactors(typed, members, operation, class_device));
+    }
     auto coordinator = std::make_shared<grouped_coordinator>(total_bytes, slices.size());
     auto future      = coordinator->get_future();
 
-    if (reactors.empty()) {
+    if (std::any_of(routes.begin(), routes.end(), [](auto const& r) { return r.empty(); })) {
       auto error = std::make_exception_ptr(
         std::runtime_error(operation == io_op_type::host_vector_async
                              ? "mixed_readv_async_io: no available reactors"
@@ -786,21 +838,6 @@ class templated_ioctx : public ioctx {
     }
 
     try {
-      auto const partition_count = std::min(reactors.size(), slices.size());
-      std::vector<std::vector<prepared_io_slice>> partitions(partition_count);
-      std::vector<std::size_t> partition_bytes(partition_count, 0);
-
-      // Keep the originals until every queue entry has been allocated. If an
-      // allocation fails, their callbacks can still release all claimed cache
-      // chunks and every coordinator credit can be settled.
-      for (auto const& slice : slices) {
-        auto const smallest = static_cast<std::size_t>(
-          std::min_element(partition_bytes.begin(), partition_bytes.end()) -
-          partition_bytes.begin());
-        partition_bytes[smallest] += slice.size();
-        partitions[smallest].push_back(slice);
-      }
-
       // A backend that does not prefer bulk I/O gets a host-only range read as
       // several queue entries of at most range_batch_slices() slices each, not
       // one entry holding every slice.  Coordinator credits are per slice, so
@@ -810,21 +847,41 @@ class templated_ioctx : public ioctx {
                            : std::size_t{0};
 
       std::vector<std::pair<Reactor*, std::unique_ptr<grouped_io_request>>> requests;
-      requests.reserve(partition_count);
-      for (std::size_t i = 0; i < partition_count; ++i) {
-        auto& partition = partitions[i];
-        if (batch == 0 || partition.size() <= batch) {
-          requests.emplace_back(
-            reactors[i], grouped_io_request::create(owner, std::move(partition), coordinator));
-          continue;
+      for (std::size_t route = 0; route < routes.size(); ++route) {
+        auto const& reactors      = routes[route];
+        auto const [first, last]  = spans[route];
+        auto const partition_count = std::min(reactors.size(), last - first);
+        std::vector<std::vector<prepared_io_slice>> partitions(partition_count);
+        std::vector<std::size_t> partition_bytes(partition_count, 0);
+
+        // Keep the originals until every queue entry has been allocated. If an
+        // allocation fails, their callbacks can still release all claimed cache
+        // chunks and every coordinator credit can be settled.
+        for (std::size_t i = first; i < last; ++i) {
+          auto const& slice   = slices[i];
+          auto const smallest = static_cast<std::size_t>(
+            std::min_element(partition_bytes.begin(), partition_bytes.end()) -
+            partition_bytes.begin());
+          partition_bytes[smallest] += slice.size();
+          partitions[smallest].push_back(slice);
         }
-        for (std::size_t first = 0; first < partition.size(); first += batch) {
-          auto const last = std::min(partition.size(), first + batch);
-          std::vector<prepared_io_slice> part(
-            std::make_move_iterator(partition.begin() + static_cast<std::ptrdiff_t>(first)),
-            std::make_move_iterator(partition.begin() + static_cast<std::ptrdiff_t>(last)));
-          requests.emplace_back(reactors[i],
-                                grouped_io_request::create(owner, std::move(part), coordinator));
+
+        requests.reserve(requests.size() + partition_count);
+        for (std::size_t i = 0; i < partition_count; ++i) {
+          auto& partition = partitions[i];
+          if (batch == 0 || partition.size() <= batch) {
+            requests.emplace_back(
+              reactors[i], grouped_io_request::create(owner, std::move(partition), coordinator));
+            continue;
+          }
+          for (std::size_t part_first = 0; part_first < partition.size(); part_first += batch) {
+            auto const part_last = std::min(partition.size(), part_first + batch);
+            std::vector<prepared_io_slice> part(
+              std::make_move_iterator(partition.begin() + static_cast<std::ptrdiff_t>(part_first)),
+              std::make_move_iterator(partition.begin() + static_cast<std::ptrdiff_t>(part_last)));
+            requests.emplace_back(reactors[i],
+                                  grouped_io_request::create(owner, std::move(part), coordinator));
+          }
         }
       }
 
@@ -846,6 +903,20 @@ class templated_ioctx : public ioctx {
       return future;
     }
   }
+
+  /**
+   * @brief Routing class of @p slice: slices of one request with different classes are
+   *        routed (@ref select_reactors) separately, under the request's one coordinator.
+   *
+   * The default puts every slice in class 0, so a request is routed as a whole.
+   */
+  [[nodiscard]] virtual std::size_t slice_class(
+    [[maybe_unused]] io_object_type const& object,
+    [[maybe_unused]] prepared_io_slice const& slice) const
+  {
+    return 0;
+  }
+
   /// Slice-aware policy; by default preserve the existing reactor fan-out.
   virtual std::vector<Reactor*> select_reactors(io_object_type const& object,
                                                 std::span<prepared_io_slice const> slices,

@@ -28,6 +28,7 @@
  */
 
 #include "io/cufile/fused_lanes.hpp"
+#include "io/cufile/staging_pool.hpp"
 #include "transport_simulator_kernels.hpp"
 
 #include <cucascade/io/cufile/config.hpp>
@@ -35,6 +36,7 @@
 #include <cucascade/io/cufile/cufile_ioctx.hpp>
 #include <cucascade/io/cufile/cufile_reactor.hpp>
 #include <cucascade/io/cufile/detail.hpp>
+#include <cucascade/io/cufile/placement.hpp>
 #include <cucascade/io/types.hpp>
 
 #include <cuda_runtime_api.h>
@@ -410,6 +412,7 @@ class stream_latch {
   {
     std::atomic_ref<unsigned>{_args->released}.store(1, std::memory_order_release);
   }
+  [[nodiscard]] cucascade::io::cufile::simulator_copy_args* args() const noexcept { return _args; }
 
  private:
   cucascade::io::cufile::simulator_copy_args* _args{nullptr};
@@ -433,12 +436,26 @@ void run_and_verify(cufile_ioctx& ioctx,
   INFO(why);
 }
 
+/// One lane read before a test holds a stream on the GPU: libcufile (compatibility mode)
+/// synchronizes the device in its first cuFileReadAsync of the process, which would then wait
+/// for the held stream.
+void warm_up(cufile_ioctx& ioctx, cucascade::io::io_object const& object, pattern_file const& file)
+{
+  read_plan plan;
+  plan.add(0, 64 * KiB);
+  cudaStream_t stream{};
+  REQUIRE(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) == cudaSuccess);
+  run_and_verify(ioctx, object, file, plan, ::cuda::stream_ref{stream});
+  REQUIRE(cudaStreamDestroy(stream) == cudaSuccess);
+}
+
 // ---------------------------------------------------------------------------
 // A scripted cuFile table (process-wide state: the table holds C function pointers).
 // ---------------------------------------------------------------------------
 
 struct fake_action {
-  enum class kind : std::uint8_t { normal, refuse, negative, short_read };
+  /// latched: the read waits on the GPU for the installed latch (the lane stays busy).
+  enum class kind : std::uint8_t { normal, refuse, negative, short_read, latched };
   kind what{kind::normal};
   std::size_t bytes{0};  ///< short_read: bytes returned
 };
@@ -453,6 +470,8 @@ struct fake_state {
   std::vector<fake_action> script;  ///< per async call; later calls use `every`
   fake_action every{};
   std::deque<std::vector<std::uint8_t>> keep_alive;
+  cucascade::io::cufile::simulator_copy_args* latch{nullptr};
+  std::vector<void*> pinned;  ///< latched reads copy from pinned memory (never blocks)
 };
 
 fake_state& fake() noexcept
@@ -538,12 +557,30 @@ CUfileError_t fake_read_async(CUfileHandle_t handle,
     *bytes_read_p = -5;
     return fake_ok();
   }
+  if (action.what == fake_action::kind::latched && state.latch != nullptr &&
+      cucascade::io::cufile::launch_simulator_gate(state.latch, static_cast<cudaStream_t>(stream)) !=
+        cudaSuccess) {
+    CUfileError_t status{};
+    status.err = CU_FILE_IO_ERROR;
+    return status;
+  }
   auto limit = *size_p;
   if (action.what == fake_action::kind::short_read) limit = std::min(limit, action.bytes);
-  auto& host     = state.keep_alive.emplace_back(limit);
-  auto const got = ::pread(static_cast<fake_handle*>(handle)->fd, host.data(), limit, *file_offset_p);
+  std::uint8_t* host = nullptr;
+  if (action.what == fake_action::kind::latched) {
+    void* raw = nullptr;
+    if (cudaMallocHost(&raw, std::max<std::size_t>(limit, 1)) != cudaSuccess) {
+      *bytes_read_p = -5;
+      return fake_ok();
+    }
+    state.pinned.push_back(raw);
+    host = static_cast<std::uint8_t*>(raw);
+  } else {
+    host = state.keep_alive.emplace_back(limit).data();
+  }
+  auto const got = ::pread(static_cast<fake_handle*>(handle)->fd, host, limit, *file_offset_p);
   if (got > 0 && cudaMemcpyAsync(static_cast<std::uint8_t*>(base) + *buffer_offset_p,
-                                 host.data(),
+                                 host,
                                  static_cast<std::size_t>(got),
                                  cudaMemcpyHostToDevice,
                                  static_cast<cudaStream_t>(stream)) != cudaSuccess) {
@@ -565,6 +602,7 @@ class scripted_cufile {
       fake().script.clear();
       fake().every = {};
       fake().keep_alive.clear();
+      fake().latch = nullptr;
     }
     _api.driver_open           = &fake_driver_open;
     _api.driver_get_properties = &fake_get_properties;
@@ -585,6 +623,11 @@ class scripted_cufile {
     cucascade::io::cufile::detail::set_cufile_api_for_testing(nullptr);
     std::lock_guard lock(fake().mutex);
     fake().keep_alive.clear();
+    fake().latch = nullptr;
+    for (auto* memory : fake().pinned) {
+      std::ignore = cudaFreeHost(memory);
+    }
+    fake().pinned.clear();
   }
   scripted_cufile(scripted_cufile const&)            = delete;
   scripted_cufile& operator=(scripted_cufile const&) = delete;
@@ -599,6 +642,12 @@ class scripted_cufile {
   {
     std::lock_guard lock(fake().mutex);
     fake().every = action;
+  }
+  /// Reads scripted @c latched wait on the GPU for @p latch.
+  void latch_with(stream_latch const& latch)
+  {
+    std::lock_guard lock(fake().mutex);
+    fake().latch = latch.args();
   }
   [[nodiscard]] std::size_t async_calls() const
   {
@@ -739,6 +788,7 @@ TEST_CASE("fused ioctx: a busy caller stream gates the copies", "[io][cufile][fu
   cfg.fused_reads.max_gated_lanes = 2;
   started_ioctx ioctx{cfg, 1};
   auto object = ioctx.get().open_io_object(file.path());
+  warm_up(ioctx.get(), *object, file);
   stream_holder busy;
   stream_holder idle;
 
@@ -790,16 +840,57 @@ TEST_CASE("fused ioctx: a busy caller stream gates the copies", "[io][cufile][fu
     for (auto& future : futures) {
       CHECK_FALSE(future.is_ready());
     }
+    // Five pending-gate reads on four lanes: those that took a lane hold their data, the
+    // rest wait parked; the idle read was served even with every lane held.
     auto const held = ioctx.get().stats() - before;
-    CHECK(held.parked_slices >= reads - 2);
+    CHECK(held.parked_slices >= 1);
     latch.release();
     for (std::size_t i = 0; i < reads; ++i) {
       CHECK(std::move(futures[i]).get(30s) == 300 * KiB);
       CHECK(plans[i].verify(arenas[i]->host_copy(), file));
     }
     auto const delta = ioctx.get().stats() - before;
+    CHECK(delta.lane_gated_reads >= 2);
+    CHECK(delta.lane_gated_reads <= 4);
+  }
+
+  SECTION("a pending gate counts against the limit only once its read is held")
+  {
+    // Limit 2: the first two busy reads become held; the third, dispatched after them, is
+    // parked; an idle read still gets a lane.
+    auto const before = ioctx.get().stats();
+    std::vector<read_plan> plans(3);
+    std::vector<std::unique_ptr<device_memory>> arenas;
+    for (std::size_t i = 0; i < 3; ++i) {
+      plans[i].add(i * MiB + 7, 100 * KiB);
+      arenas.push_back(std::make_unique<device_memory>(plans[i].arena_bytes()));
+    }
+    read_plan other;
+    other.add(6 * MiB + 1, 200 * KiB);
+    device_memory other_arena{other.arena_bytes()};
+    stream_latch latch;
+    latch.hold(busy.get());
+    std::vector<cucascade::exec::semi_future<std::size_t>> futures;
+    for (std::size_t i = 0; i < 3; ++i) {
+      futures.push_back(
+        ioctx.get().device_readv_async_io(*object, plans[i].slices(arenas[i]->get()), busy.ref()));
+      std::this_thread::sleep_for(150ms);  // its read completes: held
+    }
+    auto const parked = ioctx.get().stats() - before;
+    CHECK(parked.parked_slices == 1);
+    CHECK(ioctx.get()
+            .device_readv_async_io(*object, other.slices(other_arena.get()), idle.ref())
+            .get(20s) == 200 * KiB);
+    CHECK(other.verify(other_arena.host_copy(), file));
+    CHECK((ioctx.get().stats() - before).lane_reads == 1);  // the idle read, on a lane
+    latch.release();
+    for (std::size_t i = 0; i < 3; ++i) {
+      CHECK(std::move(futures[i]).get(30s) == 100 * KiB);
+      CHECK(plans[i].verify(arenas[i]->host_copy(), file));
+    }
+    auto const delta = ioctx.get().stats() - before;
     CHECK(delta.lane_gated_reads == 2);
-    CHECK(delta.lane_reads == reads + 1);
+    CHECK(delta.lane_reads == 4);  // the parked one took a lane once its gate fired
   }
   require_queued_bytes_zero(ioctx.get());
 }
@@ -1210,3 +1301,439 @@ TEST_CASE("fused ioctx: per-thread and legacy default stream callers",
   CHECK((ioctx.get().stats() - before).lane_reads > 0);
   require_queued_bytes_zero(ioctx.get());
 }
+
+// ---------------------------------------------------------------------------
+// Review round: two-phase gates, backlog, quotas, routing by usability, mixed requests.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// A hand-built pool for GPU 0: @p lane_reactors lane reactors then @p sync_reactors
+/// synchronous ones, with a lane quota of @p lane_slots.  Started; shut down on scope exit.
+class manual_pool {
+ public:
+  manual_pool(config const& cfg,
+              std::size_t lane_reactors,
+              std::size_t sync_reactors,
+              std::size_t lane_slots)
+  {
+    cucascade::io::cufile::pool_plan plan;
+    cucascade::io::cufile::device_group_plan group;
+    group.device            = 0;
+    group.n_reactors        = sync_reactors;
+    group.lane_reactors     = lane_reactors;
+    group.lanes_per_reactor = cfg.fused_reads.lanes_per_reactor;
+    group.lane_slots        = lane_slots;
+    plan.groups.push_back(group);
+    plan.lane_slot_bytes = cfg.fused_reads.slot_bytes;
+    auto ctx             = std::make_shared<cufile_reactor::reactor_context>(
+      cfg, std::vector<std::size_t>{0}, std::vector<std::size_t>{lane_slots});
+    _ioctx = std::make_shared<cufile_ioctx>(std::move(plan), std::move(ctx));
+    _ioctx->start();
+  }
+  ~manual_pool() { _ioctx->shutdown(); }
+  manual_pool(manual_pool const&)            = delete;
+  manual_pool& operator=(manual_pool const&) = delete;
+  [[nodiscard]] cufile_ioctx& get() const noexcept { return *_ioctx; }
+
+ private:
+  std::shared_ptr<cufile_ioctx> _ioctx;
+};
+
+[[nodiscard]] cucascade::io::prepared_io_slice device_piece(std::size_t offset,
+                                                            std::size_t size,
+                                                            std::uint8_t* dst,
+                                                            cudaStream_t stream)
+{
+  return cucascade::io::prepared_io_slice{
+    cucascade::io::range{offset, size},
+    cucascade::io::device_buffer{dst, ::cuda::stream_ref{stream}}};
+}
+
+[[nodiscard]] bool all_fill(std::vector<std::uint8_t> const& bytes)
+{
+  return std::all_of(bytes.begin(), bytes.end(), [](std::uint8_t b) { return b == guard_fill; });
+}
+
+/// Disarms the lane failure seams on scope exit.
+struct seam_reset {
+  seam_reset()                             = default;
+  seam_reset(seam_reset const&)            = delete;
+  seam_reset& operator=(seam_reset const&) = delete;
+  ~seam_reset()
+  {
+    cucascade::io::cufile::detail::set_lane_callback_failure_for_testing(0);
+    cucascade::io::cufile::detail::set_lane_copy_failure_for_testing(0);
+    cucascade::io::cufile::detail::set_lane_stream_create_failure_for_testing(0);
+  }
+};
+
+}  // namespace
+
+TEST_CASE("fused ioctx: shutdown with a gated read on a held stream settles promptly",
+          "[io][cufile][fused_ioctx][gpu][shutdown]")
+{
+  require_async_cufile();
+  pattern_file const file{8 * MiB};
+  stream_holder busy;
+  started_ioctx ioctx{fused_config(4, 1 * MiB), 1};
+  auto object = ioctx.get().open_io_object(file.path());
+  warm_up(ioctx.get(), *object, file);
+  read_plan plan;
+  plan.add(4097, 300 * KiB);
+  device_memory arena{plan.arena_bytes()};
+  stream_latch latch;
+  latch.hold(busy.get());
+  auto future = ioctx.get().device_readv_async_io(*object, plan.slices(arena.get()), busy.ref());
+  std::this_thread::sleep_for(300ms);  // its read is done: held for the gate
+  auto const started = std::chrono::steady_clock::now();
+  ioctx.get().shutdown();
+  REQUIRE(std::move(future).wait(5s));
+  CHECK(std::chrono::steady_clock::now() - started < 5s);
+  CHECK_THROWS(std::move(future).get());
+  CHECK(all_fill(arena.host_copy()));  // its copies were never queued
+  latch.release();
+}
+
+TEST_CASE("fused ioctx: a sibling failure cancels a held read",
+          "[io][cufile][fused_ioctx][gpu]")
+{
+  require_async_cufile();
+  pattern_file const file{8 * MiB};
+  stream_holder lane_stream;
+  stream_holder sync_stream;
+  auto cfg          = fused_config(4, 1 * MiB);
+  cfg.gds_threshold = 64 * KiB;
+  manual_pool pool{cfg, 1, 1, 4};
+  auto object = pool.get().open_io_object(file.path());
+  warm_up(pool.get(), *object, file);
+  std::filesystem::resize_file(file.path(), 2 * MiB);  // the small read below now fails
+  device_memory lane_dst{300 * KiB};
+  device_memory small_dst{8 * KiB};
+  stream_latch lane_latch;
+  stream_latch sync_latch;
+  lane_latch.hold(lane_stream.get());
+  sync_latch.hold(sync_stream.get());
+  std::vector<cucascade::io::prepared_io_slice> slices;
+  slices.push_back(device_piece(4096 + 3, 200 * KiB, lane_dst.get(), lane_stream.get()));
+  slices.push_back(device_piece(6 * MiB + 5, 8 * KiB, small_dst.get(), sync_stream.get()));
+  auto future = pool.get().mixed_readv_async_io(*object, std::move(slices));
+  std::this_thread::sleep_for(300ms);  // the lane read is held, the small one parked
+  CHECK_FALSE(future.is_ready());
+  sync_latch.release();  // the small read runs and fails: the request stops
+  REQUIRE(std::move(future).wait(10s));  // while the lane read's stream is still held
+  CHECK_THROWS(std::move(future).get());
+  CHECK(all_fill(lane_dst.host_copy()));
+  lane_latch.release();
+  require_queued_bytes_zero(pool.get());
+}
+
+TEST_CASE("fused ioctx: a refused gated read falls back without blocking the reactor",
+          "[io][cufile][fused_ioctx][gpu]")
+{
+  if (!has_cuda_device()) { SKIP("requires a CUDA device"); }
+  scripted_cufile cufile;
+  pattern_file const file{8 * MiB};
+  stream_holder busy;
+  stream_holder idle;
+  started_ioctx ioctx{fused_config(4, 1 * MiB), 1};
+  auto object = ioctx.get().open_io_object(file.path());
+  read_plan gated;
+  gated.add(12345, 300 * KiB);
+  read_plan other;
+  other.add(5 * MiB + 1, 200 * KiB);
+  device_memory gated_arena{gated.arena_bytes()};
+  device_memory other_arena{other.arena_bytes()};
+  cufile.script({fake_action{fake_action::kind::refuse, 0}});
+  auto const before = ioctx.get().stats();
+  stream_latch latch;
+  latch.hold(busy.get());
+  auto future =
+    ioctx.get().device_readv_async_io(*object, gated.slices(gated_arena.get()), busy.ref());
+  // The same reactor serves another read while the failed one waits for its gate.
+  CHECK(ioctx.get()
+          .device_readv_async_io(*object, other.slices(other_arena.get()), idle.ref())
+          .get(10s) == 200 * KiB);
+  CHECK(other.verify(other_arena.host_copy(), file));
+  CHECK_FALSE(future.is_ready());
+  CHECK(all_fill(gated_arena.host_copy()));
+  latch.release();
+  CHECK(std::move(future).get(30s) == 300 * KiB);
+  CHECK(gated.verify(gated_arena.host_copy(), file));
+  auto const delta = ioctx.get().stats() - before;
+  CHECK(delta.lane_failures == 1);
+  CHECK(delta.lane_reads == 1);
+  require_queued_bytes_zero(ioctx.get());
+}
+
+TEST_CASE("fused ioctx: cancel while a read sits in the lane backlog",
+          "[io][cufile][fused_ioctx][gpu]")
+{
+  if (!has_cuda_device()) { SKIP("requires a CUDA device"); }
+  scripted_cufile cufile;
+  pattern_file const file{8 * MiB};
+  stream_holder idle;
+  stream_holder held;
+  auto cfg                          = fused_config(1, 1 * MiB);
+  cfg.gds_threshold                 = 64 * KiB;
+  manual_pool pool{cfg, 1, 1, 1};
+  auto object = pool.get().open_io_object(file.path());
+  read_plan first;
+  first.add(5, 200 * KiB);
+  device_memory first_arena{first.arena_bytes()};
+  device_memory backlog_dst{200 * KiB};
+  device_memory small_dst{8 * KiB};
+  stream_latch lane_latch;  // the one lane's read waits on it
+  stream_latch sync_latch;
+  cufile.latch_with(lane_latch);
+  cufile.script({fake_action{fake_action::kind::latched, 0}});
+  auto busy_lane =
+    pool.get().device_readv_async_io(*object, first.slices(first_arena.get()), idle.ref());
+  std::this_thread::sleep_for(100ms);
+  sync_latch.hold(held.get());
+  std::vector<cucascade::io::prepared_io_slice> slices;
+  slices.push_back(device_piece(1 * MiB + 5, 200 * KiB, backlog_dst.get(), idle.get()));
+  slices.push_back(device_piece(6 * MiB + 5, 8 * KiB, small_dst.get(), held.get()));
+  auto future = pool.get().mixed_readv_async_io(*object, std::move(slices));
+  std::this_thread::sleep_for(200ms);  // the lane read waits in the backlog
+  std::filesystem::resize_file(file.path(), 2 * MiB);
+  sync_latch.release();  // the small read fails: the request stops
+  REQUIRE(std::move(future).wait(10s));  // the lane is still busy: cancelled from the backlog
+  CHECK_THROWS(std::move(future).get());
+  CHECK_FALSE(busy_lane.is_ready());
+  CHECK(all_fill(backlog_dst.host_copy()));
+  lane_latch.release();
+  CHECK(std::move(busy_lane).get(30s) == 200 * KiB);
+  CHECK(first.verify(first_arena.host_copy(), file));
+  require_queued_bytes_zero(pool.get());
+}
+
+TEST_CASE("fused ioctx: a backlog whose lanes are all lost is served synchronously",
+          "[io][cufile][fused_ioctx][gpu]")
+{
+  require_async_cufile();
+  seam_reset const reset;
+  pattern_file const file{8 * MiB};
+  stream_holder stream;
+  started_ioctx ioctx{fused_config(1, 1 * MiB), 1};
+  auto object = ioctx.get().open_io_object(file.path());
+  // Warm up: the lane set exists before the seams are armed.
+  run_and_verify(ioctx.get(), *object, file, strided_plan(0, 1, 100 * KiB, 0), stream.ref());
+  CHECK(ioctx.get().reactor(0).lanes_usable(0));
+  // The next read's completion cannot be installed and its lane's new stream cannot be
+  // created: the set loses its only lane while the second read waits in the backlog.
+  cucascade::io::cufile::detail::set_lane_callback_failure_for_testing(1);
+  cucascade::io::cufile::detail::set_lane_stream_create_failure_for_testing(1);
+  auto const before = ioctx.get().stats();
+  run_and_verify(
+    ioctx.get(), *object, file, strided_plan(1 * MiB + 3, 2, 100 * KiB, 2 * MiB), stream.ref());
+  auto const delta = ioctx.get().stats() - before;
+  CHECK(delta.lane_failures == 1);
+  CHECK(delta.lane_reads == 0);
+  CHECK_FALSE(ioctx.get().reactor(0).lanes_usable(0));
+  // Later reads take the synchronous paths.
+  run_and_verify(ioctx.get(), *object, file, strided_plan(7, 3, 50 * KiB, MiB), stream.ref());
+  require_queued_bytes_zero(ioctx.get());
+}
+
+TEST_CASE("fused ioctx: device_failed through the ioctx falls back",
+          "[io][cufile][fused_ioctx][gpu]")
+{
+  require_async_cufile();
+  seam_reset const reset;
+  pattern_file const file{8 * MiB};
+  stream_holder stream;
+  started_ioctx ioctx{fused_config(2, 1 * MiB), 1};
+  auto object = ioctx.get().open_io_object(file.path());
+  cucascade::io::cufile::detail::set_lane_callback_failure_for_testing(1);
+  auto const before = ioctx.get().stats();
+  run_and_verify(ioctx.get(), *object, file, strided_plan(99, 1, 300 * KiB, 0), stream.ref());
+  auto const delta = ioctx.get().stats() - before;
+  CHECK(delta.lane_failures == 1);
+  CHECK(delta.cufile_failures >= 1);
+  require_queued_bytes_zero(ioctx.get());
+}
+
+TEST_CASE("fused ioctx: the plan's lane quota bounds the lanes", "[io][cufile][fused_ioctx][gpu]")
+{
+  require_async_cufile();
+  pattern_file const file{32 * MiB};
+  stream_holder stream;
+  auto cfg = fused_config(4, 1 * MiB);
+  REQUIRE(cucascade::io::cufile::detail::lanes_in_use_for_testing(0) == 0);
+  manual_pool pool{cfg, 2, 1, 3};  // two lane reactors of 4 lanes, but 3 lanes planned
+  auto object = pool.get().open_io_object(file.path());
+  std::atomic<bool> done{false};
+  std::atomic<std::size_t> max_lanes{0};
+  std::thread watcher{[&] {
+    while (!done.load()) {
+      auto const lanes = cucascade::io::cufile::detail::lanes_in_use_for_testing(0);
+      auto seen        = max_lanes.load();
+      while (lanes > seen && !max_lanes.compare_exchange_weak(seen, lanes)) {}
+      std::this_thread::sleep_for(200us);
+    }
+  }};
+  std::mt19937_64 rng{41};
+  for (int round = 0; round < 6; ++round) {
+    run_and_verify(
+      pool.get(), *object, file, random_plan(rng, file.size(), 24, 4 * MiB, 16 * MiB), stream.ref());
+  }
+  done = true;
+  watcher.join();
+  CHECK(max_lanes.load() >= 1);
+  CHECK(max_lanes.load() <= 3);
+  CHECK(pool.get().stats().lane_reads > 0);
+  // The synchronous staging still has room: a slot of its size can be leased.
+  auto& staging   = cucascade::io::cufile::detail::staging_pool::instance();
+  auto const slot = staging.acquire(0, cfg.staging_slot_bytes(), 0, false);
+  CHECK(static_cast<bool>(slot));
+  if (slot) staging.release(slot);
+}
+
+TEST_CASE("fused ioctx: a cooling lane reactor is routed around",
+          "[io][cufile][fused_ioctx][gpu]")
+{
+  if (!has_cuda_device()) { SKIP("requires a CUDA device"); }
+  scripted_cufile cufile;
+  pattern_file const file{16 * MiB};
+  stream_holder stream;
+  auto cfg                      = fused_config(4, 1 * MiB);
+  cfg.fused_reads.failure_limit = 1;
+  cfg.fused_reads.cooldown_s    = 60;
+  manual_pool pool{cfg, 2, 2, 8};
+  auto object = pool.get().open_io_object(file.path());
+  cufile.every(fake_action{fake_action::kind::refuse, 0});
+  // Eight separate lane reads fan out over both lane reactors; each fails once and cools.
+  run_and_verify(pool.get(), *object, file, strided_plan(5, 8, 100 * KiB, MiB), stream.ref());
+  CHECK_FALSE(pool.get().reactor(0).lanes_usable(0));
+  CHECK_FALSE(pool.get().reactor(1).lanes_usable(0));
+
+  std::vector<reactor_stats> before;
+  for (std::size_t i = 0; i < pool.get().reactor_count(); ++i) {
+    before.push_back(pool.get().reactor(i).stats());
+  }
+  auto const calls = cufile.async_calls();
+  std::mt19937_64 rng{5};
+  for (int round = 0; round < 3; ++round) {
+    run_and_verify(
+      pool.get(), *object, file, random_plan(rng, file.size(), 16, 4 * MiB, 8 * MiB), stream.ref());
+  }
+  CHECK(cufile.async_calls() == calls);
+  for (std::size_t i = 0; i < 2; ++i) {
+    CHECK(pool.get().reactor(i).stats() == before[i]);  // lane reactors untouched
+  }
+  reactor_stats sync_delta;
+  for (std::size_t i = 2; i < pool.get().reactor_count(); ++i) {
+    sync_delta += pool.get().reactor(i).stats() - before[i];
+  }
+  CHECK(sync_delta.direct_reads + sync_delta.staged_reads + sync_delta.posix_device_reads > 0);
+  require_queued_bytes_zero(pool.get());
+}
+
+TEST_CASE("fused ioctx: an ioctx whose GPU lane budget is spent serves through the legacy path",
+          "[io][cufile][fused_ioctx][gpu]")
+{
+  require_async_cufile();
+  pattern_file const file{16 * MiB};
+  stream_holder stream;
+  auto cfg                             = fused_config(4, 1 * MiB);
+  cfg.fused_reads.max_lanes_per_device = 4;
+  started_ioctx first{cfg, 1};
+  auto object = first.get().open_io_object(file.path());
+  run_and_verify(first.get(), *object, file, strided_plan(1, 1, 100 * KiB, 0), stream.ref());
+  REQUIRE(cucascade::io::cufile::detail::lanes_in_use_for_testing(0) == 4);
+
+  started_ioctx second{cfg, 2};
+  auto second_object = second.get().open_io_object(file.path());
+  // The first request finds no lanes on either reactor; afterwards neither is a lane
+  // candidate and requests take the legacy path.
+  run_and_verify(second.get(), *second_object, file, strided_plan(3, 6, 100 * KiB, MiB),
+                 stream.ref());
+  CHECK_FALSE(second.get().reactor(0).lanes_usable(0));
+  CHECK_FALSE(second.get().reactor(1).lanes_usable(0));
+  std::mt19937_64 rng{9};
+  for (int round = 0; round < 3; ++round) {
+    run_and_verify(second.get(), *second_object, file,
+                   random_plan(rng, file.size(), 16, 4 * MiB, 8 * MiB), stream.ref());
+  }
+  CHECK(second.get().stats().lane_reads == 0);
+  require_queued_bytes_zero(second.get());
+}
+
+TEST_CASE("fused ioctx: a flat pool with more reactors than the lane budget",
+          "[io][cufile][fused_ioctx][gpu]")
+{
+  require_async_cufile();
+  pattern_file const file{32 * MiB};
+  stream_holder stream;
+  auto cfg                             = fused_config(2, 1 * MiB);
+  cfg.fused_reads.max_lanes_per_device = 4;
+  started_ioctx ioctx{cfg, 4};
+  auto object = ioctx.get().open_io_object(file.path());
+  // Every reactor gets a lane read of the first request; two of them find lanes.
+  run_and_verify(ioctx.get(), *object, file, strided_plan(9, 8, 100 * KiB, MiB), stream.ref());
+  std::size_t usable = 0;
+  for (std::size_t i = 0; i < ioctx.get().reactor_count(); ++i) {
+    if (ioctx.get().reactor(i).lanes_usable(0)) ++usable;
+  }
+  CHECK(usable == 2);
+  CHECK(cucascade::io::cufile::detail::lanes_in_use_for_testing(0) == 4);
+  auto const before = ioctx.get().stats();
+  std::mt19937_64 rng{13};
+  for (int round = 0; round < 4; ++round) {
+    run_and_verify(
+      ioctx.get(), *object, file, random_plan(rng, file.size(), 16, 4 * MiB, 8 * MiB), stream.ref());
+  }
+  CHECK((ioctx.get().stats() - before).lane_reads > 0);
+  require_queued_bytes_zero(ioctx.get());
+}
+
+TEST_CASE("fused ioctx: a mixed request keeps its synchronous slices off the lane reactors",
+          "[io][cufile][fused_ioctx][gpu]")
+{
+  require_async_cufile();
+  constexpr std::size_t size = (3 * MiB) + 1000;
+  pattern_file const file{size};
+  stream_holder stream;
+  auto cfg          = fused_config(4, 1 * MiB);
+  cfg.gds_threshold = 64 * KiB;
+  manual_pool pool{cfg, 1, 1, 4};
+  auto object = pool.get().open_io_object(file.path());
+  read_plan plan;
+  plan.add(4096 + 1, 300 * KiB);      // lane read
+  plan.add(1 * MiB + 5, 400 * KiB);   // lane read
+  plan.add(3 * MiB + 10, 500);        // EOF tail: partial last block
+  plan.add(2 * MiB + 3, 8 * KiB);     // below gds_threshold
+  run_and_verify(pool.get(), *object, file, plan, stream.ref());
+  auto const lane = pool.get().reactor(0).stats();
+  auto const sync = pool.get().reactor(1).stats();
+  REQUIRE(pool.get().reactor(0).placement().fused_lanes);
+  CHECK(lane.lane_reads == 2);
+  CHECK(lane.posix_device_reads + lane.direct_reads + lane.staged_reads == 0);
+  CHECK(sync.lane_reads == 0);
+  CHECK(sync.posix_device_reads + sync.direct_reads + sync.staged_reads == 2);
+  require_queued_bytes_zero(pool.get());
+}
+
+TEST_CASE("fused ioctx: contiguous slices into one buffer cost one copy per window",
+          "[io][cufile][fused_ioctx][gpu]")
+{
+  require_async_cufile();
+  pattern_file const file{16 * MiB};
+  stream_holder stream;
+  started_ioctx ioctx{fused_config(4, 1 * MiB), 1};
+  auto object = ioctx.get().open_io_object(file.path());
+  read_plan plan;
+  for (std::size_t i = 0; i < 48; ++i) {
+    plan.add(5 + i * 64 * KiB, 64 * KiB, /*guard=*/0);
+  }
+  auto const before        = ioctx.get().stats();
+  auto const copies_before = cucascade::io::cufile::detail::lane_copy_calls_for_testing();
+  run_and_verify(ioctx.get(), *object, file, plan, stream.ref());
+  auto const delta  = ioctx.get().stats() - before;
+  auto const copies = cucascade::io::cufile::detail::lane_copy_calls_for_testing() - copies_before;
+  CHECK(delta.lane_reads >= 3);
+  CHECK(copies == delta.lane_reads);
+  CHECK(delta.lane_parts >= 48);
+}
+

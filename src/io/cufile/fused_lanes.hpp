@@ -28,6 +28,8 @@
 
 #include "io/cufile/staging_pool.hpp"
 
+#include <cucascade/cuda/device_copy_batch.hpp>
+
 #include <cucascade/io/cufile/config.hpp>
 #include <cucascade/io/types.hpp>
 
@@ -57,13 +59,25 @@ struct lane_copy {
   std::size_t bytes{0};
 };
 
-/// One fused read: a 4 KiB-aligned file window read into a lane's slot, then copied out.
+/**
+ * @brief One fused read: a 4 KiB-aligned file window read into a lane's slot, then copied out.
+ *
+ * A lane stream never waits on an event of another stream.  A caller whose destinations may
+ * not be written yet submits the read with @ref hold: only the read is queued, the lane
+ * reports a @c held result once @ref needed_bytes of the window arrived, and keeps the slot
+ * until the owner calls @ref fused_lane_set::copy_out (queue the copies now) or
+ * @ref fused_lane_set::release_held (drop the data).
+ */
 struct lane_read {
   void* handle{nullptr};          ///< CUfileHandle_t
   range window;                   ///< 4 KiB-aligned in offset and size, at most the slot
-  std::vector<lane_copy> copies;  ///< ascending file offset, inside the window
-  cudaEvent_t gate{nullptr};      ///< event the copies must follow, or null
-  std::uint64_t token{0};         ///< the owner's, returned in the result
+  std::vector<lane_copy> copies;  ///< ascending file offset, inside the window; empty with hold
+  /// Two-phase read: read only, report @c held, wait for @c copy_out / @c release_held.
+  bool hold{false};
+  /// With @ref hold: bytes from the window's start that must arrive (the end of the last
+  /// copy the owner will pass to @c copy_out, relative to the window); in (0, window.size].
+  std::size_t needed_bytes{0};
+  std::uint64_t token{0};  ///< the owner's, returned in the result
 };
 
 /// How a lane read ended.
@@ -78,6 +92,9 @@ struct lane_result {
   ssize_t io_result{0};  ///< last bytes_done (negative: cuFile error, -EINVAL for a bad read)
   cudaError_t cuda_status{cudaSuccess};
   unsigned resubmits{0};  ///< short-read continuations issued
+  /// A @c hold read's I/O finished (@c outcome ok): the lane keeps the data in its slot until
+  /// the owner calls @c copy_out or @c release_held.  A final result follows a @c copy_out.
+  bool held{false};
   unsigned lane{0};       ///< the lane that served it (diagnostics, tests)
 };
 
@@ -116,6 +133,9 @@ class fused_lane_set {
   /// Builds as many lanes as it can (never throws); @ref capacity may be 0.
   explicit fused_lane_set(lane_set_options const& options) noexcept;
   /// Requires @ref in_flight() == 0 (asserted; a release build waits for busy lanes first).
+  /// Waits only for the lanes' own work.  The slots go back to the staging pool; the streams
+  /// are retired, never deregistered: cuFileStreamDeregister synchronizes the device and
+  /// stalls the process's cuFile calls meanwhile (see the source).
   ~fused_lane_set();
 
   fused_lane_set(fused_lane_set const&)            = delete;
@@ -128,7 +148,7 @@ class fused_lane_set {
   {
     return static_cast<std::size_t>(std::popcount(_usable));
   }
-  /// Lanes holding a read not yet reported by @ref reap.
+  /// Lanes not free: a read or copies queued, or a held read the owner has not released.
   [[nodiscard]] std::size_t in_flight() const noexcept
   {
     return static_cast<std::size_t>(std::popcount(_usable & ~_free));
@@ -137,10 +157,16 @@ class fused_lane_set {
   {
     return static_cast<std::size_t>(std::popcount(_free));
   }
-  /// Reads in flight whose copies wait on a gate.
-  [[nodiscard]] std::size_t gated() const noexcept
+  /// Lanes in the held state: reported @c held, waiting for @ref copy_out / @ref release_held.
+  [[nodiscard]] std::size_t held() const noexcept
   {
-    return static_cast<std::size_t>(std::popcount(_gated));
+    return static_cast<std::size_t>(std::popcount(_held));
+  }
+  /// Lanes with work queued on their stream (or a failure not yet reported): in flight and
+  /// not held.
+  [[nodiscard]] std::size_t active() const noexcept
+  {
+    return static_cast<std::size_t>(std::popcount(active_mask()));
   }
   [[nodiscard]] std::size_t slot_bytes() const noexcept { return _options.slot_bytes; }
   [[nodiscard]] int device() const noexcept { return _options.device; }
@@ -152,20 +178,36 @@ class fused_lane_set {
    *
    * Returns false, with @p read untouched, only when no lane is free.  Otherwise @p read is
    * moved into the lane (its @c copies then holds an empty buffer the caller may reuse for
-   * the next read, so recycling a @c lane_read allocates nothing) and its outcome is reported by a later @ref reap or @ref drain --
-   * including failures at submission (a refused @c cuFileReadAsync, a failed enqueue of the
-   * gate wait, a copy or the completion, or a malformed read), which are reported only once
-   * the lane is known idle, and which also call @c wake.  Never throws.  @p read.gate need
-   * only stay valid for the call; the caller's destinations must stay valid until reported.
+   * the next read, so recycling a @c lane_read allocates nothing) and its outcome is
+   * reported by a later @ref reap or @ref drain -- including failures at submission (a
+   * refused @c cuFileReadAsync, a failed enqueue of a copy or the completion, or a malformed
+   * read), which are reported only once the lane is known idle, and which also call @c wake.
+   * Never throws.  The caller's destinations must stay valid until the final result.
    */
   [[nodiscard]] bool submit(lane_read&& read) noexcept;
+
+  /**
+   * @brief Queue the copies of the held read on @p lane, then its completion.
+   *
+   * The lane reports a final result through a later @ref reap (failures as for @ref submit).
+   * When the held read was short, the bytes that arrived are copied first and the rest of
+   * the window is read after them, on the lane.  @p copies receives the lane's previous
+   * buffer, empty.  Never throws.
+   *
+   * @return false, with @p copies untouched, when @p lane is not held.
+   */
+  [[nodiscard]] bool copy_out(unsigned lane, std::vector<lane_copy>&& copies) noexcept;
+
+  /// Drop the held read on @p lane and free the lane.  No-op when @p lane is not held.
+  void release_held(unsigned lane) noexcept;
 
   /**
    * @brief Report every lane that finished since the last call; never blocks.
    *
    * Short reads are resubmitted on their lane (which stays busy) and not reported.  For each
-   * finished read, @p done(lane_result const&) is called after its lane was freed, so @p done
-   * may @ref submit.  A throwing @p done is the caller's bug: the exception propagates and the
+   * finished read, @p done(lane_result const&) is called after its lane was freed -- or, for
+   * a @c held result, after the lane entered the held state -- so @p done may @ref submit,
+   * @ref copy_out or @ref release_held.  A throwing @p done is the caller's bug: the exception propagates and the
    * lanes not yet reported are reported by the next call.
    *
    * @return The number of results reported.
@@ -193,30 +235,37 @@ class fused_lane_set {
   }
 
   /**
-   * @brief Block until nothing is in flight, reporting as @ref reap does.
+   * @brief Block until no lane has work queued, reporting as @ref reap does.
    *
-   * Waits on the busy lanes' streams (bounded only by CUDA and the storage); a lane is never
-   * abandoned while cuFile may still write its slot.  Reads @p done submits are drained too.
+   * Waits on the active lanes' streams (bounded only by CUDA and the storage, never by a
+   * caller's stream: lanes wait on no foreign event); a lane is never abandoned while cuFile
+   * may still write its slot.  Held lanes have nothing queued and are not waited for: they
+   * are the owner's to release (or to @ref copy_out, which makes them active again).  A lane
+   * whose stream reports an error without its completion arriving is reported
+   * @c device_failed.
    */
   template <typename Done>
   void drain(Done&& done)
   {
     device_guard const guard{_options.device};
-    while (in_flight() != 0) {
-      wait_busy_lanes();
-      if (reap(done) == 0) std::this_thread::yield();
+    while (active() != 0) {
+      auto const failed = wait_busy_lanes();
+      auto const count  = reap(done);
+      if (failed != 0) fail_unreported(failed);
+      if (count == 0 && failed == 0) std::this_thread::yield();
     }
   }
 
   /// Whether @ref reap has something to report now (callback mode), or may have (poll mode:
-  /// true while any read is in flight).
+  /// true while a lane is active).
   [[nodiscard]] bool completions_pending() const noexcept
   {
     if (_completed.load(std::memory_order_acquire) != 0) return true;
-    return _options.completion == lane_completion::poll && in_flight() != 0;
+    return _options.completion == lane_completion::poll && active_mask() != 0;
   }
 
-  /// How long the oldest read in flight has been (zero when idle); resubmits keep their start.
+  /// How long the oldest active read has been in flight (zero when none); resubmits keep
+  /// their start, held lanes do not count (they wait for their owner, not for storage).
   [[nodiscard]] std::chrono::steady_clock::duration oldest_in_flight() const noexcept;
 
  private:
@@ -254,6 +303,13 @@ class fused_lane_set {
     ssize_t bytes_done{0};
     callback_context callback;
     lane_read read;
+    /// The read was submitted with @c hold and its copies have not been queued yet.
+    bool holding{false};
+    /// Held after a short read: bytes of the window in the slot, copied before the rest of
+    /// the window is read (0: the whole needed range is in the slot).
+    std::size_t held_progress{0};
+    cudaError_t sync_error{cudaSuccess};  ///< drain: the stream reported this
+    cucascade::cuda::device_copy_batch batch;  ///< a window's copies as one call
     unsigned resubmits{0};
     std::chrono::steady_clock::time_point started{};
     early_failure early{early_failure::none};
@@ -266,11 +322,25 @@ class fused_lane_set {
 
   [[nodiscard]] bool build_lane(unsigned index) noexcept;
   void destroy_lane(unsigned index) noexcept;
+  [[nodiscard]] bool wants_registered_streams() const noexcept;
+  /// A new non-blocking stream for @p l, registered with cuFile when asked and possible.
   [[nodiscard]] bool create_stream(lane& l) noexcept;
-  void destroy_stream(lane& l) noexcept;
+  /// Retire @p l's stream (idle, or failed): kept for the life of the process, never
+  /// deregistered (see the source for why).
+  void retire_stream(lane& l) noexcept;
   void recycle_stream(unsigned index) noexcept;
   [[nodiscard]] unsigned pick_lane() noexcept;
+  [[nodiscard]] std::uint64_t active_mask() const noexcept { return _usable & ~_free & ~_held; }
   void issue(unsigned index, bool first) noexcept;
+  [[nodiscard]] bool start_read(unsigned index) noexcept;
+  /// Queue the copies of the lane's read, each clipped to end at or before @p limit (a
+  /// file offset).
+  [[nodiscard]] cudaError_t queue_copies(unsigned index, std::size_t limit) noexcept;
+  [[nodiscard]] cudaError_t queue_completion(unsigned index) noexcept;
+  /// A CUDA enqueue failed after the read was queued: wait for the lane and fail it.
+  void fail_queued(unsigned index, cudaError_t error) noexcept;
+  void advance_window(lane& l, std::size_t progress) noexcept;
+  void fail_unreported(std::uint64_t mask) noexcept;
   void fail_early(unsigned index,
                   early_failure outcome,
                   ssize_t io_result,
@@ -280,14 +350,15 @@ class fused_lane_set {
   [[nodiscard]] bool settle(unsigned index, lane_result& result) noexcept;
   void release_lane(unsigned index) noexcept;
   void repost(std::uint64_t mask) noexcept;
-  void wait_busy_lanes() noexcept;
+  /// Synchronize every active lane's stream; returns the lanes whose stream reported an error.
+  [[nodiscard]] std::uint64_t wait_busy_lanes() noexcept;
 
   lane_set_options _options;
   cufile_api const* _api{nullptr};
   std::size_t _built{0};          ///< lanes [0, _built) hold resources
   std::uint64_t _usable{0};       ///< built and not broken
   std::uint64_t _free{0};         ///< usable and idle
-  std::uint64_t _gated{0};        ///< in flight with a gate
+  std::uint64_t _held{0};         ///< reported held, waiting for the owner
   std::uint64_t _event_pending{0};  ///< poll mode: event recorded, not yet seen complete
   unsigned _cursor{0};            ///< round-robin start of the next free-lane search
   std::atomic<std::uint64_t> _completed{0};
@@ -303,5 +374,15 @@ void set_lane_callback_failure_for_testing(std::size_t nth) noexcept;
 
 /// Fail the @p nth D2D copy enqueue from now on, process-wide; 0 disarms.
 void set_lane_copy_failure_for_testing(std::size_t nth) noexcept;
+
+/// Fail the @p nth lane stream creation (construction or recycling) from now on,
+/// process-wide; 0 disarms.
+void set_lane_stream_create_failure_for_testing(std::size_t nth) noexcept;
+
+/// Lane streams retired (kept, never deregistered) so far, process-wide.
+[[nodiscard]] std::size_t retired_lane_streams_for_testing() noexcept;
+
+/// Copy calls (one per @c cudaMemcpyAsync, or one per batched window) lane sets issued so far.
+[[nodiscard]] std::size_t lane_copy_calls_for_testing() noexcept;
 
 }  // namespace cucascade::io::cufile::detail

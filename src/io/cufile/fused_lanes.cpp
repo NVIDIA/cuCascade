@@ -111,6 +111,11 @@ void release_lanes(int device, std::size_t lanes) noexcept
 
 std::atomic<std::size_t> callback_failure_countdown{0};
 std::atomic<std::size_t> copy_failure_countdown{0};
+std::atomic<std::size_t> stream_create_failure_countdown{0};
+std::atomic<std::size_t> copy_calls{0};
+
+/// Copies per window from which they are issued as one batched call.
+constexpr std::size_t batch_copies_from = 5;
 
 /// Count one event against @p countdown; true when it reaches the armed one.
 [[nodiscard]] bool consume(std::atomic<std::size_t>& countdown) noexcept
@@ -123,6 +128,25 @@ std::atomic<std::size_t> copy_failure_countdown{0};
   }
   return false;
 }
+
+// ---------------------------------------------------------------------------
+// Retired lane streams.  A lane set does not deregister or destroy its streams: what was
+// measured with libcufile 1.17 (compatibility mode) rules out every alternative --
+//   * cuFileStreamDeregister synchronizes the whole device and, while it waits, holds a lock
+//     other cuFile calls of the process need: deregistering (inline at shutdown, or in a
+//     background thread) waits for unrelated callers' GPU work and stalls the process's
+//     cuFile I/O meanwhile;
+//   * destroying a still-registered stream leaves cuFile with state for a handle CUDA may
+//     hand out again;
+//   * a stream one thread used for cuFileReadAsync fails it from another thread once the
+//     first is gone, so streams cannot be pooled for later sets (each reactor has its own
+//     worker thread).
+// So a set's streams are retired: kept, registered and idle, for the life of the process
+// (one small object per lane of every lane set built; the slots go back to the staging
+// pool as before).
+// ---------------------------------------------------------------------------
+
+std::atomic<std::size_t> retired_stream_count{0};
 
 std::atomic<bool> warned_stream_register{false};
 std::atomic<bool> warned_no_async{false};
@@ -145,6 +169,21 @@ void set_lane_callback_failure_for_testing(std::size_t nth) noexcept
 void set_lane_copy_failure_for_testing(std::size_t nth) noexcept
 {
   copy_failure_countdown.store(nth, std::memory_order_relaxed);
+}
+
+void set_lane_stream_create_failure_for_testing(std::size_t nth) noexcept
+{
+  stream_create_failure_countdown.store(nth, std::memory_order_relaxed);
+}
+
+std::size_t retired_lane_streams_for_testing() noexcept
+{
+  return retired_stream_count.load(std::memory_order_relaxed);
+}
+
+std::size_t lane_copy_calls_for_testing() noexcept
+{
+  return copy_calls.load(std::memory_order_relaxed);
 }
 
 // ---------------------------------------------------------------------------
@@ -211,16 +250,25 @@ fused_lane_set::fused_lane_set(lane_set_options const& options) noexcept : _opti
   }
 }
 
+bool fused_lane_set::wants_registered_streams() const noexcept
+{
+  return _options.register_streams && _api->has_stream_register &&
+         _api->stream_register != nullptr && _api->stream_deregister != nullptr;
+}
+
 bool fused_lane_set::create_stream(lane& l) noexcept
 {
+  if (consume(stream_create_failure_countdown)) {
+    l.stream = nullptr;
+    return false;
+  }
   if (cudaStreamCreateWithFlags(&l.stream, cudaStreamNonBlocking) != cudaSuccess) {
     std::ignore = cudaGetLastError();
     l.stream    = nullptr;
     return false;
   }
   l.stream_registered = false;
-  if (_options.register_streams && _api->has_stream_register && _api->stream_register != nullptr &&
-      _api->stream_deregister != nullptr) {
+  if (wants_registered_streams()) {
     auto const status   = _api->stream_register(l.stream, stream_flags);
     l.stream_registered = status.err == CU_FILE_SUCCESS;
     if (!l.stream_registered && !warned_stream_register.exchange(true)) {
@@ -232,13 +280,13 @@ bool fused_lane_set::create_stream(lane& l) noexcept
   return true;
 }
 
-void fused_lane_set::destroy_stream(lane& l) noexcept
+void fused_lane_set::retire_stream(lane& l) noexcept
 {
   if (l.stream == nullptr) return;
-  if (l.stream_registered) std::ignore = _api->stream_deregister(l.stream);
+  // Kept for the life of the process (see "Retired lane streams" above).
+  retired_stream_count.fetch_add(1, std::memory_order_relaxed);
+  l.stream            = nullptr;
   l.stream_registered = false;
-  CUCASCADE_ASSERT_CUDA_SUCCESS(cudaStreamDestroy(l.stream));
-  l.stream = nullptr;
 }
 
 bool fused_lane_set::build_lane(unsigned index) noexcept
@@ -256,12 +304,18 @@ bool fused_lane_set::build_lane(unsigned index) noexcept
       cudaEventCreateWithFlags(&l.event, cudaEventDisableTiming) != cudaSuccess) {
     std::ignore = cudaGetLastError();
     l.event     = nullptr;
-    destroy_stream(l);
+    retire_stream(l);
     staging_pool::instance().release(l.slot);
     l.slot = {};
     return false;
   }
   l.callback = callback_context{this, lane_bit(index), cudaSuccess};
+  try {
+    l.batch.reserve(64);
+  } catch (...) {
+    // Batching is an optimisation: windows with more copies than reserved fall back to
+    // one call per copy if the batch cannot grow.
+  }
   return true;
 }
 
@@ -269,10 +323,13 @@ void fused_lane_set::destroy_lane(unsigned index) noexcept
 {
   auto& l = _lanes[index];
   if (l.stream != nullptr) {
-    // Also waits for a completion callback still returning from its wake call.
-    if (cudaStreamSynchronize(l.stream) != cudaSuccess) std::ignore = cudaGetLastError();
+    // Also waits for a completion callback still returning from its wake call.  Waits only
+    // for the lane's own read and copies: a lane stream never waits on a foreign event.
+    if (cudaStreamSynchronize(l.stream) != cudaSuccess) {
+      std::ignore = cudaGetLastError();
+    }
   }
-  destroy_stream(l);
+  retire_stream(l);
   if (l.event != nullptr) {
     CUCASCADE_ASSERT_CUDA_SUCCESS(cudaEventDestroy(l.event));
     l.event = nullptr;
@@ -328,11 +385,63 @@ bool fused_lane_set::submit(lane_read&& read) noexcept
   l.read      = std::move(read);
   read.copies = std::move(spare);
   read.copies.clear();
-  l.resubmits = 0;
-  l.started   = std::chrono::steady_clock::now();
-  if (l.read.gate != nullptr) _gated |= bit;
+  l.resubmits     = 0;
+  l.holding       = l.read.hold;
+  l.held_progress = 0;
+  l.sync_error    = cudaSuccess;
+  l.started       = std::chrono::steady_clock::now();
   issue(index, /*first=*/true);
   return true;
+}
+
+bool fused_lane_set::copy_out(unsigned lane_index, std::vector<lane_copy>&& copies) noexcept
+{
+  if (lane_index >= max_lanes || (_held & lane_bit(lane_index)) == 0) return false;
+  device_guard const guard{_options.device};
+  auto& l = _lanes[lane_index];
+  _held &= ~l.callback.bit;
+  l.holding = false;
+  std::swap(l.read.copies, copies);
+  copies.clear();
+  auto const& win = l.read.window;
+  for (auto const& copy : l.read.copies) {
+    if (copy.offset < win.offset || copy.offset > win.end() ||
+        copy.bytes > win.end() - copy.offset || (copy.bytes != 0 && copy.dst == nullptr)) {
+      fail_early(lane_index, early_failure::io_failed, -EINVAL, cudaSuccess, false);
+      return true;
+    }
+  }
+  if (l.held_progress != 0) {
+    // Short held read: the slot holds the window's first `held_progress` bytes.  Copy them
+    // out, then read the rest into the slot (offset 0) behind those copies, on the lane.
+    auto const progress = l.held_progress;
+    l.held_progress     = 0;
+    l.callback.status   = cudaSuccess;
+    if (auto const error = queue_copies(lane_index, win.offset + progress);
+        error != cudaSuccess) {
+      fail_queued(lane_index, error);
+      return true;
+    }
+    advance_window(l, progress);
+    ++l.resubmits;
+    issue(lane_index, /*first=*/false);
+    return true;
+  }
+  l.callback.status = cudaSuccess;
+  auto error        = queue_copies(lane_index, std::numeric_limits<std::size_t>::max());
+  if (error == cudaSuccess) error = queue_completion(lane_index);
+  if (error != cudaSuccess) fail_queued(lane_index, error);
+  return true;
+}
+
+void fused_lane_set::release_held(unsigned lane_index) noexcept
+{
+  if (lane_index >= max_lanes || (_held & lane_bit(lane_index)) == 0) return;
+  auto& l = _lanes[lane_index];
+  _held &= ~l.callback.bit;
+  l.holding       = false;
+  l.held_progress = 0;
+  release_lane(lane_index);
 }
 
 void fused_lane_set::fail_early(unsigned index,
@@ -367,6 +476,11 @@ void fused_lane_set::issue(unsigned index, bool first) noexcept
       fail_invalid();
       return;
     }
+    if (l.holding && (!read.copies.empty() || read.needed_bytes == 0 ||
+                      read.needed_bytes > win.size)) {
+      fail_invalid();
+      return;
+    }
     for (auto const& copy : read.copies) {
       if (copy.offset < win.offset || copy.offset > win.end() ||
           copy.bytes > win.end() - copy.offset ||
@@ -377,63 +491,105 @@ void fused_lane_set::issue(unsigned index, bool first) noexcept
     }
   }
 
-  // 1. The arguments cuFile reads at execution; buffer_offset is always 0 (libcufile ignores a
-  //    non-zero one on some paths and lands the data at the base).
-  l.size              = win.size;
-  l.file_offset       = static_cast<off_t>(win.offset);
-  l.buffer_offset     = 0;
-  l.bytes_done        = bytes_sentinel;
-  l.callback.status   = cudaSuccess;
+  if (!start_read(index)) return;
+  // A held read queues only its completion: its copies come with copy_out.
+  auto error = l.holding ? cudaSuccess
+                         : queue_copies(index, std::numeric_limits<std::size_t>::max());
+  if (error == cudaSuccess) error = queue_completion(index);
+  if (error != cudaSuccess) fail_queued(index, error);
+}
 
-  // 2. The read.
-  auto const status = _api->read_async(static_cast<CUfileHandle_t>(read.handle),
+bool fused_lane_set::start_read(unsigned index) noexcept
+{
+  auto& l          = _lanes[index];
+  auto const& win  = l.read.window;
+  // The arguments cuFile reads at execution; buffer_offset is always 0 (libcufile ignores a
+  // non-zero one on some paths and lands the data at the base).
+  l.size            = win.size;
+  l.file_offset     = static_cast<off_t>(win.offset);
+  l.buffer_offset   = 0;
+  l.bytes_done      = bytes_sentinel;
+  l.callback.status = cudaSuccess;
+  auto const status = _api->read_async(static_cast<CUfileHandle_t>(l.read.handle),
                                        l.slot.base,
                                        &l.size,
                                        &l.file_offset,
                                        &l.buffer_offset,
                                        &l.bytes_done,
                                        static_cast<CUstream>(l.stream));
-  if (status.err != CU_FILE_SUCCESS) {
-    auto const code = static_cast<ssize_t>(status.err);
-    fail_early(index, early_failure::io_failed, code > 0 ? -code : -EIO, cudaSuccess, false);
-    return;
+  if (status.err == CU_FILE_SUCCESS) return true;
+  // Nothing was queued.
+  auto const code = static_cast<ssize_t>(status.err);
+  fail_early(index, early_failure::io_failed, code > 0 ? -code : -EIO, cudaSuccess, false);
+  return false;
+}
+
+cudaError_t fused_lane_set::queue_copies(unsigned index, std::size_t limit) noexcept
+{
+  auto& l         = _lanes[index];
+  auto const& win = l.read.window;
+  auto const source = [&](lane_copy const& copy) { return l.slot.base + (copy.offset - win.offset); };
+  auto const bytes_of = [&](lane_copy const& copy) -> std::size_t {
+    if (copy.offset >= limit) return 0;
+    return std::min(copy.bytes, limit - copy.offset);
+  };
+
+  std::size_t count = 0;
+  for (auto const& copy : l.read.copies) {
+    if (bytes_of(copy) != 0) ++count;
   }
-
-  // 3. The gate (first issue only: on a resubmit it has passed).
-  cudaError_t error = cudaSuccess;
-  if (first && read.gate != nullptr) error = cudaStreamWaitEvent(l.stream, read.gate, 0);
-
-  // 4. The copies out of the slot.
-  for (auto const& copy : read.copies) {
-    if (error != cudaSuccess) break;
-    if (copy.bytes == 0) continue;
-    error = consume(copy_failure_countdown)
-              ? cudaErrorInvalidValue
-              : cudaMemcpyAsync(copy.dst,
-                                l.slot.base + (copy.offset - win.offset),
-                                copy.bytes,
-                                cudaMemcpyDeviceToDevice,
-                                l.stream);
-  }
-
-  // 5. The completion.
-  if (error == cudaSuccess) {
-    bool const injected = consume(callback_failure_countdown);
-    if (_options.completion == lane_completion::poll) {
-      error = injected ? cudaErrorInvalidResourceHandle : cudaEventRecord(l.event, l.stream);
-      if (error == cudaSuccess) _event_pending |= l.callback.bit;
-    } else {
-      error = injected ? cudaErrorInvalidResourceHandle
-                       : cudaStreamAddCallback(l.stream, &on_done, &l.callback, 0);
+  if (count >= batch_copies_from && !consume(copy_failure_countdown)) {
+    // One call for the window's copies (cudaMemcpyBatchAsync where the runtime has it; the
+    // lane stream is never a default stream).
+    try {
+      l.batch.clear();
+      for (auto const& copy : l.read.copies) {
+        if (auto const bytes = bytes_of(copy); bytes != 0) l.batch.add(copy.dst, source(copy), bytes);
+      }
+      copy_calls.fetch_add(1, std::memory_order_relaxed);
+      auto const error = l.batch.enqueue(::cuda::stream_ref{l.stream});
+      l.batch.clear();
+      return error;
+    } catch (...) {
+      l.batch.clear();  // could not grow: one call per copy below
     }
+  } else if (count >= batch_copies_from) {
+    return cudaErrorInvalidValue;  // injected
   }
-  if (error == cudaSuccess) return;
+  for (auto const& copy : l.read.copies) {
+    auto const bytes = bytes_of(copy);
+    if (bytes == 0) continue;
+    copy_calls.fetch_add(1, std::memory_order_relaxed);
+    auto const error = consume(copy_failure_countdown)
+                         ? cudaErrorInvalidValue
+                         : cudaMemcpyAsync(copy.dst, source(copy), bytes, cudaMemcpyDeviceToDevice, l.stream);
+    if (error != cudaSuccess) return error;
+  }
+  return cudaSuccess;
+}
 
-  // The read is queued: wait for it (rare) so the lane is idle when reported.
+cudaError_t fused_lane_set::queue_completion(unsigned index) noexcept
+{
+  auto& l             = _lanes[index];
+  bool const injected = consume(callback_failure_countdown);
+  if (_options.completion == lane_completion::poll) {
+    auto const error = injected ? cudaErrorInvalidResourceHandle : cudaEventRecord(l.event, l.stream);
+    if (error == cudaSuccess) _event_pending |= l.callback.bit;
+    return error;
+  }
+  return injected ? cudaErrorInvalidResourceHandle
+                  : cudaStreamAddCallback(l.stream, &on_done, &l.callback, 0);
+}
+
+void fused_lane_set::fail_queued(unsigned index, cudaError_t error) noexcept
+{
+  // The read (and maybe some copies) is queued: wait for it (rare) so the lane is idle when
+  // reported, and give the lane a fresh stream.
+  auto& l          = _lanes[index];
   std::ignore      = cudaGetLastError();
   auto const drain = cudaStreamSynchronize(l.stream);
   if (drain != cudaSuccess) std::ignore = cudaGetLastError();
-  fail_early(index, early_failure::device_failed, l.bytes_done, error, drain != cudaSuccess);
+  fail_early(index, early_failure::device_failed, l.bytes_done, error, true);
 }
 
 void fused_lane_set::on_done(cudaStream_t, cudaError_t status, void* context) noexcept
@@ -478,11 +634,12 @@ void fused_lane_set::release_lane(unsigned index) noexcept
 {
   auto& l   = _lanes[index];
   auto const bit = l.callback.bit;
-  l.early        = early_failure::none;
-  l.read.gate    = nullptr;
-  l.read.handle  = nullptr;
+  l.early         = early_failure::none;
+  l.holding       = false;
+  l.held_progress = 0;
+  l.read.handle   = nullptr;
   l.read.copies.clear();
-  _gated &= ~bit;
+  _held &= ~bit;
   _event_pending &= ~bit;
   if ((_usable & bit) != 0) _free |= bit;
 }
@@ -490,7 +647,11 @@ void fused_lane_set::release_lane(unsigned index) noexcept
 void fused_lane_set::recycle_stream(unsigned index) noexcept
 {
   auto& l = _lanes[index];
-  destroy_stream(l);
+  // Its completion callback may still be returning from `wake`.
+  if (l.stream != nullptr && cudaStreamSynchronize(l.stream) != cudaSuccess) {
+    std::ignore = cudaGetLastError();
+  }
+  retire_stream(l);
   bool usable = create_stream(l);
   if (usable && l.event != nullptr) {
     CUCASCADE_ASSERT_CUDA_SUCCESS(cudaEventDestroy(l.event));
@@ -503,10 +664,14 @@ void fused_lane_set::recycle_stream(unsigned index) noexcept
   }
   if (!usable) {
     _usable &= ~l.callback.bit;
-    CUCASCADE_LOG_WARN("cufile: fused lane {} on GPU {} lost its stream; {} lanes left",
-                       index,
-                       _options.device,
-                       capacity());
+    try {
+      CUCASCADE_LOG_WARN("cufile: fused lane {} on GPU {} lost its stream; {} lanes left",
+                         index,
+                         _options.device,
+                         capacity());
+    } catch (...) {
+      // Logging is best effort.
+    }
   }
 }
 
@@ -541,18 +706,38 @@ bool fused_lane_set::settle(unsigned index, lane_result& result) noexcept
   if (l.bytes_done < 0) return finish(lane_result::status::io_failed);
 
   auto& win          = l.read.window;
-  std::size_t needed = 0;
+  std::size_t needed = l.holding ? l.read.needed_bytes : 0;
   for (auto const& copy : l.read.copies) {
     needed = std::max(needed, copy.offset + copy.bytes - win.offset);
   }
   auto const done = static_cast<std::size_t>(l.bytes_done);
-  if (done >= needed) return finish(lane_result::status::ok);
-
-  // Short read: the bytes below `progress` and the copies within them landed.
+  // Short read: the bytes below `progress` (and, without hold, the copies within them)
+  // landed.
   auto const progress = done / IO_BLOCK_SIZE * IO_BLOCK_SIZE;
-  if (progress == 0 || l.resubmits >= _options.max_resubmits) {
+  if (done < needed && (progress == 0 || l.resubmits >= _options.max_resubmits)) {
     return finish(lane_result::status::io_failed);
   }
+  if (l.holding) {
+    // Phase one done: keep the slot for the owner.  A short read continues in copy_out,
+    // after the bytes already in the slot were copied out (the continuation reads into
+    // offset 0 and would overwrite them).
+    l.held_progress = done >= needed ? 0 : progress;
+    _held |= l.callback.bit;
+    result.outcome = lane_result::status::ok;
+    result.held    = true;
+    return true;
+  }
+  if (done >= needed) return finish(lane_result::status::ok);
+
+  advance_window(l, progress);
+  ++l.resubmits;
+  issue(index, /*first=*/false);
+  return false;
+}
+
+void fused_lane_set::advance_window(lane& l, std::size_t progress) noexcept
+{
+  auto& win = l.read.window;
   win.offset += progress;
   win.size -= progress;
   auto& copies = l.read.copies;
@@ -567,11 +752,22 @@ bool fused_lane_set::settle(unsigned index, lane_result& result) noexcept
     copy.offset += skip;
     copy.bytes -= skip;
   }
-  ++l.resubmits;
-  l.read.gate = nullptr;
-  _gated &= ~l.callback.bit;
-  issue(index, /*first=*/false);
-  return false;
+}
+
+void fused_lane_set::fail_unreported(std::uint64_t mask) noexcept
+{
+  // Their streams reported an error; a lane whose completion has not arrived by now will not
+  // get one (a sticky error stops callbacks): report it as failed rather than wait forever.
+  auto const pending = _completed.load(std::memory_order_acquire);
+  auto lanes         = mask & active_mask() & ~pending;
+  while (lanes != 0) {
+    auto const index = static_cast<unsigned>(std::countr_zero(lanes));
+    lanes &= lanes - 1;
+    auto& l = _lanes[index];
+    if (l.early != early_failure::none) continue;
+    _event_pending &= ~l.callback.bit;
+    fail_early(index, early_failure::device_failed, l.bytes_done, l.sync_error, true);
+  }
 }
 
 void fused_lane_set::repost(std::uint64_t mask) noexcept
@@ -579,16 +775,22 @@ void fused_lane_set::repost(std::uint64_t mask) noexcept
   if (mask != 0) _completed.fetch_or(mask, std::memory_order_acq_rel);
 }
 
-void fused_lane_set::wait_busy_lanes() noexcept
+std::uint64_t fused_lane_set::wait_busy_lanes() noexcept
 {
-  auto busy = _usable & ~_free;
+  std::uint64_t failed = 0;
+  auto busy            = active_mask();
   while (busy != 0) {
     auto const index = static_cast<unsigned>(std::countr_zero(busy));
     busy &= busy - 1;
     auto& l = _lanes[index];
     if (l.early != early_failure::none || l.stream == nullptr) continue;
-    if (cudaStreamSynchronize(l.stream) != cudaSuccess) std::ignore = cudaGetLastError();
+    if (auto const status = cudaStreamSynchronize(l.stream); status != cudaSuccess) {
+      std::ignore  = cudaGetLastError();
+      l.sync_error = status;
+      failed |= l.callback.bit;
+    }
   }
+  return failed;
 }
 
 std::size_t fused_lane_set::registered_streams() const noexcept
@@ -605,7 +807,7 @@ std::size_t fused_lane_set::registered_streams() const noexcept
 
 std::chrono::steady_clock::duration fused_lane_set::oldest_in_flight() const noexcept
 {
-  auto busy = _usable & ~_free;
+  auto busy = active_mask();
   if (busy == 0) return std::chrono::steady_clock::duration::zero();
   auto oldest = std::chrono::steady_clock::time_point::max();
   while (busy != 0) {
@@ -617,3 +819,4 @@ std::chrono::steady_clock::duration fused_lane_set::oldest_in_flight() const noe
 }
 
 }  // namespace cucascade::io::cufile::detail
+

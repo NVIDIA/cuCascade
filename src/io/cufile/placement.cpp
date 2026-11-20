@@ -187,7 +187,8 @@ void collect_warnings(memory::system_topology_info const* topology,
 }
 
 /// Whether the optional feature block @p block is enabled and valid.  An invalid one is
-/// reported in @p plan's warnings and planned as disabled (the reactor rejects it later).
+/// reported in @p plan's warnings and planned without the feature; the reactors built from
+/// the same config refuse it (std::invalid_argument), so no context can be built from it.
 template <typename Block>
 [[nodiscard]] bool feature_valid(Block const& block,
                                  char const* name,
@@ -200,7 +201,9 @@ template <typename Block>
     return true;
   } catch (std::exception const& e) {
     plan.warnings.push_back(std::string{name} + " is invalid (" + e.what() +
-                            "): the pool is planned without " + what);
+                            "): the pool is planned without " + what +
+                            ", and a cuFile context with this configuration will refuse to be "
+                            "built");
     return false;
   }
 }
@@ -246,7 +249,8 @@ pool_plan plan_cufile_pool(config const& cfg,
     if (!cfg.storage_hint_path.empty()) {
       hint = memory::topology_discovery::discover_storage_for_path(cfg.storage_hint_path);
     }
-    // An invalid feature block is planned as disabled, like any other planning problem.
+    // An invalid feature block is planned as disabled and reported; building reactors from
+    // it then fails loudly.
     bool const fused = feature_valid(cfg.fused_reads, "fused_reads", "fused-read lanes", plan);
     bool const batch = feature_valid(cfg.host_batch, "host_batch", "host batch reactors", plan);
 

@@ -393,6 +393,10 @@ struct fused_read_config {
   /// Continuations of one read after short reads, before it falls back.
   unsigned max_resubmits{8};
 
+  /// Caller pieces one fused read serves at most: a window closes when it holds this many,
+  /// so a read's device copies stay bounded.  At least 1.
+  std::size_t max_parts_per_read{256};
+
   /// Consecutive failed lane reads after which a reactor stops using lanes for
   /// @ref cooldown_s seconds.  A failed read is always re-served synchronously.
   unsigned failure_limit{8};
@@ -431,6 +435,9 @@ struct fused_read_config {
     }
     if (failure_limit == 0) {
       throw std::invalid_argument("fused_reads.failure_limit must be positive");
+    }
+    if (max_parts_per_read == 0) {
+      throw std::invalid_argument("fused_reads.max_parts_per_read must be positive");
     }
     switch (completion) {
       case lane_completion::callback:

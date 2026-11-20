@@ -793,3 +793,47 @@ TEST_CASE("fused plan post-conditions hold on random inputs", "[io][cufile][fuse
     }
   }
 }
+
+TEST_CASE("fused plan: a window closes at max_parts", "[io][cufile][fused_plan]")
+{
+  // 40 contiguous 4 KiB slices fit one 1 MiB window; with a cap of 16 parts they make 3.
+  std::vector<std::pair<std::size_t, std::size_t>> ranges;
+  for (std::size_t i = 0; i < 40; ++i) {
+    ranges.emplace_back(i * 4 * KiB, 4 * KiB);
+  }
+  auto slices       = device_slices(ranges);
+  auto options      = window_of(1 * MiB);
+  options.max_parts = 16;
+  auto const stats  = plan_fused_reads(slices, 64 * MiB, options);
+  CHECK(stats.reads == 3);
+  CHECK(stats.parts == 40);
+  REQUIRE(slices.size() == 3);
+  CHECK(slices[0].fused.size() == 16);
+  CHECK(slices[1].fused.size() == 16);
+  CHECK(slices[2].fused.size() == 8);
+  for (auto const& slice : slices) {
+    CHECK(is_lane_read(slice, 64 * MiB, 1 * MiB));
+  }
+
+  // No cap: one window.
+  auto uncapped = device_slices(ranges);
+  CHECK(plan_fused_reads(uncapped, 64 * MiB, window_of(1 * MiB)).reads == 1);
+}
+
+TEST_CASE("fused plan: a slice whose end overflows is clamped to the file",
+          "[io][cufile][fused_plan]")
+{
+  constexpr std::size_t file_size = (3 * MiB) + 100;
+  auto slices = device_slices({{5000, std::numeric_limits<std::size_t>::max() - 1000}});
+  auto const stats = plan_fused_reads(slices, file_size, window_of(1 * MiB));
+  std::size_t payload = 0;
+  for (auto const& slice : slices) {
+    for (auto const& p : pieces_of(slice)) {
+      CHECK(p.rng.end() <= file_size);
+      payload += p.rng.size;
+    }
+  }
+  CHECK(payload == file_size - 5000);
+  CHECK(stats.tail_slices == 1);
+  CHECK(stats.reads >= 3);
+}

@@ -363,18 +363,59 @@ bool cufile_ioctx::fused_reads_usable() const noexcept
   return api != nullptr && api->has_async_read;
 }
 
+template <typename Visit>
+void cufile_ioctx::for_each_lane_reactor(int device_id, Visit&& visit) const
+{
+  if (_plan.groups.empty()) {
+    // A flat pool: every reactor may own lanes.
+    for (std::size_t i = 0; i < _reactors.size(); ++i) {
+      if (!visit(i)) return;
+    }
+    return;
+  }
+  for (auto const& group : _groups) {
+    if (group.device != device_id) continue;
+    for (std::size_t i = group.first; i < group.first + group.lanes; ++i) {
+      if (!visit(i)) return;
+    }
+    return;
+  }
+}
+
+bool cufile_ioctx::lanes_routable(int device_id) const noexcept
+{
+  if (device_id < 0 || !fused_reads_usable()) return false;
+  bool usable = false;
+  for_each_lane_reactor(device_id, [&](std::size_t index) {
+    usable = _reactors[index]->lanes_usable(device_id);
+    return !usable;
+  });
+  return usable;
+}
+
+bool cufile_ioctx::is_routable_lane_read(cufile_io_object const& object,
+                                         prepared_io_slice const& slice) const noexcept
+{
+  return is_lane_read(slice, object.size(), _config.fused_reads.slot_bytes) &&
+         lane_window(slice).size >= _config.gds_threshold && object.cufile_registered() &&
+         lanes_routable(slice.d_buffer.device_id);
+}
+
 bool cufile_ioctx::has_lane_read(cufile_io_object const& object,
                                  std::span<prepared_io_slice const> slices) const noexcept
 {
   if (!object.cufile_registered() || !fused_reads_usable()) return false;
-  auto const file_size = object.size();
-  for (auto const& slice : slices) {
-    if (is_lane_read(slice, file_size, _config.fused_reads.slot_bytes) &&
-        lane_window(slice).size >= _config.gds_threshold) {
-      return true;
-    }
-  }
-  return false;
+  return std::any_of(slices.begin(), slices.end(), [&](prepared_io_slice const& slice) {
+    return is_routable_lane_read(object, slice);
+  });
+}
+
+std::size_t cufile_ioctx::slice_class(cufile_io_object const& object,
+                                      prepared_io_slice const& slice) const
+{
+  // Lane reads go to lane reactors; everything else of the same request to the reactors
+  // its own role picks (see select_reactors).
+  return _config.fused_reads.enabled && is_routable_lane_read(object, slice) ? 1 : 0;
 }
 
 std::vector<std::size_t> cufile_ioctx::candidates(reactor_role role, int device_id) const
@@ -402,12 +443,12 @@ std::vector<std::size_t> cufile_ioctx::candidates(reactor_role role, int device_
   };
   switch (role) {
     case reactor_role::lane:
-      if (group != nullptr) {
-        add(group->first, group->lanes != 0 ? group->lanes : group->count);
-      } else {
-        add_all_sync();
-      }
-      break;
+      // Only reactors that can use lanes on the GPU now (not cooling down, lanes there).
+      for_each_lane_reactor(device_id, [&](std::size_t index) {
+        if (_reactors[index]->lanes_usable(device_id)) out.push_back(index);
+        return true;
+      });
+      return out;  // empty: no lane reactor is usable; the caller routes synchronously
     case reactor_role::host:
       if (_batch_count != 0) {
         add(_batch_first, _batch_count);
@@ -486,13 +527,15 @@ std::vector<cufile_reactor*> cufile_ioctx::select_reactors(
   io_op_type operation,
   int device_id)
 {
-  auto selected = operation == io_op_type::host_vector_async && device_id >= 0 &&
-                      has_lane_read(object, slices)
-                    ? rank(candidates(reactor_role::lane, device_id),
-                           slices.size(),
-                           operation,
-                           device_id)
-                    : next_reactor(object, slices.size(), operation, device_id);
+  std::vector<cufile_reactor*> selected;
+  if (operation == io_op_type::host_vector_async && device_id >= 0 &&
+      has_lane_read(object, slices)) {
+    if (auto const lane_reactors = candidates(reactor_role::lane, device_id);
+        !lane_reactors.empty()) {
+      selected = rank(lane_reactors, slices.size(), operation, device_id);
+    }
+  }
+  if (selected.empty()) selected = next_reactor(object, slices.size(), operation, device_id);
   if (operation == io_op_type::write_vector_async && !selected.empty()) {
     for (auto const& slice : slices)
       if (slice.backend_owner &&
@@ -547,8 +590,7 @@ void cufile_ioctx::prepare_device_slices(io_object const& object,
   // take the POSIX path.
   auto const split_bytes = std::max(
     _config.staging_piece_bytes, align_up_block(std::max<std::size_t>(_config.gds_threshold, 1)));
-  auto const file_size    = object.size();
-  std::size_t piece_count = 0;  // slices after splitting
+  auto const file_size = object.size();
 
   for (auto& slice : slices) {
     if (!slice.has_device_request() || slice.d_buffer.ready_gate_set) continue;
@@ -556,22 +598,43 @@ void cufile_ioctx::prepare_device_slices(io_object const& object,
 
     slice.d_buffer.ready_gate     = gates.of(slice.d_buffer.stream.get());
     slice.d_buffer.ready_gate_set = true;
-
+  }
+  // Fused reads replace the split and the legacy fusion: the planner packs and splits the
+  // device slices into lane reads of at most a slot.  Only when a lane reactor can take them
+  // on every GPU the request reads into; otherwise the request takes the legacy path end to
+  // end (its windows would only be served synchronously, by fewer reactors).
+  auto const* file = dynamic_cast<cufile_io_object const*>(&object);
+  if (file != nullptr && file->cufile_registered() && fused_reads_usable()) {
+    bool routable  = false;
+    bool any_other = false;
+    int checked    = -1;
+    for (auto const& slice : slices) {
+      if (!slice.has_device_request()) continue;
+      auto const device = slice.d_buffer.device_id;
+      if (device == checked) continue;
+      checked = device;
+      if (lanes_routable(device)) {
+        routable = true;
+      } else {
+        any_other = true;
+      }
+    }
+    if (routable && !any_other) {
+      fused_plan_options options;
+      options.window_bytes   = _config.fused_reads.slot_bytes;
+      options.gap_bytes      = _config.fused_reads.fuse_gap_bytes;
+      options.fuse           = _config.fused_reads.fuse;
+      options.min_read_bytes = align_up_block(_config.gds_threshold);
+      options.max_parts      = _config.fused_reads.max_parts_per_read;
+      std::ignore            = plan_fused_reads(slices, file_size, options);
+      return;
+    }
+  }
+  std::size_t piece_count = 0;  // slices after splitting
+  for (auto const& slice : slices) {
     if (auto const pieces = split_pieces(slice, file_size, split_bytes); pieces > 1) {
       piece_count += pieces - 1;
     }
-  }
-  // Fused reads replace the split and the legacy fusion: the planner packs and splits the
-  // device slices into lane reads of at most a slot.
-  auto const* file = dynamic_cast<cufile_io_object const*>(&object);
-  if (file != nullptr && file->cufile_registered() && fused_reads_usable()) {
-    fused_plan_options options;
-    options.window_bytes   = _config.fused_reads.slot_bytes;
-    options.gap_bytes      = _config.fused_reads.fuse_gap_bytes;
-    options.fuse           = _config.fused_reads.fuse;
-    options.min_read_bytes = align_up_block(_config.gds_threshold);
-    std::ignore            = plan_fused_reads(slices, file_size, options);
-    return;
   }
   if (piece_count == 0) {
     fuse_device_slices(slices, file_size);
@@ -735,6 +798,16 @@ std::shared_ptr<cufile_ioctx> make_cufile_ioctx(std::size_t n_reactors, config c
     if (caps.size() <= index) caps.resize(index + 1, unplanned);
     caps[index] = group.staging_cap_bytes;
   }
+  // The lanes each planned GPU's plan reserved bound its lane sets (unplanned: the
+  // default), in a flat pool too, like the staging caps.
+  std::vector<std::size_t> lane_quotas;
+  for (auto const& group : plan.groups) {
+    auto const index = static_cast<std::size_t>(group.device);
+    if (lane_quotas.size() <= index) {
+      lane_quotas.resize(index + 1, std::numeric_limits<std::size_t>::max());
+    }
+    lane_quotas[index] = group.lane_slots;
+  }
   if (n_reactors != 0) {
     // A flat pool: no groups, so no lane or batch roles (every reactor has every enabled
     // capability) and no lane slots reserved up front.
@@ -748,8 +821,8 @@ std::shared_ptr<cufile_ioctx> make_cufile_ioctx(std::size_t n_reactors, config c
   for (auto const& warning : plan.warnings) {
     CUCASCADE_LOG_WARN("cufile: {}", warning);
   }
-  auto ctx =
-    std::make_shared<cufile_reactor::reactor_context>(std::move(effective), std::move(caps));
+  auto ctx = std::make_shared<cufile_reactor::reactor_context>(
+    std::move(effective), std::move(caps), std::move(lane_quotas));
   return std::make_shared<cufile_ioctx>(std::move(plan), std::move(ctx));
 }
 

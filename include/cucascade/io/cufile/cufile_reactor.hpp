@@ -445,6 +445,18 @@ class cufile_reactor {
     {
     }
 
+    /// As above, with @p lane_quotas: the fused-read lanes the plan reserved per device
+    /// (@c device_group_plan::lane_slots, indexed by device id); devices past its end use
+    /// @ref lane_quota's default.
+    reactor_context(config cfg,
+                    std::vector<std::size_t> staging_caps,
+                    std::vector<std::size_t> lane_quotas)
+      : _config(std::move(cfg)),
+        _staging_caps(std::move(staging_caps)),
+        _lane_quotas(std::move(lane_quotas))
+    {
+    }
+
     [[nodiscard]] const config& cfg() const noexcept { return _config; }
 
     struct engine_binding {
@@ -478,10 +490,17 @@ class cufile_reactor {
       return !_batch_policy_logged.exchange(true, std::memory_order_relaxed);
     }
 
+    /// The fused-read lanes the process may hold on @p device for this context: the plan's
+    /// @c lane_slots for a planned device, else
+    /// @c min(reactors_per_device x lanes_per_reactor, max_lanes_per_device) of
+    /// @c config::fused_reads (what @c fused_lane_staging_bytes budgets).
+    [[nodiscard]] std::size_t lane_quota(int device) const noexcept;
+
    private:
     config _config;
     std::vector<std::size_t> _staging_caps;
     mutable std::atomic<bool> _batch_policy_logged{false};
+    std::vector<std::size_t> _lane_quotas;
     mutable std::mutex _engine_mutex;
     using engine_bindings = std::vector<std::shared_ptr<engine_binding>>;
     std::atomic<std::shared_ptr<const engine_bindings>> _engines;
@@ -563,6 +582,12 @@ class cufile_reactor {
 
   /// The GPU this reactor mainly serves and the CPUs its worker is pinned to.
   [[nodiscard]] reactor_placement const& placement() const noexcept { return _placement; }
+
+  /// Whether this reactor can serve lane reads into @p device now: fused reads enabled, its
+  /// placement allows lanes, not cooling down after failures, and its lane set for @p device
+  /// has lanes (a device it has not tried yet counts as usable).  Any thread; the ioctx
+  /// routes by it.
+  [[nodiscard]] bool lanes_usable(int device) const noexcept;
 
   /// Whether @p path can be served by this reactor: true iff it names an
   /// existing, accessible regular file.  Routing between this and the uring
@@ -658,6 +683,8 @@ class cufile_reactor {
     prepared_io_slice slice;
     std::shared_ptr<grouped_coordinator> coordinator;
     std::shared_ptr<cucascade::cuda::cuda_event> gate;
+    /// Re-dispatched with lanes bypassed: the fallback of a failed lane read.
+    bool no_lanes{false};
   };
 
   /// Registered staging slots and their copy streams for one device (defined in
@@ -992,6 +1019,28 @@ class cufile_reactor {
   /// placement allows them.  Worker-only.
   struct lane_state;
   std::unique_ptr<lane_state> _lanes;
+
+  /// Published for @ref lanes_usable (any thread): per device, 0 = not tried yet, 1 = has
+  /// lanes, 2 = none; and the end of the current cooldown (steady clock, ns since epoch).
+  static constexpr std::size_t max_lane_devices = 64;
+  std::array<std::atomic<std::uint8_t>, max_lane_devices> _lane_device_state{};
+  std::atomic<std::int64_t> _lane_cooldown_until_ns{0};
+
+  // Lane-specific helpers (called from the generic async hooks below).
+  void reap_lanes() noexcept;
+  void poll_held_lanes() noexcept;
+  void issue_lane_backlog() noexcept;
+  /// Settle (or move to the held list) the lane read of reaped result @p result_index.
+  void settle_lane_result(std::size_t result_index) noexcept;
+  [[nodiscard]] bool issue_lane_op(std::uint32_t index) noexcept;
+  void copy_out_lane_op(std::uint32_t index) noexcept;
+  /// Serve a lane op's destinations through the synchronous paths of this reactor (parked
+  /// on its gate first when the gate has not fired), then release the op.
+  void serve_lane_op_synchronously(std::uint32_t index) noexcept;
+  /// Release a lane op whose read was not served and settle it with @p error.
+  void fail_lane_op(std::uint32_t index, grouped_coordinator::error_type const& error) noexcept;
+  void publish_lane_state(int device, bool usable) noexcept;
+  void drain_lanes(grouped_coordinator::error_type const& terminal_error) noexcept;
 
   /// Reap every asynchronous facility once (no blocking): settle finished lane reads,
   /// refill lanes from the backlog, run fallbacks.  Called every worker pass.

@@ -102,8 +102,9 @@ class planner {
   {
     auto const& slice = _slices[index];
     auto pos          = slice.rng.offset;
-    auto const end    = std::min(slice.rng.end(), _file_size);
-    bool const whole  = slice.rng.end() <= _file_size;
+    // offset < file_size (eligible): no overflow, whatever the size.
+    auto const end    = pos + std::min(slice.rng.size, _file_size - pos);
+    bool const whole  = slice.rng.size <= _file_size - pos;
     std::size_t pieces = 0;
     while (pos < end) {
       ++pieces;
@@ -134,7 +135,9 @@ class planner {
                                 whole && pos == slice.rng.offset && take == slice.rng.size});
       _data_end = pos + take;
       pos += take;
-      if (_data_end == _limit) close();
+      if (_data_end == _limit || (_options.max_parts != 0 && _parts.size() >= _options.max_parts)) {
+        close();
+      }
     }
     if (pieces > 1) ++_stats.split_slices;
   }

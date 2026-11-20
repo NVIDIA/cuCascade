@@ -41,6 +41,8 @@ struct fused_plan_options {
   /// Windows whose aligned size is below this are not lane reads: their parts are emitted as
   /// ordinary slices.  0 = every window is a lane read.
   std::size_t min_read_bytes{0};
+  /// Most parts one window holds: it closes when it has this many.  0 = no limit.
+  std::size_t max_parts{0};
 };
 
 /**
