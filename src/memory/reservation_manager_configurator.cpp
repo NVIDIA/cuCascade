@@ -190,7 +190,11 @@ builder_reference& reservation_manager_configurator::set_host_portability(bool m
 }
 
 builder_reference& reservation_manager_configurator::set_disk_mounting_point(
-  int uuid, std::size_t capacity, std::string mounting_point, std::shared_ptr<io::ioctx> io_context)
+  int uuid,
+  std::size_t capacity,
+  std::string mounting_point,
+  std::shared_ptr<io::ioctx> io_context,
+  bool allow_gds)
 {
   assert(!mounting_point.empty() && "Mounting point cannot be empty");
   disk_memory_space_config config;
@@ -198,6 +202,7 @@ builder_reference& reservation_manager_configurator::set_disk_mounting_point(
   config.memory_capacity = capacity;
   config.mount_paths     = std::move(mounting_point);
   config.io_context      = std::move(io_context);
+  config.allow_gds       = allow_gds;
   _disk_mounting_points.push_back(std::move(config));
   return *this;
 }

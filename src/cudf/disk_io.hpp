@@ -32,7 +32,6 @@
 #include <cucascade/io/types.hpp>
 
 #include <cstddef>
-#include <memory>
 #include <span>
 #include <string>
 
@@ -42,28 +41,26 @@ namespace io {
 class ioctx;
 }  // namespace io
 
-namespace memory {
-class memory_space;
-}  // namespace memory
-
 namespace detail {
 
 /**
- * @brief Whether GPUDirect Storage really works on this host (not cuFile compatibility mode).
+ * @brief The cuFile driver's GDS status flags (io::cufile::gds_status_flags()); 0 when GPUDirect
+ *        Storage does not really work on this host (cuFile compatibility mode, or no cuFile).
  *
- * The one place automatic backend selection asks; see disk_io_context.cpp.
+ * The one place backend selection asks; see disk_io_context.cpp.
  */
-[[nodiscard]] bool gds_is_available() noexcept;
+[[nodiscard]] unsigned int gds_status_flags() noexcept;
 
 /**
- * @brief The io context of a DISK memory space, adopting default_disk_io_context() when the space
- *        has none yet.
+ * @brief Whether a cuFile driver reporting @p status_flags is expected to serve the files under
+ *        @p mount_path through GPUDirect Storage (see io::cufile::gds_supports_filesystem()).
  *
- * The caller holds the returned reference for the whole conversion, so a concurrent
- * memory_space::set_io_context() cannot tear the context down underneath it.
+ * Looks at the filesystem and drives under a probe file it creates in @p mount_path and removes
+ * again; with no status flag set the mount is not touched.
+ *
+ * @throws std::runtime_error if the probe file cannot be created.
  */
-[[nodiscard]] std::shared_ptr<io::ioctx> resolve_disk_io_context(
-  memory::memory_space const& disk_space);
+[[nodiscard]] bool mount_supports_gds(std::string const& mount_path, unsigned int status_flags);
 
 /**
  * @brief Write device buffers into an existing (freshly created) batch file and wait.

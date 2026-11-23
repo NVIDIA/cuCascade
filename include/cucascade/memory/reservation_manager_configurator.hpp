@@ -166,11 +166,14 @@ class reservation_manager_configurator {
   /// @param capacity Capacity of the disk memory space in bytes.
   /// @param mounting_point Directory the space's files are created in.
   /// @param io_context io context serving the space's files (must be started and support
-  ///        writes); null adopts the process-shared default on first use.
+  ///        writes); null adopts a process-shared default on first use.
+  /// @param allow_gds Whether that default may be the cuFile (GPUDirect Storage) context, which
+  ///        is adopted only when the mounting point supports GDS; false always adopts uring.
   builder_reference& set_disk_mounting_point(int uuid,
                                              std::size_t capacity,
                                              std::string mounting_point,
-                                             std::shared_ptr<io::ioctx> io_context = nullptr);
+                                             std::shared_ptr<io::ioctx> io_context = nullptr,
+                                             bool allow_gds                        = true);
 
   /// \brief build the memory space configurations based on the provided system topology
   /// @param topology System topology information.

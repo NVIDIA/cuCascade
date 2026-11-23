@@ -27,8 +27,9 @@ namespace cucascade {
  * Registers converters between all supported cudf-backed representation types (GPU, HOST, DISK).
  * Disk converters perform their I/O through the io context of the DISK memory_space
  * (memory_space::get_io_context()), resolved at conversion time, so each disk memory_space can use
- * a different io stack; a space without one adopts default_disk_io_context()
- * (see cucascade/cudf/disk_io_context.hpp).
+ * a different io stack; a space without one adopts a process-shared default, cuFile on a mount
+ * that supports GPUDirect Storage and uring otherwise (see resolve_disk_io_context() in
+ * cucascade/cudf/disk_io_context.hpp).
  *
  * This is provided by the cucascade-cudf library; the cudf-free core registry ships empty.
  *

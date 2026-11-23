@@ -80,7 +80,8 @@ class memory_space {
    * Construct a DISK-tier memory_space.
    *
    * The io context in @p config (if any) serves this space's files; without one, the DISK
-   * converters adopt the process-shared default on first use (see get_or_init_io_context()).
+   * converters adopt a process-shared default on first use (see get_or_init_io_context()),
+   * the cuFile one only if allow_gds() and the mount supports GPUDirect Storage.
    */
   explicit memory_space(const disk_memory_space_config& config);
 
@@ -154,6 +155,12 @@ class memory_space {
   [[nodiscard]] std::string_view get_disk_mount_path() const;
 
   /**
+   * @brief Whether this DISK space may adopt the shared cuFile (GPUDirect Storage) context
+   *        (disk_memory_space_config::allow_gds). Throws if not DISK tier.
+   */
+  [[nodiscard]] bool allow_gds() const;
+
+  /**
    * @brief Get the io context that serves this DISK space's files.
    *
    * @return The configured or adopted context; null if none has been set yet.
@@ -216,6 +223,7 @@ class memory_space {
   std::optional<::cuda::mr::any_resource<::cuda::mr::device_accessible>>
     _reservation_allocator_resource;
   std::unique_ptr<rmm::cuda_stream_pool> _stream_pool;
+  const bool _allow_gds = false;  ///< disk_memory_space_config::allow_gds (DISK tier only)
   /// io context serving a DISK space's files (null for other tiers and until set or adopted).
   /// Mutable: get_or_init_io_context() lazily adopts a default on a const space.
   mutable std::shared_ptr<io::ioctx> _io_context;

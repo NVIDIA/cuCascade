@@ -165,7 +165,7 @@ std::vector<memory_space_config> create_benchmark_configs()
   host_config.initial_number_pools = 16;
   configs.emplace_back(host_config);
 
-  // DISK 0: no io context -> adopts the process-shared default (cuFile with real GDS, else uring).
+  // DISK 0: no io context -> adopts a process-shared default (cuFile on a GDS mount, else uring).
   disk_memory_space_config default_disk;
   default_disk.disk_id         = DEFAULT_DISK_ID;
   default_disk.memory_capacity = 32 * GiB;
@@ -230,8 +230,7 @@ const memory_space* disk_space_for(benchmark::State& state, bool device)
 {
   auto const disk_id = static_cast<int>(state.range(2));
   auto* space        = get_shared_memory_manager()->get_memory_space(Tier::DISK, disk_id);
-  auto context       = space->get_io_context();
-  if (!context) { context = default_disk_io_context(); }
+  auto context       = resolve_disk_io_context(*space);
   if (device ? !context->supports_device_write() : !context->supports_write()) {
     state.SkipWithMessage("the io context of DISK " + std::to_string(disk_id) + " cannot write " +
                           (device ? "device" : "host") + " memory");

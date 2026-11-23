@@ -26,6 +26,7 @@ request to its GPU's reactor) and `cufile_api` (the `dlopen`ed entry points):
 - [Registered arena memory](#registered-arena-memory)
 - [Plugging in the asynchronous APIs](#plugging-in-the-asynchronous-apis)
 - [What discovery reports](#what-discovery-reports)
+- [DISK memory spaces](#disk-memory-spaces)
 - [IBM Storage Scale checklist](#ibm-storage-scale-checklist)
 - [Verifying the path a read took](#verifying-the-path-a-read-took)
 - [Configuration reference](#configuration-reference)
@@ -190,6 +191,38 @@ Passive (`memory::topology_discovery::discover()`, no CUDA or cuFile loaded):
 
 Active: `cufile::gds_available()` loads libcufile, opens its driver and reports
 whether a storage class has a GDS mode and compatibility mode is not forced.
+
+## DISK memory spaces
+
+A DISK `memory_space` given no io context adopts a process-shared one on its
+first conversion (`resolve_disk_io_context()` in
+`cucascade/cudf/disk_io_context.hpp`): the shared cuFile context when the space
+allows GDS and its mount supports it, otherwise the shared uring context.
+
+- `disk_memory_space_config::allow_gds` (default `true`; last argument of
+  `reservation_manager_configurator::set_disk_mounting_point()`) turns the
+  cuFile choice off for a space. Such a space never opens the cuFile driver.
+- The mount check is `cufile::gds_supports_filesystem()` on the driver's status
+  flags (`cufile::gds_status_flags()`) and the filesystem under the mount,
+  found from a probe file created in the mount and removed again:
+
+  | Filesystem of the mount | Driver flag needed |
+  |-------------------------|--------------------|
+  | `ext4`, `xfs`, every drive NVMe | `CU_FILE_NVME_SUPPORTED` |
+  | `gpfs` | `CU_FILE_GPFS_SUPPORTED` |
+  | `lustre` | `CU_FILE_LUSTRE_SUPPORTED` |
+  | `wekafs` | `CU_FILE_WEKAFS_SUPPORTED` |
+  | `beegfs` | `CU_FILE_BEEGFS_SUPPORTED` |
+  | `nfs`, `nfs4` | `CU_FILE_NFS_SUPPORTED` |
+  | anything else (tmpfs, overlay, unresolved) | never |
+
+- It is a prediction: cuFile does not report the mode a file gets. On a mount
+  that passes, cuFile can still serve a file in compatibility mode (denylists
+  in `cufile.json`, mount options, RDMA setup), which works but is slower than
+  uring; set `allow_gds` off for that space.
+- The shared cuFile context uses the `cufile::config` defaults, so it takes the
+  arena of every visible GPU (shared with any other context of the same lane
+  geometry). A space given its own context is never changed.
 
 ## IBM Storage Scale checklist
 

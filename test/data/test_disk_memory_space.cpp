@@ -184,9 +184,21 @@ TEST_CASE("concurrent first uses of a fresh disk memory_space adopt one default"
   REQUIRE(space.get_io_context() == seen.front());
 }
 
+TEST_CASE("disk memory_space allows GDS unless its config says otherwise",
+          "[disk][io][memory_space]")
+{
+  auto config = make_disk_config();
+  REQUIRE(config.allow_gds);
+  REQUIRE(memory::memory_space(config).allow_gds());
+
+  config.allow_gds = false;
+  REQUIRE_FALSE(memory::memory_space(config).allow_gds());
+}
+
 TEST_CASE("io context accessors reject non-DISK memory spaces", "[disk][io][memory_space]")
 {
   auto gpu_space = test::make_mock_memory_space(memory::Tier::GPU, 0);
+  REQUIRE_THROWS_AS(gpu_space->allow_gds(), std::logic_error);
   REQUIRE_THROWS_AS(gpu_space->get_io_context(), std::logic_error);
   REQUIRE_THROWS_AS(gpu_space->set_io_context(nullptr), std::logic_error);
   REQUIRE_THROWS_AS(

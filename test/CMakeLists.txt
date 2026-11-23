@@ -202,8 +202,12 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_CUDF)
 
   # Set include directories
   target_include_directories(
-    cucascade_cudf_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
-                                 ${CMAKE_CURRENT_SOURCE_DIR}/utils)
+    cucascade_cudf_tests
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
+            ${CMAKE_CURRENT_SOURCE_DIR}/utils
+            # Tests of src-private helpers (cudf/disk_io.hpp) include them from
+            # src/.
+            ${PROJECT_SOURCE_DIR}/src)
 
   # Link dependencies
   target_link_libraries(

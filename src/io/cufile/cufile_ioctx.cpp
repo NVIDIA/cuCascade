@@ -37,18 +37,38 @@ namespace cucascade::io::cufile {
 // Lets the context be destroyed on one of its reactors' workers (see ~templated_ioctx).
 static_assert(reactor_reports_worker_thread<cufile_reactor>);
 
-bool gds_available() noexcept
+bool gds_available() noexcept { return gds_status_flags() != 0; }
+
+unsigned int gds_status_flags() noexcept
 {
-  static bool const available = [] {
+  static unsigned int const flags = []() -> unsigned int {
     auto const* api = cufile_api::get();
-    if (api == nullptr || !cufile_api::open_driver()) { return false; }
+    if (api == nullptr || !cufile_api::open_driver()) { return 0; }
     CUfileDrvProps_t props{};
-    if (api->driver_get_properties(&props).err != CU_FILE_SUCCESS) { return false; }
+    if (api->driver_get_properties(&props).err != CU_FILE_SUCCESS) { return 0; }
     auto const* forced = std::getenv("CUFILE_FORCE_COMPAT_MODE");
-    return props.nvfs.dstatusflags != 0 &&
-           (forced == nullptr || ::strncasecmp(forced, "true", 4) != 0);
+    if (forced != nullptr && ::strncasecmp(forced, "true", 4) == 0) { return 0; }
+    return props.nvfs.dstatusflags;
   }();
-  return available;
+  return flags;
+}
+
+bool gds_supports_filesystem(unsigned int status_flags,
+                             std::string_view filesystem_type,
+                             bool on_nvme) noexcept
+{
+  auto const has = [status_flags](CUfileDriverStatusFlags_t storage_class) {
+    return (status_flags & (1U << storage_class)) != 0;
+  };
+  if (filesystem_type == "ext4" || filesystem_type == "xfs") {
+    return on_nvme && has(CU_FILE_NVME_SUPPORTED);
+  }
+  if (filesystem_type == "gpfs") { return has(CU_FILE_GPFS_SUPPORTED); }
+  if (filesystem_type == "lustre") { return has(CU_FILE_LUSTRE_SUPPORTED); }
+  if (filesystem_type == "wekafs") { return has(CU_FILE_WEKAFS_SUPPORTED); }
+  if (filesystem_type == "beegfs") { return has(CU_FILE_BEEGFS_SUPPORTED); }
+  if (filesystem_type == "nfs" || filesystem_type == "nfs4") { return has(CU_FILE_NFS_SUPPORTED); }
+  return false;
 }
 
 namespace {

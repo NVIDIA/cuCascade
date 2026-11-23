@@ -28,6 +28,10 @@ namespace io {
 class ioctx;
 }  // namespace io
 
+namespace memory {
+class memory_space;
+}  // namespace memory
+
 /**
  * @brief Which io stack serves a DISK memory space's files.
  */
@@ -93,18 +97,47 @@ struct disk_io_context_options {
   disk_io_context_options const& options = {});
 
 /**
- * @brief The process-shared default context of DISK memory spaces configured without one.
+ * @brief The process-shared default context for callers that have no DISK memory space at hand.
  *
- * Built on first use with make_disk_io_context() and the io_config defaults (automatic backend,
- * see disk_io_backend::automatic), serving both the host and the device paths. It is cached
- * through a weak reference, so every space that adopts it shares one reactor set; it is shut down
- * when the last space holding it is destroyed and rebuilt on a later use. The same teardown-order
- * note as for make_disk_io_context() applies to the spaces holding it. The cache itself (a
- * function-local mutex and weak reference) is destroyed during static destruction, so do not
- * start a DISK conversion from a static destructor.
+ * One of the two shared contexts DISK spaces adopt (see resolve_disk_io_context()): the cuFile
+ * one when GPUDirect Storage is really available on this host, else the uring one
+ * (disk_io_backend::automatic). It does not look at any mount, so prefer
+ * resolve_disk_io_context() for a space.
+ *
+ * Each shared context is built on first use with make_disk_io_context() and the io_config
+ * defaults, serving both the host and the device paths. It is cached through a weak reference, so
+ * every space that adopts it shares one reactor set; it is shut down when the last space holding
+ * it is destroyed and rebuilt on a later use. The same teardown-order note as for
+ * make_disk_io_context() applies to the spaces holding it. The cache itself (a function-local
+ * mutex and weak references) is destroyed during static destruction, so do not start a DISK
+ * conversion from a static destructor.
  *
  * @return The shared default context (started).
  */
 [[nodiscard]] std::shared_ptr<io::ioctx> default_disk_io_context();
+
+/**
+ * @brief The io context of a DISK memory space, adopting a process-shared default first when the
+ *        space has none yet. What the DISK converters use.
+ *
+ * A space without a context adopts the shared cuFile context when it allows GDS
+ * (disk_memory_space_config::allow_gds, the default) and its mount is on a filesystem the cuFile
+ * driver serves through GPUDirect Storage; otherwise the shared uring context. The mount check
+ * runs once per space, on this first use: it opens the cuFile driver, and when the driver has a
+ * GDS mode it creates and removes one probe file in the mount to find its filesystem and drives.
+ * A space with allow_gds off never opens the cuFile driver. The check is a prediction (see
+ * io::cufile::gds_supports_filesystem()): on a mount that passes it cuFile can still serve a file
+ * in compatibility mode, which works but is slower than uring.
+ *
+ * Hold the returned reference for the whole operation, so a concurrent
+ * memory_space::set_io_context() cannot tear the context down underneath it.
+ *
+ * @param disk_space A DISK-tier memory space.
+ * @return The space's context (started); never null.
+ * @throws std::logic_error if @p disk_space is not a DISK-tier memory space.
+ * @throws whatever make_disk_io_context() throws when a shared context has to be built.
+ */
+[[nodiscard]] std::shared_ptr<io::ioctx> resolve_disk_io_context(
+  memory::memory_space const& disk_space);
 
 }  // namespace cucascade

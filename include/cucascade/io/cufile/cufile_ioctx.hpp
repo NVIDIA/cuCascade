@@ -22,6 +22,7 @@
 #include <cucascade/io/templated_ioctx.hpp>
 
 #include <cstddef>
+#include <string_view>
 #include <vector>
 
 namespace cucascade::io::cufile {
@@ -36,6 +37,30 @@ namespace cucascade::io::cufile {
  * driver; later calls return its result.  Thread-safe.
  */
 [[nodiscard]] bool gds_available() noexcept;
+
+/**
+ * @brief The cuFile driver's GDS status flags: bit `CU_FILE_<X>_SUPPORTED` is set
+ *        when storage class X has a GDS mode.
+ *
+ * 0 exactly when @c gds_available() is false.  Opens the cuFile driver like
+ * @c gds_available() does.  Thread-safe.
+ */
+[[nodiscard]] unsigned int gds_status_flags() noexcept;
+
+/**
+ * @brief Whether a driver reporting @p status_flags has a GDS mode for files on
+ *        a @p filesystem_type filesystem (the type @c /proc/self/mountinfo names).
+ *
+ * ext4 and xfs count through the NVMe class and only when @p on_nvme (every
+ * drive under the filesystem is NVMe); gpfs, lustre, wekafs, beegfs and nfs /
+ * nfs4 through their own class.  Any other filesystem (tmpfs, overlay, ...) is
+ * served in compatibility mode.  A prediction: cuFile does not say which mode a
+ * file gets, and can still fall back to compatibility mode on a supported
+ * filesystem (cufile.json denylists, mount options, RDMA setup).
+ */
+[[nodiscard]] bool gds_supports_filesystem(unsigned int status_flags,
+                                           std::string_view filesystem_type,
+                                           bool on_nvme) noexcept;
 
 /**
  * @brief cuFile / GPUDirect Storage local-disk ioctx: one @c cufile_reactor per

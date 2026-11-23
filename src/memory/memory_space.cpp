@@ -174,6 +174,7 @@ memory_space::memory_space(const disk_memory_space_config& config)
     _start_downgrading_memory_threshold(config.downgrade_trigger_threshold()),
     _stop_downgrading_memory_threshold(config.downgrade_stop_threshold()),
     _allocator(null_device_memory_resource{}),
+    _allow_gds(config.allow_gds),
     _io_context(config.io_context)
 {
   if (config.mount_paths.empty()) {
@@ -389,6 +390,14 @@ std::string_view memory_space::get_disk_mount_path() const
   }
   auto& limiter = std::get<std::unique_ptr<disk_access_limiter>>(_reservation_allocator);
   return limiter->get_mount_path();
+}
+
+bool memory_space::allow_gds() const
+{
+  if (_id.tier != Tier::DISK) {
+    throw std::logic_error("allow_gds called on non-DISK memory space");
+  }
+  return _allow_gds;
 }
 
 std::shared_ptr<io::ioctx> memory_space::get_io_context() const

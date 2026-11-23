@@ -20,6 +20,7 @@
 
 #include <cucascade/cuda/event.hpp>
 #include <cucascade/cudf/builtin_converters.hpp>
+#include <cucascade/cudf/disk_io_context.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/cudf/host_table.hpp>
@@ -1307,7 +1308,7 @@ std::unique_ptr<idata_representation> convert_host_fast_to_host_fast(
 // =============================================================================
 //
 // Every DISK converter moves one whole batch file with one vectored request through the io context
-// of the DISK memory space (detail::resolve_disk_io_context) and waits for it before returning, so
+// of the DISK memory space (resolve_disk_io_context) and waits for it before returning, so
 // the conversion stays synchronous for its callers. All slices are built before the request is
 // submitted, and the helpers in disk_io.hpp await the request before they return or unwind: once
 // they are left, no I/O touches the source/destination buffers or the file any more.
@@ -1544,7 +1545,7 @@ static std::unique_ptr<idata_representation> convert_host_data_to_disk(
   [[maybe_unused]] memory::reservation* reservation)
 {
   nvtx_scope convert_range{"convert:host_to_disk"};
-  auto const io_context  = detail::resolve_disk_io_context(*target_memory_space);
+  auto const io_context  = resolve_disk_io_context(*target_memory_space);
   auto& host_source      = source.cast<host_data_representation>();
   const auto& host_table = host_source.get_host_table();
 
@@ -1593,7 +1594,7 @@ static std::unique_ptr<idata_representation> convert_disk_to_host_data(
   memory::reservation* reservation)
 {
   nvtx_scope convert_range{"convert:disk_to_host"};
-  auto const io_context  = detail::resolve_disk_io_context(source.get_memory_space());
+  auto const io_context  = resolve_disk_io_context(source.get_memory_space());
   auto& disk_source      = source.cast<disk_data_representation>();
   const auto& disk_table = disk_source.get_disk_table();
   const auto& file_path  = disk_table.file_path;
@@ -1684,7 +1685,7 @@ static std::unique_ptr<idata_representation> convert_gpu_to_disk(
   [[maybe_unused]] memory::reservation* reservation)
 {
   nvtx_scope convert_range{"convert:gpu_to_disk"};
-  auto const io_context = detail::resolve_disk_io_context(*target_memory_space);
+  auto const io_context = resolve_disk_io_context(*target_memory_space);
   auto& gpu_source      = source.cast<gpu_table_representation>();
   // Keep the source device current from writer ordering through the write: a null stream must
   // name the same default stream for the writer wait, planning's string-offset reads, and I/O.
@@ -1921,7 +1922,7 @@ static std::unique_ptr<idata_representation> convert_disk_to_gpu(
   [[maybe_unused]] memory::reservation* reservation)
 {
   nvtx_scope convert_range{"convert:disk_to_gpu"};
-  auto const io_context  = detail::resolve_disk_io_context(source.get_memory_space());
+  auto const io_context  = resolve_disk_io_context(source.get_memory_space());
   auto& disk_source      = source.cast<disk_data_representation>();
   const auto& disk_table = disk_source.get_disk_table();
   const auto& file_path  = disk_table.file_path;

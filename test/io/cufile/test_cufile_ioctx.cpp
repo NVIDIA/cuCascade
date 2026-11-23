@@ -270,6 +270,39 @@ class substituted_api {
 
 }  // namespace
 
+TEST_CASE("GDS serves a filesystem only when the driver reports its storage class", "[io][cufile]")
+{
+  using cucascade::io::cufile::gds_supports_filesystem;
+  auto const flag = [](CUfileDriverStatusFlags_t storage_class) { return 1U << storage_class; };
+
+  // Local filesystems count through the NVMe class, and only on NVMe drives.
+  CHECK(gds_supports_filesystem(flag(CU_FILE_NVME_SUPPORTED), "ext4", /*on_nvme=*/true));
+  CHECK(gds_supports_filesystem(flag(CU_FILE_NVME_SUPPORTED), "xfs", /*on_nvme=*/true));
+  CHECK_FALSE(gds_supports_filesystem(flag(CU_FILE_NVME_SUPPORTED), "ext4", /*on_nvme=*/false));
+  CHECK_FALSE(gds_supports_filesystem(flag(CU_FILE_GPFS_SUPPORTED), "ext4", /*on_nvme=*/true));
+
+  // Distributed filesystems each have a class of their own.
+  CHECK(gds_supports_filesystem(flag(CU_FILE_GPFS_SUPPORTED), "gpfs", /*on_nvme=*/false));
+  CHECK(gds_supports_filesystem(flag(CU_FILE_LUSTRE_SUPPORTED), "lustre", /*on_nvme=*/false));
+  CHECK(gds_supports_filesystem(flag(CU_FILE_WEKAFS_SUPPORTED), "wekafs", /*on_nvme=*/false));
+  CHECK(gds_supports_filesystem(flag(CU_FILE_BEEGFS_SUPPORTED), "beegfs", /*on_nvme=*/false));
+  CHECK(gds_supports_filesystem(flag(CU_FILE_NFS_SUPPORTED), "nfs", /*on_nvme=*/false));
+  CHECK(gds_supports_filesystem(flag(CU_FILE_NFS_SUPPORTED), "nfs4", /*on_nvme=*/false));
+  CHECK_FALSE(gds_supports_filesystem(flag(CU_FILE_NVME_SUPPORTED), "gpfs", /*on_nvme=*/true));
+
+  // No class at all, or a filesystem cuFile has no GDS mode for.
+  auto const every_class = ~0U;
+  CHECK_FALSE(gds_supports_filesystem(0, "gpfs", /*on_nvme=*/true));
+  CHECK_FALSE(gds_supports_filesystem(every_class, "tmpfs", /*on_nvme=*/false));
+  CHECK_FALSE(gds_supports_filesystem(every_class, "overlay", /*on_nvme=*/true));
+  CHECK_FALSE(gds_supports_filesystem(every_class, "", /*on_nvme=*/true));
+}
+
+TEST_CASE("gds_available agrees with the driver's GDS status flags", "[io][cufile]")
+{
+  CHECK(cucascade::io::cufile::gds_available() == (cucascade::io::cufile::gds_status_flags() != 0));
+}
+
 TEST_CASE("a cufile context rejects a configuration its reactors cannot run", "[io][cufile]")
 {
   auto no_lanes  = small_config();

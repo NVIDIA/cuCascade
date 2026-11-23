@@ -370,6 +370,32 @@ TEST_CASE("Configurator pins initial host pools concurrently only from the defau
   REQUIRE(hosts.front().initial_pool_threads == 1);
 }
 
+TEST_CASE("Configurator carries allow_gds to the DISK space config", "[configurator]")
+{
+  system_topology_info topology;
+  if (!make_single_gpu_topology(topology, synthetic_numa_capacity)) {
+    SUCCEED("Skipped: requires at least one GPU");
+    return;
+  }
+
+  reservation_manager_configurator builder;
+  builder.set_gpu_ids({static_cast<int>(topology.gpus.front().id)});
+  builder.use_numa_id_as_host_id();
+  builder.set_per_numa_region_capacity(1ull << 30);
+  builder.set_disk_mounting_point(0, 1ull << 30, "/tmp");
+  builder.set_disk_mounting_point(1, 1ull << 30, "/tmp", nullptr, /*allow_gds=*/false);
+
+  std::vector<disk_memory_space_config> disks;
+  for (auto const& config : builder.build(topology)) {
+    if (auto const* disk = std::get_if<disk_memory_space_config>(&config)) {
+      disks.push_back(*disk);
+    }
+  }
+  REQUIRE(disks.size() == 2);
+  REQUIRE(disks[0].allow_gds);
+  REQUIRE_FALSE(disks[1].allow_gds);
+}
+
 // Device-memory nodes are not host memory and must not inflate the host total.
 TEST_CASE("Total NUMA capacity excludes device-memory nodes", "[configurator]")
 {

@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+#include "cudf/disk_io.hpp"
 #include "utils/child_test_runner.hpp"
 #include "utils/cudf_test_utils.hpp"
 #include "utils/disk_test_utils.hpp"
@@ -28,9 +29,14 @@
 #include <cucascade/data/representation_converter.hpp>
 #include <cucascade/exec/semi_future.hpp>
 #include <cucascade/io/config.hpp>
+#ifdef CUCASCADE_HAS_CUFILE
+#include <cucascade/io/cufile/cufile_ioctx.hpp>
+#endif
 #include <cucascade/io/datasource_factory.hpp>
 #include <cucascade/io/io_context.hpp>
+#include <cucascade/memory/disk_table.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
+#include <cucascade/memory/topology_discovery.hpp>
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/filling.hpp>
@@ -370,9 +376,87 @@ TEST_CASE("disk spaces without a context adopt the shared default on first conve
   auto disk_b =
     registry().convert<disk_data_representation>(*gpu_rep, space_b.get(), shared_stream());
 
-  auto const shared_default = default_disk_io_context();
-  REQUIRE(space_a->get_io_context() == shared_default);
-  REQUIRE(space_b->get_io_context() == shared_default);
+  auto const adopted = space_a->get_io_context();
+  REQUIRE(adopted != nullptr);
+  REQUIRE(space_b->get_io_context() == adopted);
+}
+
+TEST_CASE("a disk space that disallows GDS adopts the shared uring context", "[disk][io][context]")
+{
+  if (!test::io_uring_usable()) {
+    WARN("io_uring cannot run in this process");
+    return;
+  }
+  scratch_dir dir;
+  memory::disk_memory_space_config config;
+  config.disk_id         = 13;
+  config.memory_capacity = 1UL << 30;
+  config.mount_paths     = dir.string();
+  config.allow_gds       = false;
+  memory::memory_space space_a(config);
+  config.disk_id = 14;
+  memory::memory_space space_b(config);
+
+  auto const context = resolve_disk_io_context(space_a);
+  REQUIRE(context->type() == io::io_context_type::uring);
+  REQUIRE(space_a.get_io_context() == context);
+  REQUIRE(resolve_disk_io_context(space_b) == context);
+  REQUIRE(dir.file_count() == 0);  // the mount was never looked at
+}
+
+TEST_CASE("a disk space that allows GDS adopts the cuFile context only on a GDS mount",
+          "[disk][io][context]")
+{
+  if (!test::io_uring_usable()) {
+    WARN("io_uring cannot run in this process");
+    return;
+  }
+  scratch_dir dir;
+  auto space = test::make_disk_space(disk_io_backend::automatic, 15, dir.string());
+  REQUIRE(space->allow_gds());
+  bool const gds = detail::mount_supports_gds(dir.string(), detail::gds_status_flags());
+
+  auto const context = resolve_disk_io_context(*space);
+  REQUIRE(context->type() == (gds ? io::io_context_type::cufile : io::io_context_type::uring));
+  REQUIRE(space->get_io_context() == context);
+  REQUIRE(dir.file_count() == 0);  // the mount probe leaves no file behind
+}
+
+TEST_CASE("resolve_disk_io_context keeps the context a space was configured with",
+          "[disk][io][context]")
+{
+  scratch_dir dir;
+  auto space = test::make_disk_space(disk_io_backend::uring, 16, dir.string());
+  if (space == nullptr) {
+    WARN("the uring backend cannot run in this process");
+    return;
+  }
+  auto const configured = space->get_io_context();
+  REQUIRE(configured != nullptr);
+  REQUIRE(resolve_disk_io_context(*space) == configured);
+}
+
+TEST_CASE("mount_supports_gds follows the filesystem under the mount", "[disk][io][context]")
+{
+  scratch_dir dir;
+  // A driver without any GDS storage class: the mount is not even looked at.
+  REQUIRE_FALSE(detail::mount_supports_gds(dir.string(), 0));
+  REQUIRE(dir.file_count() == 0);
+
+#ifdef CUCASCADE_HAS_CUFILE
+  // What the check has to see: the storage of a file in the mount directory.
+  auto const file    = memory::generate_disk_file_path(dir.string());
+  auto const storage = memory::topology_discovery::discover_storage_for_path(file);
+  std::filesystem::remove(file);
+  CAPTURE(storage.filesystem_type, storage.all_devices_nvme());
+
+  auto const every_class = ~0U;
+  bool const expected    = storage.status == memory::path_storage_status::ok &&
+                        io::cufile::gds_supports_filesystem(
+                          every_class, storage.filesystem_type, storage.all_devices_nvme());
+  REQUIRE(detail::mount_supports_gds(dir.string(), every_class) == expected);
+  REQUIRE(dir.file_count() == 0);  // the probe file is gone
+#endif
 }
 
 TEST_CASE("set_io_context switches the context of later conversions", "[disk][io][context]")

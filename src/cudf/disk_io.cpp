@@ -17,10 +17,8 @@
 
 #include "disk_io.hpp"
 
-#include <cucascade/cudf/disk_io_context.hpp>
 #include <cucascade/exec/semi_future.hpp>
 #include <cucascade/io/io_context.hpp>
-#include <cucascade/memory/memory_space.hpp>
 
 #include <cstddef>
 #include <memory>
@@ -101,11 +99,6 @@ void check_transferred(std::size_t transferred,
 }
 
 }  // namespace
-
-std::shared_ptr<io::ioctx> resolve_disk_io_context(memory::memory_space const& disk_space)
-{
-  return disk_space.get_or_init_io_context([] { return default_disk_io_context(); });
-}
 
 void write_disk_file_device(io::ioctx& ctx,
                             std::string const& path,
