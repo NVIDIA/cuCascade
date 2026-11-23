@@ -41,7 +41,9 @@ namespace cucascade {
  *
  * @param source The source data representation to convert from
  * @param target_memory_space The memory space where the target representation will be allocated
- * @param stream CUDA stream for asynchronous memory operations
+ * @param stream CUDA stream for asynchronous memory operations. Not an ordering dependency on the
+ *        source: converters must order reads after the source's writer event (see
+ *        idata_representation::get_writer_event()).
  * @param reservation Optional caller-owned reservation on the target memory space. When non-null,
  *        the converter draws its target allocation down from this reservation instead of committing
  *        fresh capacity, preventing double-counting against the target pool. May be nullptr.
@@ -185,7 +187,7 @@ class representation_converter_registry {
    * @tparam TargetType The target representation type
    * @param source The source data representation
    * @param target_memory_space The target memory space for the new representation
-   * @param stream CUDA stream for memory operations
+   * @param stream CUDA stream for memory operations; not an ordering dependency on @p source
    * @return std::unique_ptr<TargetType> The converted representation
    * @throws std::runtime_error if no converter is registered for the type pair
    *
@@ -214,7 +216,7 @@ class representation_converter_registry {
    * @tparam TargetType The target representation type
    * @param source The source data representation
    * @param reservation Caller-owned reservation on the target memory space
-   * @param stream CUDA stream for memory operations
+   * @param stream CUDA stream for memory operations; not an ordering dependency on @p source
    * @return std::unique_ptr<TargetType> The converted representation
    * @throws std::runtime_error if no converter is registered for the type pair
    */
@@ -237,7 +239,7 @@ class representation_converter_registry {
    * @param source The source data representation
    * @param target_type The target representation type index
    * @param target_memory_space The target memory space for the new representation
-   * @param stream CUDA stream for memory operations
+   * @param stream CUDA stream for memory operations; not an ordering dependency on @p source
    * @return std::unique_ptr<idata_representation> The converted representation
    * @throws std::runtime_error if no converter is registered for the type pair
    *

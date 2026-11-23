@@ -27,6 +27,8 @@
 #include <array>
 #include <cerrno>
 #include <cstring>
+#include <stdexcept>
+#include <system_error>
 
 namespace cucascade::exec::thread_util {
 
@@ -165,9 +167,12 @@ std::vector<int> get_thread_affinity(pthread_t handle) noexcept
   cpu_set_t mask{};
   if (::pthread_getaffinity_np(handle, sizeof(mask), &mask) != 0) { return {}; }
   std::vector<int> ids;
-  // A conservative upper bound so the vector never reallocates on the caller's
-  // hot path; the actual count is capped by CPU_SETSIZE anyway.
-  ids.reserve(static_cast<std::size_t>(CPU_COUNT(&mask)));
+  try {
+    // Sized once: the pushes below never reallocate.
+    ids.reserve(static_cast<std::size_t>(CPU_COUNT(&mask)));
+  } catch (...) {
+    return {};  // allocation failed: the documented failure value, not std::terminate
+  }
   for (int i = 0; i < CPU_SETSIZE; ++i) {
     if (CPU_ISSET(static_cast<std::size_t>(i), &mask)) { ids.push_back(i); }
   }
@@ -177,6 +182,35 @@ std::vector<int> get_thread_affinity(pthread_t handle) noexcept
 std::vector<int> get_current_thread_affinity() noexcept
 {
   return get_thread_affinity(::pthread_self());
+}
+
+scoped_thread_affinity::scoped_thread_affinity(std::span<int const> cpus)
+{
+  if (cpus.empty()) return;
+  cpu_set_t requested{}, actual{};
+  CPU_ZERO(&requested);
+  for (int cpu : cpus) {
+    if (cpu < 0 || cpu >= CPU_SETSIZE) throw std::invalid_argument("unsupported CPU affinity id");
+    CPU_SET(static_cast<std::size_t>(cpu), &requested);
+  }
+  int error = ::pthread_getaffinity_np(::pthread_self(), sizeof(_saved), &_saved);
+  if (error)
+    throw std::system_error(error, std::generic_category(), "reading startup CPU affinity");
+  error = ::pthread_setaffinity_np(::pthread_self(), sizeof(requested), &requested);
+  if (error)
+    throw std::system_error(error, std::generic_category(), "setting startup CPU affinity");
+  error = ::pthread_getaffinity_np(::pthread_self(), sizeof(actual), &actual);
+  if (error || !CPU_EQUAL(&actual, &requested)) {
+    ::pthread_setaffinity_np(::pthread_self(), sizeof(_saved), &_saved);
+    if (error)
+      throw std::system_error(error, std::generic_category(), "verifying startup CPU affinity");
+    throw std::runtime_error("startup CPU affinity was restricted by the operating system");
+  }
+  _restore = true;
+}
+scoped_thread_affinity::~scoped_thread_affinity()
+{
+  if (_restore) ::pthread_setaffinity_np(::pthread_self(), sizeof(_saved), &_saved);
 }
 
 // ---------------------------------------------------------------------------

@@ -19,11 +19,30 @@
 
 #include <cuda_runtime_api.h>
 
+#include <algorithm>
 #include <cstdlib>
+#include <iterator>
 #include <stdexcept>
+#include <type_traits>
+#include <vector>
 
 namespace cucascade {
 namespace memory {
+
+namespace {
+
+/// Make room in @p list for @p extra more elements, growing geometrically so
+/// repeated calls stay amortized constant time. Afterwards, that many
+/// push_backs of a type that moves without throwing cannot throw.
+template <typename T>
+void reserve_for(std::vector<T>& list, std::size_t extra)
+{
+  static_assert(std::is_nothrow_move_constructible_v<T>);
+  auto const needed = list.size() + extra;
+  if (needed > list.capacity()) { list.reserve(std::max(needed, 2 * list.capacity())); }
+}
+
+}  // namespace
 
 small_pinned_host_memory_resource::small_pinned_host_memory_resource(
   fixed_size_host_memory_resource& upstream)
@@ -164,23 +183,38 @@ void* small_pinned_host_memory_resource::allocate([[maybe_unused]] ::cuda::strea
 
   std::size_t idx = slab_index_for(bytes);
   std::lock_guard<std::mutex> lock(mutex_);
-  if (free_lists_[idx].empty()) { expand_pool_locked(idx); }
-  free_slab slab = free_lists_[idx].back();
-  free_lists_[idx].pop_back();
+  auto& free_list = free_lists_[idx];
+  if (free_list.empty()) { expand_pool_locked(idx); }
+  // Prefer a slab with no pending GPU use. Always taking the most recently
+  // freed slab makes this stream wait on whatever the freeing stream still has
+  // queued, possibly on another GPU, while older free slabs sit idle.
+  auto const [chosen, ready] = select_slab_locked(free_list);
+  free_slab slab             = *chosen;
+  // Erasing keeps the list in the order slabs were freed, and shifts only the
+  // pending slabs the search already passed.
+  free_list.erase(chosen);
   // If this slab was recently deallocated, its ready_event captures the freeing
   // stream's last use (e.g. an in-flight async H2D copy still reading the slab).
-  // Make the reusing stream wait for it so we cannot overwrite the slab before
-  // that copy completes. Recording the event again (on a later deallocate) does
-  // not disturb this already-enqueued wait, so the event is safe to recycle.
   if (slab.ready_event != nullptr) {
-    // cudaStreamWaitEvent is legal across devices, so the reusing stream may
-    // belong to a different GPU than the one that recorded the event.
-    cudaError_t const wait_status = ::cudaStreamWaitEvent(stream.get(), slab.ready_event, 0);
-    if (wait_status != cudaSuccess) {
-      // The wait was not established, so returning this pointer would recreate
-      // the unordered-reuse race. Keep the slab tracked and propagate the error.
-      free_lists_[idx].push_back(slab);
-      CUCASCADE_CUDA_TRY(wait_status);
+    // A slab the search saw complete needs no wait: that use has finished, and
+    // nothing records the event again while the slab is free. Waiting anyway
+    // costs a driver call under the mutex and adds a dependency, possibly on
+    // another GPU, to the reusing stream.
+    if (!ready) {
+      // Make the reusing stream wait for the event so it cannot overwrite the
+      // slab before that copy completes. Recording the event again (on a later
+      // deallocate) does not disturb this already-enqueued wait, so the event
+      // is safe to recycle. cudaStreamWaitEvent is legal across devices, so the
+      // reusing stream may belong to a different GPU than the one that
+      // recorded the event.
+      cudaError_t const wait_status = ::cudaStreamWaitEvent(stream.get(), slab.ready_event, 0);
+      if (wait_status != cudaSuccess) {
+        // The wait was not established, so returning this pointer would
+        // recreate the unordered-reuse race. Keep the slab tracked and
+        // propagate the error.
+        free_list.push_back(slab);
+        CUCASCADE_CUDA_TRY(wait_status);
+      }
     }
     release_event_locked(slab.ready_event, slab.event_device);
   }
@@ -243,6 +277,32 @@ std::size_t small_pinned_host_memory_resource::slab_index_for(std::size_t bytes)
   return SLAB_SIZES.size() - 1;
 }
 
+small_pinned_host_memory_resource::slab_choice
+small_pinned_host_memory_resource::select_slab_locked(std::vector<free_slab>& free_list)
+{
+  // Search newest first, so the slab found is the most recently used one whose
+  // work has finished. Slabs a pool expansion just added sit at the back and
+  // carry no event to query.
+  std::size_t queries = 0;
+  for (auto candidate = free_list.end(); candidate != free_list.begin();) {
+    --candidate;
+    if (candidate->ready_event == nullptr) { return {candidate, true}; }
+    // Each query is a driver call made under the mutex every device shares, and
+    // a stream stalled behind long GPU work can leave a long run of pending
+    // slabs that each allocation would otherwise search past.
+    if (queries == MAX_READINESS_QUERIES) { break; }
+    ++queries;
+    cudaError_t const status = ::cudaEventQuery(candidate->ready_event);
+    if (status == cudaSuccess) { return {candidate, true}; }
+    // Nothing has left the list, so a failed query loses neither the slab nor
+    // its event. cudaErrorNotReady only means the slab is still in use.
+    if (status != cudaErrorNotReady) { CUCASCADE_CUDA_TRY(status); }
+  }
+  // No slab within reach is ready: fall back to the most recently freed one,
+  // which the caller orders behind its event.
+  return {std::prev(free_list.end()), false};
+}
+
 void small_pinned_host_memory_resource::expand_pool_locked(std::size_t slab_idx)
 {
   // Acquire one upstream block and carve it into slabs.
@@ -251,10 +311,17 @@ void small_pinned_host_memory_resource::expand_pool_locked(std::size_t slab_idx)
 
   std::size_t slab_size = SLAB_SIZES[slab_idx];
   std::size_t num_slabs = upstream_block_size / slab_size;
+  auto& free_list       = free_lists_[slab_idx];
+  // Make room in both lists before publishing anything. A throw after a slab
+  // was published would destroy `allocation`, returning its block upstream
+  // while the free list still hands out slabs inside it, so the block would
+  // have two owners. With the room made, nothing below can throw.
+  reserve_for(free_list, allocation->size() * num_slabs);
+  reserve_for(owned_allocations_, 1);
   for (std::byte* block : allocation->get_blocks()) {
     for (std::size_t i = 0; i < num_slabs; ++i) {
       // Freshly-carved slabs were never used, so they carry no pending-work event.
-      free_lists_[slab_idx].push_back(free_slab{block + i * slab_size, nullptr, -1});
+      free_list.push_back(free_slab{block + i * slab_size, nullptr, -1});
     }
   }
   owned_allocations_.push_back(std::move(allocation));

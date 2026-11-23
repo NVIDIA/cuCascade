@@ -11,6 +11,7 @@ Comprehensive documentation for the cuCascade GPU memory management library.
 | [Data Management](data-management.md) | Data batch lifecycle, repositories, and representation conversion |
 | [Topology & Configuration](topology-and-configuration.md) | Hardware discovery, NUMA awareness, and system configuration |
 | [Development Guide](development-guide.md) | Building, testing, benchmarking, and contributing |
+| [CI and the Merge Queue](ci.md) | PR testing, approvals, queue entry, diagnostics, and retries |
 | [Data Batch State Transitions](data_batch_state_transitions.md) | State machine reference for `data_batch` |
 
 ## Reading Paths

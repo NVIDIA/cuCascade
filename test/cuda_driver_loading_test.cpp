@@ -3,18 +3,21 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include <cucascade/log/logging.hpp>
 #include <cucascade/memory/topology_discovery.hpp>
 
 #include <dlfcn.h>
 
+#include <algorithm>
 #include <atomic>
+#include <cstddef>
 #include <cstdlib>
 #include <cstring>
-#include <iostream>
-#include <sstream>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 namespace {
 
@@ -121,17 +124,25 @@ int main(int argc, char** argv)
     return result.attributes_populated && result.hw_decomp ? 0 : 1;
   }
   if (mode == "unavailable") {
-    std::ostringstream warning;
-    auto* original_stderr    = std::cerr.rdbuf(warning.rdbuf());
+    // The loader reports the missing symbol through cuCascade's log sink, once per process: the
+    // driver handle is a function-local static, so the second query must not warn again.
+    auto warnings = std::make_shared<std::vector<std::string>>();
+    cucascade::log::set_sink(
+      cucascade::log::make_sink([warnings](cucascade::log::record const& rec) {
+        if (rec.lvl == cucascade::log::level::warn) { warnings->emplace_back(rec.message); }
+      }),
+      cucascade::log::level::warn);
     auto const result        = query_fake_gpu_runtime_attribute();
     auto const repeat_result = query_fake_gpu_runtime_attribute();
-    std::cerr.rdbuf(original_stderr);
-    auto const message = warning.str();
+    cucascade::log::clear_sink();
     auto const expected =
-      std::string{"Warning: Failed to load CUDA driver symbol "} + "cuDeviceGetAttribute:";
+      std::string{"failed to load CUDA driver symbol "} + "cuDeviceGetAttribute:";
+    auto const matches = static_cast<std::size_t>(
+      std::count_if(warnings->begin(), warnings->end(), [&](std::string const& message) {
+        return message.starts_with(expected);
+      }));
     return result.attributes_populated && !result.hw_decomp && repeat_result.attributes_populated &&
-               !repeat_result.hw_decomp && message.find(expected) != std::string::npos &&
-               message.find(expected, message.find(expected) + expected.size()) == std::string::npos
+               !repeat_result.hw_decomp && matches == 1
              ? 0
              : 1;
   }
