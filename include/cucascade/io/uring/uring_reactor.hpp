@@ -32,6 +32,12 @@
 
 #include <liburing.h>
 
+// <liburing.h> includes <linux/fs.h>, whose BLOCK_SIZE macro breaks the moodycamel queue a
+// header included after this one may bring in.  Nothing here uses it.
+#ifdef BLOCK_SIZE
+#undef BLOCK_SIZE
+#endif
+
 #include <array>
 #include <atomic>
 #include <cstdint>
@@ -98,6 +104,20 @@ class local_io_object : public io_object {
                   io_access access)
     : local_io_object(
         std::move(path), std::move(fd), std::move(fd_direct), file_size, "", {}, access)
+  {
+  }
+
+  /// Take over @p other's descriptors and identity (for a backend object that
+  /// extends an opened local file, see @c cufile::cufile_io_object).
+  local_io_object(local_io_object&& other)
+    : _path(std::move(other._path)),
+      _hash(std::move(other._hash)),
+      _fd(std::move(other._fd)),
+      _fd_direct(std::move(other._fd_direct)),
+      _file_size(other._file_size.load(std::memory_order_relaxed)),
+      _access(other._access),
+      _identity(std::move(other._identity)),
+      _has_identity(other._has_identity)
   {
   }
 
@@ -170,6 +190,16 @@ class local_io_object : public io_object {
 // uring_reactor
 // ---------------------------------------------------------------------------
 
+/// Where a reactor's worker runs.  A reactor dedicated to one GPU makes
+/// @c device the worker's current CUDA device once, when the worker starts
+/// (so the copy events its slots keep belong to that GPU), and pins the worker
+/// to @c cpus -- the CPUs of the GPU's NUMA node.  The defaults leave the
+/// worker unpinned, selecting the device of each device request as it runs.
+struct reactor_placement {
+  int device{-1};
+  std::vector<int> cpus;
+};
+
 /**
  * @brief Single-threaded local-file I/O reactor.
  *
@@ -206,6 +236,9 @@ class uring_reactor {
   /// pool — the natural home for things shared rather than per-reactor: the
   /// pinned bounce-staging resource (and, in future, GDS-registered buffers, a
   /// shared submission/poll thread, etc.).  Carries the primitive @c config too.
+  /// A null @p mr makes the reactors host-only: they hold no staging, so they
+  /// serve host reads into contiguous buffers, host writes and flushes, and fail
+  /// device requests (@c operation_not_supported) and fragmented cache fills.
   class reactor_context {
    public:
     reactor_context(config cfg, cucascade::memory::fixed_size_host_memory_resource* mr)
@@ -231,13 +264,15 @@ class uring_reactor {
   using reactor_context_type = reactor_context;
 
   /// Bounce slots are allocated by @c start() from the context's
-  /// host_memory_resource (which must be non-null); their size is taken from its
+  /// host_memory_resource (none for a host-only reactor, see @ref
+  /// reactor_context); their size is taken from its
   /// @c get_block_size() and their count from a fixed 64 MiB staging budget.  The
   /// reactor keeps the @c multiple_blocks_allocation alive until it is destroyed —
   /// blocks return to the resource then — and holds the shared @p ctx so it (and
   /// the resource) outlive the reactor.
   explicit uring_reactor(std::shared_ptr<reactor_context> ctx,
-                         std::string_view tname = "uring_reactor");
+                         std::string_view tname  = "uring_reactor",
+                         reactor_placement where = {});
 
   ~uring_reactor();
 
@@ -417,6 +452,8 @@ class uring_reactor {
   reactor_config_type _config;
   // Thread name prefix captured at construction; applied to the worker in start().
   std::string _tname;
+  // Applied by the worker when it starts.
+  reactor_placement _placement;
   // Keeps the bounce-slot blocks alive for the reactor's lifetime.  The
   // multiple_blocks_allocation destructor returns the blocks to the upstream
   // resource when the reactor is destroyed.

@@ -8,7 +8,7 @@ and the 1.17 parameter declarations in `cufile.h`.
 A newer library/client can change applicability. Comments marked **[verify]**
 require installed-release and target-host validation, not guessed additional keys.
 
-| Example | Engine starting preference (not configured by this JSON) |
+| Example | Starting preference of the superseded async engine (not configured by this JSON) |
 |---|---|
 | `nvme-libcufile-1.17-v1.json` | QD 32, 4 MiB, 40 lanes |
 | `gpfs-libcufile-1.17-v1.json` | QD 64, validated GPFS block clamped to 1–8 MiB, 80 lanes |
@@ -43,5 +43,4 @@ RDMA addresses/policy have **no typed setter IDs in the installed 1.17 header**.
 Use the documented JSON mechanism and validate with vendor tooling instead.
 The templates deliberately omit client-specific routing/write-enable keys and
 GPU slab JSON names whose spelling/support is not established here.
-They do not enable async engine mode, qualify mounts, enable writes, or set CPU
-affinity. Configure those separately; see [the operations guide](../cufile-reactor.md).
+They do not configure the cuCascade backend; see [cufile-gds.md](../cufile-gds.md).

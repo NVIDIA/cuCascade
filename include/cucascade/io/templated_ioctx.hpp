@@ -24,8 +24,6 @@
 #include <cucascade/io/types.hpp>
 #include <cucascade/log/logging.hpp>
 
-#include <rmm/cuda_device.hpp>
-
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -44,7 +42,6 @@
 #include <string_view>
 #include <system_error>
 #include <thread>
-#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -65,59 +62,6 @@ namespace detail {
 }
 
 /**
- * @brief A non-blocking stream ordered after the work the calling thread had
- *        queued on its per-thread default stream.
- *
- * @c cudaStreamPerThread names the per-thread default stream of whichever
- * thread uses the handle, so a reactor worker given it would order the
- * transfer after its own (empty) per-thread stream instead of the caller's.
- * This stream is created on the submitting thread, waits there on an event
- * recorded on that thread's per-thread stream, and can then be used from any
- * thread.  Destroyed (asynchronously, per CUDA) when the last slice holding it
- * goes.
- */
-class per_thread_stream_stand_in {
- public:
-  explicit per_thread_stream_stand_in(int device) : _device(device)
-  {
-    rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{device}};
-    auto status = cudaStreamCreateWithFlags(&_stream, cudaStreamNonBlocking);
-    if (status != cudaSuccess) {
-      std::ignore = cudaGetLastError();
-      throw std::runtime_error(std::string("templated_ioctx: cudaStreamCreate failed: ") +
-                               cudaGetErrorString(status));
-    }
-    cudaEvent_t ready{};
-    status = cudaEventCreateWithFlags(&ready, cudaEventDisableTiming);
-    if (status == cudaSuccess) {
-      // Resolved here, on the submitting thread: its own per-thread stream.
-      status = cudaEventRecord(ready, cudaStreamPerThread);
-      if (status == cudaSuccess) status = cudaStreamWaitEvent(_stream, ready, 0);
-      std::ignore = cudaEventDestroy(ready);
-    }
-    if (status != cudaSuccess) {
-      std::ignore = cudaStreamDestroy(_stream);
-      std::ignore = cudaGetLastError();
-      throw std::runtime_error(
-        std::string("templated_ioctx: ordering after the per-thread default stream failed: ") +
-        cudaGetErrorString(status));
-    }
-  }
-
-  ~per_thread_stream_stand_in() { std::ignore = cudaStreamDestroy(_stream); }
-
-  per_thread_stream_stand_in(per_thread_stream_stand_in const&)            = delete;
-  per_thread_stream_stand_in& operator=(per_thread_stream_stand_in const&) = delete;
-
-  [[nodiscard]] cudaStream_t get() const noexcept { return _stream; }
-  [[nodiscard]] int device() const noexcept { return _device; }
-
- private:
-  int _device;
-  cudaStream_t _stream{};
-};
-
-/**
  * @brief Resolve default streams on the submitting thread before any slice
  *        reaches a reactor. Device ids must be resolved.
  *
@@ -129,32 +73,13 @@ class per_thread_stream_stand_in {
  * In a non-PTDS build this costs nothing and preserves null-stream semantics.
  *
  * Replace @c cudaStreamPerThread with a stand-in ordered after the submitting
- * thread's per-thread default stream (one per device).
+ * thread's per-thread default stream (one per device): that handle names the
+ * per-thread stream of whichever thread uses it, so a reactor worker given it
+ * would order the transfer after its own (empty) stream instead of the
+ * caller's.  The stand-in is a lease on a stream of a per-device pool, back in
+ * the pool when the last slice holding it goes; nothing is created per call.
  */
-inline void resolve_default_streams(std::vector<prepared_io_slice>& slices)
-{
-  std::vector<std::shared_ptr<per_thread_stream_stand_in>> stand_ins;
-  for (auto& slice : slices) {
-    if (!slice.has_device_request()) continue;
-    if (slice.d_buffer.stream.get() == nullptr) {
-      slice.d_buffer.stream = ::cuda::stream_ref{cudaStreamLegacy};
-      continue;
-    }
-    if (slice.d_buffer.stream.get() != cudaStreamPerThread) continue;
-    auto const device =
-      slice.d_buffer.device_id >= 0 ? slice.d_buffer.device_id : current_cuda_device();
-    std::shared_ptr<per_thread_stream_stand_in> stand_in;
-    for (auto const& existing : stand_ins) {
-      if (existing->device() == device) stand_in = existing;
-    }
-    if (stand_in == nullptr) {
-      stand_in = std::make_shared<per_thread_stream_stand_in>(device);
-      stand_ins.push_back(stand_in);
-    }
-    slice.d_buffer.stream       = ::cuda::stream_ref{stand_in->get()};
-    slice.d_buffer.stream_owner = stand_in;
-  }
-}
+void resolve_default_streams(std::vector<prepared_io_slice>& slices);
 
 }  // namespace detail
 
@@ -226,8 +151,8 @@ concept io_reactor_c = requires(R reactor,
  * @c io_rng = the exact file range written (finish_success then raises the
  * object's size); short writes are resubmitted, a 0-byte completion is EIO.
  * A device source is read in stream order after the work queued on
- * @c d_buffer.stream before the call (enqueue the D2H copy or
- * @c cuFileWriteAsync on that stream, or synchronize it first), with every
+ * @c d_buffer.stream before the call (enqueue the D2H copy on that stream,
+ * wait for an event recorded on it, or synchronize it first), with every
  * argument block / staging buffer kept alive until the stream passed it.
  * Ops of a request whose coordinator stopped (@c should_continue() false) are
  * cancelled with @c operation_canceled, and a request never resolves while one
@@ -369,7 +294,11 @@ class templated_ioctx : public ioctx {
     _started = true;
   }
 
-  void shutdown() noexcept override { shutdown_reactors(_reactors); }
+  void shutdown() noexcept override
+  {
+    shutdown_reactors(_reactors);
+    _started = false;  // so that start() starts the reactors again
+  }
 
   [[nodiscard]] bool supports(std::string_view path) const noexcept final
   {
@@ -539,12 +468,11 @@ class templated_ioctx : public ioctx {
           continue;
         }
 
-        slice.rng.size     = std::min(slice.rng.size, typed.size() - slice.rng.offset);
-        auto const payload = slice.payload_bytes();
-        if (payload > std::numeric_limits<std::size_t>::max() - total_bytes) {
+        slice.rng.size = std::min(slice.rng.size, typed.size() - slice.rng.offset);
+        if (slice.rng.size > std::numeric_limits<std::size_t>::max() - total_bytes) {
           throw std::overflow_error("mixed read byte count overflow");
         }
-        total_bytes += payload;
+        total_bytes += slice.rng.size;
 
         if (slice.has_device_request()) {
           has_device_slice = true;
@@ -739,23 +667,7 @@ class templated_ioctx : public ioctx {
   {
     // A device slice on the per-thread default stream must be ordered against
     // THIS thread's stream before a reactor worker sees it.
-    if (has_device_slice) {
-      if constexpr (requires { requires Reactor::wants_submit_fence; }) {
-        bool const fence_enabled = !_reactors.empty() && _reactors.front()->submit_fence_enabled();
-        if (fence_enabled) {
-          for (auto& slice : slices) {
-            if (!slice.has_device_request()) continue;
-            slice.d_buffer.original_stream_was_ptds =
-              slice.d_buffer.stream.get() == cudaStreamPerThread;
-            slice.d_buffer.original_stream_was_null = slice.d_buffer.stream.get() == nullptr;
-          }
-        }
-        detail::resolve_default_streams(slices);
-        if (fence_enabled) _reactors.front()->record_submit_fences(typed, slices);
-      } else {
-        detail::resolve_default_streams(slices);
-      }
-    }
+    if (has_device_slice) { detail::resolve_default_streams(slices); }
 
     // One call site issues one priority, so the first slice speaks for the
     // request; stamp the resolved value on every slice so each queue entry

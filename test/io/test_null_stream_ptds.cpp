@@ -26,9 +26,6 @@
 #ifdef CUCASCADE_HAS_CUFILE
 #include <cucascade/io/cufile/cufile_ioctx.hpp>
 #include <cucascade/io/cufile/cufile_reactor.hpp>
-#include <cucascade/io/cufile/detail.hpp>
-#include <cucascade/io/cufile/device_engine.hpp>
-#include <cucascade/io/cufile/runtime.hpp>
 #endif
 
 #include <cuda_runtime_api.h>
@@ -110,48 +107,24 @@ class started_context {
 #ifdef CUCASCADE_HAS_CUFILE
     else {
       cucascade::io::cufile::config cfg{};
-      cfg.gds_threshold = backend == "cufile direct" ? 4096 : 1UL << 40;
-      if (backend == "cufile engine") {
-        cfg.async_engine.mode = cucascade::io::cufile::engine_mode::async_simulated_for_testing;
-        cfg.async_engine.arena_bytes = 16 * MiB;
-        // Functional compat tests must not demote on cold initialization or host preemption.
-        cfg.async_engine.demotion.slow_floor_us = 100000;
-        cfg.async_engine.demotion.stuck_ms      = 1000;
-        cfg.async_engine.mount_overrides.push_back(
-          {cucascade::io::cufile::mount_match::mount_prefix,
-           "/",
-           cucascade::io::cufile::mount_override_state::operator_qualified,
-           4,
-           MiB});
-      }
-      cucascade::io::cufile::detail::set_cufile_writes_in_compat_for_testing(backend ==
-                                                                             "cufile direct");
-      cufile_context =
-        std::make_shared<cucascade::io::cufile::cufile_reactor::reactor_context>(cfg);
-      context = std::make_unique<cucascade::io::cufile::cufile_ioctx>(1, cufile_context);
+      cfg.lanes      = 2;
+      cfg.lane_bytes = MiB;
+      cfg.devices    = {0};
+      context        = std::make_unique<cucascade::io::cufile::cufile_ioctx>(cfg);
     }
 #endif
     context->start();
   }
-  ~started_context()
-  {
-    context->shutdown();
-#ifdef CUCASCADE_HAS_CUFILE
-    cucascade::io::cufile::detail::set_cufile_writes_in_compat_for_testing(false);
-#endif
-  }
+  ~started_context() { context->shutdown(); }
   cucascade::memory::numa_region_pinned_host_memory_resource upstream{0};
   cucascade::memory::fixed_size_host_memory_resource staging;
   std::unique_ptr<cucascade::io::ioctx> context;
-#ifdef CUCASCADE_HAS_CUFILE
-  std::shared_ptr<cucascade::io::cufile::cufile_reactor::reactor_context> cufile_context;
-#endif
 };
 
 std::vector<std::string> backends()
 {
 #ifdef CUCASCADE_HAS_CUFILE
-  return {"uring", "cufile direct", "cufile staged", "cufile engine"};
+  return {"uring", "cufile"};
 #else
   return {"uring"};
 #endif
@@ -174,7 +147,7 @@ TEST_CASE("a PTDS caller's null-stream I/O orders after its producer", "[io][gpu
   auto object =
     write ? context.open_io_object_for_write(file.path) : context.open_io_object(file.path);
 #ifdef CUCASCADE_HAS_CUFILE
-  if (backend == "cufile direct" &&
+  if (backend == "cufile" &&
       !dynamic_cast<cucascade::io::cufile::cufile_io_object const&>(*object).cufile_registered()) {
     SKIP("file cannot register with cuFile");
   }
@@ -202,72 +175,3 @@ TEST_CASE("a PTDS caller's null-stream I/O orders after its producer", "[io][gpu
   }
   REQUIRE(cudaStreamSynchronize(nullptr) == cudaSuccess);
 }
-
-#ifdef CUCASCADE_HAS_CUFILE
-TEST_CASE("engine reads preserve the PTDS-built stream matrix", "[io][gpu][ptds][engine][ioctx]")
-{
-  using namespace cucascade::io;
-  using namespace cucascade::io::cufile;
-  int devices{};
-  if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) SKIP("requires CUDA");
-  auto const kind = GENERATE(0, 1, 2, 3);  // null, explicit legacy, PTDS, explicit nonblocking
-  CAPTURE(kind);
-  scratch_file file;
-  device_storage buffer;
-  started_context started{"cufile engine"};
-  if (!runtime::instance().engine_possible(engine_mode::async_simulated_for_testing)) {
-    // Warm-up initializes asynchronously. Opening a file joins runtime initialization.
-    std::ignore = runtime::instance().ensure_initialized();
-    if (!runtime::instance().engine_possible(engine_mode::async_simulated_for_testing))
-      SKIP("requires async compat libcufile");
-  }
-  auto object = started.context->open_io_object(file.path);
-  if (!static_cast<cufile_io_object const&>(*object).cufile_registered())
-    SKIP("file cannot register with cuFile");
-  started.cufile_context->ensure_engine(0);
-  auto const deadline = std::chrono::steady_clock::now() + 15s;
-  while (!started.cufile_context->engine_for_device(0) &&
-         std::chrono::steady_clock::now() < deadline)
-    std::this_thread::sleep_for(1ms);
-  auto binding = started.cufile_context->engine_for_device(0);
-  REQUIRE(binding);
-  cudaStream_t explicit_stream{};
-  REQUIRE(cudaStreamCreateWithFlags(&explicit_stream, cudaStreamNonBlocking) == cudaSuccess);
-  cudaStream_t stream = kind == 0   ? nullptr
-                        : kind == 1 ? cudaStreamLegacy
-                        : kind == 2 ? cudaStreamPerThread
-                                    : explicit_stream;
-  REQUIRE(cudaLaunchHostFunc(
-            stream, [](void*) { std::this_thread::sleep_for(50ms); }, nullptr) == cudaSuccess);
-  REQUIRE(cudaMemsetAsync(buffer.data, 0xAB, bytes, stream) == cudaSuccess);
-  auto const before = binding->engine->gauges().async_registered_bytes;
-  slice request{0, bytes, buffer.data};
-  REQUIRE(started.context
-            ->device_readv_async_io(*object, std::span{&request, 1}, ::cuda::stream_ref{stream})
-            .get(15s) == bytes);
-  std::vector<std::uint8_t> contents(bytes);
-  if (kind == 2) {
-    // PTDS cannot be joined back from the reaper: foreign-stream reads are safe immediately.
-    REQUIRE(cudaMemcpyAsync(
-              contents.data(), buffer.data, bytes, cudaMemcpyDeviceToHost, explicit_stream) ==
-            cudaSuccess);
-    REQUIRE(cudaStreamSynchronize(explicit_stream) == cudaSuccess);
-  } else {
-    REQUIRE(cudaMemcpyAsync(contents.data(), buffer.data, bytes, cudaMemcpyDeviceToHost, stream) ==
-            cudaSuccess);
-  }
-  REQUIRE(cudaStreamSynchronize(stream) == cudaSuccess);
-  CHECK(std::ranges::all_of(contents, [](auto byte) { return byte == 0x55; }));
-  auto const after = binding->engine->gauges().async_registered_bytes;
-  if (kind == 0)
-    CHECK(after == before);  // Original null retains legacy routing.
-  else {
-    auto const gauge_deadline = std::chrono::steady_clock::now() + 5s;
-    while (binding->engine->gauges().async_registered_bytes < before + bytes &&
-           std::chrono::steady_clock::now() < gauge_deadline)
-      std::this_thread::sleep_for(1ms);
-    CHECK(binding->engine->gauges().async_registered_bytes >= before + bytes);
-  }
-  REQUIRE(cudaStreamDestroy(explicit_stream) == cudaSuccess);
-}
-#endif

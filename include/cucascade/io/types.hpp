@@ -48,17 +48,9 @@ struct cached_chunk;
 class metadata_store;
 }  // namespace cucascade::io::cache
 
-namespace cucascade::io::cufile {
-struct file_write_ticket;
-}
-
 namespace cucascade::io {
 class ioctx;
 }  // namespace cucascade::io
-
-namespace cucascade::cuda {
-class cuda_event;
-}  // namespace cucascade::cuda
 
 namespace cucascade::io {
 
@@ -356,12 +348,6 @@ struct host_buffer {
   std::variant<std::monostate, std::uint8_t*, std::vector<cache::cached_chunk*>> buffer;
 };
 
-/// Caller-recorded input dependency. The owner returns its event to a per-device pool.
-struct submit_fence {
-  cudaEvent_t event{};
-  std::shared_ptr<void> owner;
-};
-
 struct device_buffer {
   device_buffer() noexcept = default;
 
@@ -378,24 +364,10 @@ struct device_buffer {
   // stream_ref's default constructor).
   ::cuda::stream_ref stream{cudaStream_t{nullptr}};
   int device_id{-1};
-  /// Set by a backend's submission path on the submitting thread: an event
-  /// recorded on @c stream there, marking the work queued before the read that
-  /// the read must not overtake, or null when that work had already finished.
-  /// A worker that writes the destination outside @c stream (cuFile DMA, a copy
-  /// on its own stream) waits on it instead of resolving @c stream itself: a
-  /// thread-relative handle (the per-thread default stream, or the null stream in
-  /// a per-thread-default build) names a different stream on another thread.
-  /// Meaningful only when @c ready_gate_set.
-  std::shared_ptr<cucascade::cuda::cuda_event> ready_gate;
-  /// Whether the submission path resolved @c ready_gate (see there).
-  bool ready_gate_set{false};
   /// Keeps alive a stream the dispatcher created in place of the caller's
   /// (see @c detail::resolve_default_streams in templated_ioctx.hpp); null
   /// when @c stream is the caller's own.
   std::shared_ptr<void> stream_owner;
-  std::shared_ptr<submit_fence> fence;
-  bool original_stream_was_ptds{false};
-  bool original_stream_was_null{false};
 };
 
 class prepared_io_completion final {
@@ -442,12 +414,6 @@ enum class io_priority : std::uint8_t { automatic, high, low };
   return requested == io_priority::automatic ? fallback : requested;
 }
 
-/// One destination of a fused device read (see @ref prepared_io_slice::fused).
-struct fused_part {
-  range rng;                    ///< The caller's range, inside the fused slice's window.
-  std::uint8_t* data{nullptr};  ///< Its device destination.
-};
-
 /// What a prepared slice asks a reactor to do.  Reads are the default; writes
 /// and flushes reach only reactors that model @c io_write_reactor_c.
 enum class io_op_kind : std::uint8_t { read, write, flush };
@@ -465,17 +431,9 @@ struct prepared_io_slice {
   /// Reactor queue for this slice (see @ref io_priority); a request takes its
   /// first slice's value, resolving @c automatic by call shape.
   io_priority priority{io_priority::automatic};
-  /// Non-empty for a fused device read: several device destinations, ordered by
-  /// offset and not overlapping, that one physical read of @c rng serves.  They
-  /// share @c d_buffer's stream, gate and device; @c d_buffer.data is the first
-  /// part's destination.  A backend fuses its own slices at submission (cuFile
-  /// does, see @c cufile::config::fuse_gap_bytes); callers never set this.
-  std::vector<fused_part> fused;
   /// Read (default), write or flush.  A write slice carries exactly one source:
   /// a contiguous host buffer or a device buffer, which the reactor only reads.
   io_op_kind kind{io_op_kind::read};
-  /// Inode sequencing ticket for opt-in engine write contexts.
-  std::shared_ptr<cufile::file_write_ticket> backend_owner;
 
   prepared_io_slice() noexcept = default;
   explicit prepared_io_slice(range r, host_buffer h) noexcept : rng(r), h_buffer(std::move(h)) {}
@@ -500,23 +458,9 @@ struct prepared_io_slice {
     return !h_buffer.needs_staging() && !has_device_request();
   }
 
-  [[nodiscard]] bool is_fused() const noexcept { return !fused.empty(); }
-
   [[nodiscard]] size_t size() const noexcept { return rng.size; }
 
   [[nodiscard]] size_t offset() const noexcept { return rng.offset; }
-
-  /// Bytes the caller asked for: the parts of a fused slice (its window also
-  /// covers the gaps between them), else the window.
-  [[nodiscard]] std::size_t payload_bytes() const noexcept
-  {
-    if (fused.empty()) return rng.size;
-    std::size_t total = 0;
-    for (auto const& part : fused) {
-      total += part.rng.size;
-    }
-    return total;
-  }
 
   [[nodiscard]] bool is_write() const noexcept { return kind == io_op_kind::write; }
 

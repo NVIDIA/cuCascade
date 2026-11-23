@@ -38,68 +38,18 @@ constexpr std::array required_symbols{"cuFileDriverOpen",
 struct optional_symbol {
   std::string_view name;
   std::size_t group;
-  bool (*is_present)(cufile_api const&) noexcept {nullptr};
 };
-
-template <auto Member>
-constexpr optional_symbol parameter_symbol(std::string_view name)
-{
-  return {name, 4, [](cufile_api const& api) noexcept { return api.*Member != nullptr; }};
-}
 
 constexpr std::array optional_symbols{
   optional_symbol{"cuFileReadAsync", 0},
   optional_symbol{"cuFileWriteAsync", 1},
   optional_symbol{"cuFileStreamRegister", 2},
   optional_symbol{"cuFileStreamDeregister", 2},
-  optional_symbol{"cuFileBatchIOSetUp", 3},
-  optional_symbol{"cuFileBatchIOSubmit", 3},
-  optional_symbol{"cuFileBatchIOGetStatus", 3},
-  optional_symbol{"cuFileBatchIOCancel", 3},
-  optional_symbol{"cuFileBatchIODestroy", 3},
-#ifdef CUCASCADE_CUFILE_HAS_CUFILESETPARAMETERSIZET
-  parameter_symbol<&cufile_api::set_parameter_size_t>("cuFileSetParameterSizeT"),
-#endif
-#ifdef CUCASCADE_CUFILE_HAS_CUFILESETPARAMETERBOOL
-  parameter_symbol<&cufile_api::set_parameter_bool>("cuFileSetParameterBool"),
-#endif
-#ifdef CUCASCADE_CUFILE_HAS_CUFILESETPARAMETERSTRING
-  parameter_symbol<&cufile_api::set_parameter_string>("cuFileSetParameterString"),
-#endif
-#ifdef CUCASCADE_CUFILE_HAS_CUFILEGETPARAMETERSIZET
-  parameter_symbol<&cufile_api::get_parameter_size_t>("cuFileGetParameterSizeT"),
-#endif
-#ifdef CUCASCADE_CUFILE_HAS_CUFILEGETPARAMETERBOOL
-  parameter_symbol<&cufile_api::get_parameter_bool>("cuFileGetParameterBool"),
-#endif
-#ifdef CUCASCADE_CUFILE_HAS_CUFILEGETPARAMETERSTRING
-  parameter_symbol<&cufile_api::get_parameter_string>("cuFileGetParameterString"),
-#endif
-#ifdef CUCASCADE_CUFILE_HAS_CUFILEGETPARAMETERMINMAXVALUE
-  parameter_symbol<&cufile_api::get_parameter_min_max_value>("cuFileGetParameterMinMaxValue"),
-#endif
-#ifdef CUCASCADE_CUFILE_HAS_CUFILESETPARAMETERPOSIXPOOLSLABARRAY
-  parameter_symbol<&cufile_api::set_parameter_posix_pool_slab_array>(
-    "cuFileSetParameterPosixPoolSlabArray"),
-#endif
-#ifdef CUCASCADE_CUFILE_HAS_CUFILEGETPARAMETERPOSIXPOOLSLABARRAY
-  parameter_symbol<&cufile_api::get_parameter_posix_pool_slab_array>(
-    "cuFileGetParameterPosixPoolSlabArray"),
-#endif
-#ifdef CUCASCADE_CUFILE_HAS_CUFILESETPARAMETERGPUBOUNCEBUFFERSLABARRAY
-  parameter_symbol<&cufile_api::set_parameter_gpu_bounce_buffer_slab_array>(
-    "cuFileSetParameterGpuBounceBufferSlabArray"),
-#endif
-#ifdef CUCASCADE_CUFILE_HAS_CUFILEGETPARAMETERGPUBOUNCEBUFFERSLABARRAY
-  parameter_symbol<&cufile_api::get_parameter_gpu_bounce_buffer_slab_array>(
-    "cuFileGetParameterGpuBounceBufferSlabArray"),
-#endif
 };
-constexpr bool has_declared_parameters = optional_symbols.size() > 9;
 
 struct resolver_context {
   std::string_view missing_symbol;
-  std::size_t missing_group{5};
+  std::size_t missing_group{3};
   bool all_optional_missing{false};
   int token{0};
 };
@@ -118,13 +68,9 @@ void* resolve_stub(void* opaque, char const* name) noexcept
   return &context.token;
 }
 
-std::array<bool, 5> capabilities(cufile_api const& api)
+std::array<bool, 3> capabilities(cufile_api const& api)
 {
-  return {api.has_async_read,
-          api.has_async_write,
-          api.has_stream_register,
-          api.has_batch,
-          api.has_parameters};
+  return {api.has_async_read, api.has_async_write, api.has_stream_register};
 }
 
 void check_required(cufile_api const& api)
@@ -147,26 +93,13 @@ TEST_CASE("cuFile loader resolves all declared optional groups", "[cufile][optio
   auto const api = cufile_api::resolve_symbols(resolve_stub, &context);
   REQUIRE(api.has_value());
   check_required(*api);
-  auto const flags = capabilities(*api);
-  for (std::size_t group = 0; group < flags.size(); ++group) {
-    CHECK(flags[group] == (group != 4 || has_declared_parameters));
+  for (bool const capability : capabilities(*api)) {
+    CHECK(capability);
   }
   CHECK(api->read_async != nullptr);
   CHECK(api->write_async != nullptr);
   CHECK(api->stream_register != nullptr);
   CHECK(api->stream_deregister != nullptr);
-  CHECK(api->batch_setup != nullptr);
-  CHECK(api->batch_submit != nullptr);
-  CHECK(api->batch_get_status != nullptr);
-  CHECK(api->batch_cancel != nullptr);
-  CHECK(api->batch_destroy != nullptr);
-  for (auto const& symbol : optional_symbols) {
-    if (symbol.group == 4) {
-      CAPTURE(symbol.name);
-      REQUIRE(symbol.is_present != nullptr);
-      CHECK(symbol.is_present(*api));
-    }
-  }
 }
 
 TEST_CASE("cuFile loader still requires every legacy symbol", "[cufile][optional]")
@@ -191,44 +124,24 @@ TEST_CASE("cuFile missing individual optional symbols disables only their group"
   check_required(*api);
   auto const flags = capabilities(*api);
   for (std::size_t group = 0; group < flags.size(); ++group) {
-    CHECK(flags[group] == (group != missing.group && (group != 4 || has_declared_parameters)));
+    CHECK(flags[group] == (group != missing.group));
   }
   if (missing.group == 2) {
     CHECK(api->stream_register == nullptr);
     CHECK(api->stream_deregister == nullptr);
   }
-  if (missing.group == 3) {
-    CHECK(api->batch_setup == nullptr);
-    CHECK(api->batch_submit == nullptr);
-    CHECK(api->batch_get_status == nullptr);
-    CHECK(api->batch_cancel == nullptr);
-    CHECK(api->batch_destroy == nullptr);
-  }
-  if (missing.group == 4) {
-    for (auto const& symbol : optional_symbols) {
-      if (symbol.group != 4) { continue; }
-      CAPTURE(symbol.name);
-      REQUIRE(symbol.is_present != nullptr);
-      if (symbol.name == missing.name) {
-        CHECK_FALSE(symbol.is_present(*api));
-      } else {
-        CHECK(symbol.is_present(*api));
-      }
-    }
-  }
 }
 
 TEST_CASE("cuFile missing whole optional groups is independent", "[cufile][optional]")
 {
-  auto const missing =
-    GENERATE(std::size_t{0}, std::size_t{1}, std::size_t{2}, std::size_t{3}, std::size_t{4});
+  auto const missing = GENERATE(std::size_t{0}, std::size_t{1}, std::size_t{2});
   resolver_context context;
   context.missing_group = missing;
   auto const api        = cufile_api::resolve_symbols(resolve_stub, &context);
   REQUIRE(api.has_value());
   auto const flags = capabilities(*api);
   for (std::size_t group = 0; group < flags.size(); ++group) {
-    CHECK(flags[group] == (group != missing && (group != 4 || has_declared_parameters)));
+    CHECK(flags[group] == (group != missing));
   }
 }
 

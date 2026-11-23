@@ -114,9 +114,8 @@ passively from procfs, sysfs and cuFile's configuration file -- libcufile is nev
 | `cufile_json` | `$CUFILE_ENV_PATH_JSON` or `/etc/cufile.json`, parsed (JSON with comments): direct-I/O size, bounce cache, pinned limit, poll / compat mode, RDMA addresses and policy, the execution thread pool, `fs.gpfs.*`, the denylists |
 
 `discover_gds_setup(roots, cufile_json_path)` runs the same discovery against a fixture tree, and
-`read_cufile_config(path)` parses one file. What libcufile itself reports once loaded (effective
-parameters, driver properties) is `cucascade::io::cufile::platform_info`; the cuFile backend's pool
-planner combines both (see [cufile-gds.md](io/cufile-gds.md)).
+`read_cufile_config(path)` parses one file. Whether libcufile, once loaded, reports a usable GDS
+path is `cucascade::io::cufile::gds_available()` (see [cufile-gds.md](io/cufile-gds.md)).
 
 **Storage devices** (`storage_device_info`): type (NVMe/SATA_SSD/SATA_HDD/UNKNOWN), name, NUMA node, PCIe bus ID
 
@@ -167,7 +166,7 @@ regular file is stored, as a `path_storage_info` snapshot:
 filesystems, and for stacks that cannot be resolved -- unknown is never a negative answer, and no
 NVMe device is invented. Discovery is passive like the rest of this component (no CUDA, no cuFile,
 no file creation), never throws, and caches nothing: a file can move or a mount change right after
-the snapshot. The cuFile backend's `cufile::probe_path` builds its per-file GDS verdict on it.
+the snapshot.
 
 ### Network Device Verification
 

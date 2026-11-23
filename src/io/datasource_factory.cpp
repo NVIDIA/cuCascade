@@ -32,14 +32,20 @@
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
 #include <cucascade/memory/memory_space.hpp>
+#include <cucascade/memory/net_topology.hpp>
+#include <cucascade/memory/topology_discovery.hpp>
+#include <cucascade/memory/topology_index.hpp>
 
+#include <algorithm>
 #include <cctype>
+#include <cstddef>
 #include <exception>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <utility>
+#include <vector>
 
 namespace cucascade::io {
 
@@ -54,6 +60,34 @@ cucascade::memory::fixed_size_host_memory_resource* first_host_resource(
   auto host_spaces = rm.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
   if (host_spaces.empty()) { return nullptr; }
   return host_spaces.front()->get_memory_resource_of<cucascade::memory::Tier::HOST>();
+}
+
+/// One uring device group per GPU-tier memory space of @p rm (none: an empty
+/// result).  A group stages through the HOST space of its GPU's NUMA node and
+/// runs on that node's CPUs; a GPU whose node is unknown, or has no HOST space,
+/// stages through @p fallback_mr and is not pinned.
+std::vector<uring::uring_ioctx::device_group> uring_device_groups(
+  cucascade::memory::memory_reservation_manager& rm,
+  uring::config const& cfg,
+  cucascade::memory::fixed_size_host_memory_resource* fallback_mr)
+{
+  cucascade::memory::topology_index const index{cucascade::memory::process_topology(), rm};
+
+  std::vector<uring::uring_ioctx::device_group> groups;
+  for (int const gpu : index.gpu_ids()) {
+    int const numa = index.numa_node_of(gpu);
+    auto* mr       = fallback_mr;
+    for (auto const* space : rm.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST)) {
+      if (numa >= 0 && space->get_device_id() == numa) {
+        mr = space->get_memory_resource_of<cucascade::memory::Tier::HOST>();
+        break;
+      }
+    }
+    groups.push_back({gpu,
+                      cucascade::memory::cpus_of_numa_node(numa),
+                      std::make_shared<uring::uring_reactor::reactor_context>(cfg, mr)});
+  }
+  return groups;
 }
 
 /// Build a SigV4 authorizer from the object-store credentials, or nullptr when
@@ -86,7 +120,7 @@ factory_type make_cufile_ioctx_factory()
 {
   return [](const io_config& config) -> std::shared_ptr<ioctx> {
     try {
-      return cufile::make_cufile_ioctx(config.cufile_n_reactors, config.cufile);
+      return std::make_shared<cufile::cufile_ioctx>(config.cufile);
     } catch (const std::exception& e) {
       CUCASCADE_LOG_ERROR("make_cufile_ioctx_factory: construction failed: {}", e.what());
       return nullptr;
@@ -105,6 +139,13 @@ factory_type make_uring_ioctx_factory(
         CUCASCADE_LOG_ERROR(
           "make_uring_ioctx_factory: no HOST-tier memory resource for the reactor staging");
         return nullptr;
+      }
+      // With GPUs: the read reactors spread over the GPUs, plus a write reactor
+      // each, placed on the GPU's NUMA node.
+      if (auto const groups = uring_device_groups(reservation_manager, config.uring, host_mr);
+          !groups.empty()) {
+        auto const readers = std::max<std::size_t>(1, config.uring_n_reactors / groups.size());
+        return std::make_shared<uring::uring_ioctx>(groups, readers);
       }
       // One reactor_context shares config and the pinned staging resource.
       auto ctx = std::make_shared<uring::uring_reactor::reactor_context>(config.uring, host_mr);

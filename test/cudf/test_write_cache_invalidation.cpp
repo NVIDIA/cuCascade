@@ -72,7 +72,9 @@ using cucascade::test::wait_for_cache;
 
 /** A uring ioctx with an armed fs_cache, and a scratch file of known bytes. */
 struct write_cache_fixture {
-  write_cache_fixture() : memory(identity_memory())
+  // Room for the factory's read and write reactors and a test's own reactor (64 MiB
+  // of staging each) next to the cache.
+  write_cache_fixture() : memory(identity_memory(1.0, 512ULL << 20))
   {
     cucascade::io::io_config config;
     config.uring_n_reactors = 1;

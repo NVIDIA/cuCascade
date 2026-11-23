@@ -4,32 +4,32 @@ The cuFile backend (`io_backend::cufile`, `cufile_ioctx`) reads local and
 network-filesystem files into GPU memory, and writes them from it, through
 NVIDIA cuFile (GPUDirect Storage). It is built when `cufile.h` is found at
 configure time (`CUCASCADE_HAS_CUFILE`). `libcufile.so.0` is `dlopen`ed at run
-time, so a host without it serves every transfer through POSIX.
+time; on a host without it, or whose cuFile driver does not open, the context
+does not start.
 
 It is tuned for Parquet scans: 1–8 MB column chunks at arbitrary file offsets,
 read into RMM-allocated buffers, from IBM Storage Scale (GPFS) over RDMA or
 from local NVMe.
 
-This page describes the default, synchronous read paths: one read in flight per reactor. Two
-opt-in features keep many reads in flight per thread instead. **Fused stream lanes**
-(`fused_reads`) serve device reads with fused `cuFileReadAsync` calls. **Host batch**
-(`host_batch`) serves aligned host reads with cuFile's batch API. Both are described in
-[cufile-fused-lanes.md](cufile-fused-lanes.md).
+The whole backend is `cufile_reactor` (one per GPU), `cufile_ioctx` (routes a
+request to its GPU's reactor) and `cufile_api` (the `dlopen`ed entry points):
+`include/cucascade/io/cufile/` and `src/io/cufile/`.
 
 ## Table of contents
 
 - [Routing](#routing)
+- [One reactor per GPU: lanes and the arena](#one-reactor-per-gpu-lanes-and-the-arena)
 - [How a device read is served](#how-a-device-read-is-served)
 - [How a device write is served](#how-a-device-write-is-served)
+- [Host I/O](#host-io)
 - [Ordering against the caller's stream](#ordering-against-the-callers-stream)
-- [Sizing the pool: one group of reactors per GPU](#sizing-the-pool-one-group-of-reactors-per-gpu)
-- [Registered staging memory](#registered-staging-memory)
+- [Registered arena memory](#registered-arena-memory)
+- [Plugging in the asynchronous APIs](#plugging-in-the-asynchronous-apis)
 - [What discovery reports](#what-discovery-reports)
 - [IBM Storage Scale checklist](#ibm-storage-scale-checklist)
 - [Verifying the path a read took](#verifying-the-path-a-read-took)
 - [Configuration reference](#configuration-reference)
 - [Known limitations](#known-limitations)
-- Opt-in: [fused stream lanes and host batch reads](cufile-fused-lanes.md)
 
 ## Routing
 
@@ -40,175 +40,142 @@ local paths (for example, all but GDS-capable mounts). Those paths then fall
 through to `uring` and stay routed. A build without cuFile refuses
 `io_backend::cufile`: the registry constructor throws `std::invalid_argument`.
 
+Inside the context, a device read or write goes to the reactor of its GPU: the
+GPU the caller names, else the submitting thread's current device. A request
+for a GPU the context does not serve fails. Host I/O has no GPU and goes to the
+least-backlogged reactors.
+
+## One reactor per GPU: lanes and the arena
+
+```
+ cufile_reactor of GPU g
+ ├─ read lanes   cf-g<g>-rd0 .. rd<N-1>   queue: high / low priority segments
+ ├─ write lanes  cf-g<g>-wr0 .. wr<N-1>   queue: high / low priority segments
+ ├─ host reactor cf-g<g>-host             a host-only io_uring reactor
+ └─ arena        cudaMalloc, registered with cuFile once:
+                 N read slots + N write slots of lane_bytes each
+```
+
+A **lane** is a thread that blocks in one synchronous cuFile call at a time, so
+the lane count (`lanes`, default 32) is the I/O depth of the GPU. Reads and
+writes have their own lanes and queues, so reads never wait behind writes. The
+lanes are pinned to the CPUs of the GPU's NUMA node when discovery knows it,
+and each makes its GPU current once, when it starts.
+
+For every segment it serves, a lane takes one **slot** of the arena:
+`lane_bytes` (default 8 MiB) of device memory at a 4 KiB-aligned offset of a
+buffer registered with `cuFileBufRegister`. Every cuFile call therefore has an
+aligned file offset, an aligned size and an aligned offset into registered
+memory, which is what zero-copy DMA needs and what a Parquet chunk read into an
+RMM buffer never has.
+
+A lane serves high-priority segments first, and a waiting low-priority one
+after every four high ones, so neither starves.
+
+Only the synchronous `cuFileRead` / `cuFileWrite` are called: they are the
+calls that take the direct path on every filesystem GDS supports.
+
 ## How a device read is served
 
-Each reactor is one worker thread that keeps one storage read in flight. A
-device read of a cuFile-registered file of at least `gds_threshold` bytes takes
-one of two cuFile paths:
+At submission, on the caller's thread, the request is cut into **segments** of
+at most one slot:
 
-| Path | When | What happens |
-|------|------|--------------|
-| **staged** | `staging_mode` is `automatic` and cuFile reports a GDS mode (`gds_available()`), or `staging_mode` is `always`; and the reactor holds a staging slot on the destination's GPU | The range is widened to 4 KiB boundaries. Each piece is one `cuFileRead` into a registered, 64 KiB-aligned slot. The wanted bytes are then copied device-to-device into the destination on the slot's own stream. |
-| **direct** | otherwise | `cuFileRead` into the destination itself. cuFile bounces an unaligned or unregistered read through its own GPU buffers. |
+1. Every slice is cut into parts that fit a slot once widened to 4 KiB
+   boundaries.
+2. The parts of one request that lie close together share a segment: at most
+   `coalesce_gap_bytes` apart, with gaps making up at most `coalesce_gap_ratio`
+   of the read. One cuFile read then serves them all, the gaps read and
+   discarded.
 
-Zero-copy DMA needs a 4 KiB-aligned file offset, length, buffer base and
-buffer offset, and the memory must be registered (`cuFileBufRegister`).
-Parquet chunks meet none of these conditions, so a direct read is bounced by
-cuFile. On the legacy configuration that means 1 MiB pieces (`per_buffer_cache_size_kb`)
-handled one after another, from a 128 MiB per-GPU pool (`max_device_cache_size_kb`).
-libcufile 1.17 and later default to 384 MiB of slabs instead. A staged read
-makes one aligned call per piece (8 MiB by default), into memory registered
-once for the life of the process. It then makes an HBM-speed copy (about 1% of
-HBM bandwidth at 50 GB/s).
+A read lane then:
 
-Staged reads never ask cuFile to read past the end of the file. A range that
-reaches into the file's partial last block reads the aligned body first, then
-the tail in its own call. What GDS does past EOF is not specified, and some
-nvidia-fs builds trip over it.
+1. reads the segment's page-aligned window into its slot with one `cuFileRead`
+   (a failed call is retried twice; past the end of the file cuFile returns
+   short, which is fine as long as every part's bytes arrived);
+2. copies each part out of the slot into its destination, device to device, on
+   the lane's own stream, part by part (two touching destinations can be
+   separate allocations);
+3. waits for those copies, then settles the parts.
 
-Everything else uses POSIX through the reactor's pinned scratch:
-- reads below `gds_threshold` (256 KiB; NVIDIA documents a small-I/O
-  regression on kernels ≥ 6.11);
-- files cuFile does not serve;
-- host-only reads;
-- a read whose `cuFileRead` failed, which is retried that way and counted in
-  `cufile_failures`.
-
-For a cuFile-registered file these POSIX reads go through the O_DIRECT
-descriptor too. IBM documents that buffered reads running concurrently with
-GDS reads of the same file cost the GDS reads their performance.
-
-The pinned scratch of a transfer (two slots of up to 8 MiB) is borrowed from
-the HOST memory space pool of the reactor's NUMA node when one is registered
-(`memory::find_host_pool`; a HOST `memory_space` registers its pool), and given
-back before the transfer settles. It then counts against that space's budget
-only while the transfer runs, and a pool block's 4 KiB alignment lets the
-O_DIRECT reads and writes use the blocks directly (`preadv` / `pwritev`).
-Without a registered pool each reactor keeps 16 MiB of its own.
-
-The `cufile_ioctx` splits device-only reads larger than `staging_piece_bytes`
-into pieces on 4 KiB boundaries, so several reactors of the GPU read one large
-range at once. Every piece after the first starts aligned and fits one slot.
+The future of a read settles only once the bytes are in the destination, so
+they are visible from any stream.
 
 ## How a device write is served
 
-A write is cut at the write granule (4 KiB, or the O_DIRECT block or page size
-when larger). The aligned body of a device source of at least `gds_threshold`
-bytes, written to a cuFile-registered file, goes to `cuFileWrite` when cuFile
-reports a GDS mode:
+Every slice is cut into parts of at most one slot; each is a segment. cuFile
+writes whole granules (4 KiB, or the page size when larger), so a write lane
+splits a part into `[head | body | tail]`, the body on granule boundaries:
 
-| Path | When | What happens |
-|------|------|--------------|
-| **staged** | the reactor holds a free staging slot on the source's GPU (same `staging_mode` rule as reads) | A slot-sized piece at a time: a device-to-device copy into the registered, aligned slot, then one `cuFileWrite` from it. |
-| **direct** | otherwise | `cuFileWrite` from the source itself; cuFile bounces an unregistered source through its own GPU buffers. |
+1. it copies the body into its slot and the head and tail (less than a granule
+   each) into host memory, on its own stream, and waits for the copies;
+2. it writes the body with `cuFileWrite` from the slot; a short write continues
+   from the last whole granule written;
+3. it writes the head and tail through the host reactor.
 
-Everything else is written with `pwrite` (O_DIRECT for aligned pieces):
-- the sub-granule head and tail, bodies below `gds_threshold`, files cuFile
-  does not serve, and a body whose `cuFileWrite` failed (counted in
-  `cufile_failures`), all staged through the reactor's pinned host scratch by
-  device-to-host copies;
-- on a compatibility-only platform, every device body: cuFile would bounce it
-  through host memory anyway, and its 1 MiB writes measured about half as fast
-  as the staged path when they extend a file;
-- host sources: a body of at least 4 MiB congruent with its file offset goes
-  O_DIRECT from the caller; anything else goes through the page cache with its
-  writeback started at once (`sync_file_range`).
+A write settles once its bytes are in the file. A flush is `fdatasync`.
 
-As for reads, the `cufile_ioctx` takes a write's GPU from the source pointer, so
-it reaches that GPU's group and slots, and records its stream gate on the
-submitting thread. Device sources are never registered per write (NVIDIA
-advises against registering a one-shot buffer); the staging slots are what
-cuFile DMAs from. A flush is `fdatasync`. `write_split_bytes` cuts large write
-slices into pieces spread over the group's reactors.
+## Host I/O
+
+Host reads, host writes and flushes are served by a host-only
+`uring::uring_reactor` that every `cufile_reactor` owns: it has no staging
+memory and rejects device requests. The backend makes no `pread` / `pwrite`
+calls of its own.
+
+A file that cannot be registered with cuFile still opens and serves host I/O;
+device I/O on it fails with `std::errc::operation_not_supported`. The reason is
+logged once, as a warning, for the first such file.
 
 ## Ordering against the caller's stream
 
-A device read must not write its destination before the work queued on the
-caller's stream ahead of the read has finished. On the submitting thread,
-`cufile_ioctx` records an event on the caller's stream when that stream still
-has work queued. The event goes in `device_buffer::ready_gate`, and the
-workers wait on it. A worker never queries the caller's stream handle,
-because `cudaStreamPerThread`, or the null stream in a per-thread-default
-build, names a different stream on the worker's thread. A read issued on a
-stream that is being captured is refused with `std::invalid_argument`, and the
-capture stays valid.
+A lane must not touch a caller's device buffer before the work queued on the
+caller's stream ahead of the request has finished. At submission, the reactor
+records one event per run of slices on the same stream (`cuda::cuda_event` on a
+`cuda::stream_ref`), and the lane makes its own stream wait for that event
+before the copy that reads or writes the buffer. A lane never queries the
+caller's stream handle. `cudaStreamPerThread`, which names a different stream
+on every thread, is replaced at dispatch by a stand-in stream ordered after it.
 
-- A **staged** read whose stream is still busy, needs one cuFile call, and has
-  a spare slot starts at once. Only its scatter copy waits, on the GPU
-  (`cudaStreamWaitEvent`), so the storage round trip overlaps the caller's
-  compute (`early_staged_reads`).
-- Any other read whose stream is busy is parked until the event fires.
-  Parked reads hold nothing and never stop the reactor from serving other
-  requests.
+Nothing is created per request: a lane owns its stream and its completion
+event, the gate events are recycled by the reactor, and the stand-in streams
+come from a pool.
 
-The future of a read settles only once every slice has stopped touching its
-destination, and the bytes are then visible from any stream. The same holds
-at shutdown. A read issued early whose copy is still waiting for its stream
-keeps `shutdown()` waiting until that stream lets the copy run. So never shut
-the ioctx down while holding a stream whose work waits on something issued
-after the shutdown.
+The storage round trip of a read never waits for the caller's stream; only the
+copies out of the slot do.
 
-## Sizing the pool: one group of reactors per GPU
+## Registered arena memory
 
-`io_config::cufile_n_reactors = 0` is the default. It makes the factory
-discover the topology and call `cufile::plan_cufile_pool`, which builds:
+The arena is allocated with `cudaMalloc` outside RMM and registered with
+`cuFileBufRegister` once, as a whole:
 
-- **one group of reactors per GPU** in `cufile.devices`, or per visible GPU
-  when that is empty. A device read goes to the group of its destination's GPU,
-  which comes from the pointer (`cudaPointerGetAttributes`), not from the
-  calling thread. Each GPU therefore has its own queue depth and is never stuck
-  behind another GPU's backlog. A request's slices travel together to the group
-  of its first device slice.
-- **reactors per GPU** set by Little's law (bytes in flight = throughput ×
-  latency). At 50 GB/s and 2–5 ms per RDMA read, 100–250 MB must be in flight
-  per GPU, which is 12–31 reads of 8 MB. Unless `reactors_per_device` is set,
-  the planner takes 32 when `storage_hint_path` is on a network filesystem, 8
-  on local block storage and 16 otherwise. One reactor is one read in flight.
-- **pinning.** Each group is pinned to its GPU's CPUs: NVML's affinity
-  intersected with the process's inherited affinity, never widened. This keeps
-  syscalls, scratch memory and completions on the GPU's socket. cuFile, not
-  thread placement, picks the NIC (`rdma_dev_addr_list`,
-  `rdma_load_balancing_policy`).
-- **staging budget.** Reactors × `staging_slots_per_reactor` slots, bounded by
-  `max_staging_bytes_per_device`, half the GPU's free BAR1 and cuFile's
-  `max_device_pinned_mem_size`. Pieces are capped at cuFile's
-  `max_direct_io_size`, because cuFile moves a larger call as sequential
-  chunks.
-
-The plan is logged once (`cufile pool: ...`). Setup problems the planner can
-see are logged as warnings; see [the checklist](#ibm-storage-scale-checklist).
-A positive `cufile_n_reactors` keeps the old behaviour: one flat, unpinned
-pool of that many reactors shared by every GPU. It still gets the plan's
-per-GPU staging caps and piece size. `cufile::make_cufile_ioctx(n_reactors,
-cfg)` builds exactly what the registry's factory builds, but throws on failure
-instead of returning null. Use it when an engine constructs the ioctx itself.
-
-```cpp
-cucascade::io::io_config config;
-config.backend                    = cucascade::io::io_backend::cufile;
-config.cufile.storage_hint_path   = "/gpfs/fs1/warehouse/lineitem/part-0.parquet";
-// Optional overrides:
-// config.cufile.reactors_per_device          = 32;
-// config.cufile.max_staging_bytes_per_device = 1UL << 30;
-cucascade::io::io_context_registry registry{config, reservation_manager};
+```
+arena bytes per GPU = 2 × lanes × lane_bytes      (512 MiB by default)
 ```
 
-## Registered staging memory
+It belongs to the GPU, not to a reactor. The reactors of several contexts on
+one GPU that ask for the same `lanes` and `lane_bytes` share its slots, and so
+its depth; the GPU keeps it for the life of the process. Reserve it **before**
+RMM claims the device:
 
-Staging slots are allocated with `cudaMalloc` outside RMM, registered with
-`cuFileBufRegister` once, and reused by every reactor and ioctx of the process.
-They are never freed: `cudaFree` would synchronize the whole device. The
-defaults are 32 reactors × 2 slots × (8 MiB + 64 KiB), about 516 MiB per GPU,
-capped at 1 GiB. `cufile_ioctx::start()` reserves the planned slots up front.
-Reserve them, or subtract them from the GPU memory pool, **before** RMM claims
-the device: `cufile::reserve_staging(device, slots, cfg)`, then
-`cufile::staging_usage_of(device)` reports what is held.
+```cpp
+cucascade::io::cufile::reserve_arena(device, config.cufile);
+```
 
-Each slot is its own registration, kept far below the 16 × `max_direct_io_size`
-that Storage Scale can RDMA-register per buffer. A single large registration
-would bounce everything past that window. When registration fails (BAR1 or
-the pinned limit exhausted; a T4 has 256 MiB of BAR1), staging is turned off
-for that device and the reactors read directly.
+When the registration fails (BAR1 or cuFile's pinned limit exhausted; a T4 has
+256 MiB of BAR1), a warning is logged and I/O still works: cuFile then moves
+the bytes through its own bounce buffers.
+
+## Plugging in the asynchronous APIs
+
+A lane moves bytes between a file and its slot through
+`cufile_reactor::transport`, two blocking calls that mirror `cuFileRead` and
+`cuFileWrite`. The one implementation, `sync_transport`, makes those calls. A
+transport built on `cuFileReadAsync` / `cuFileWriteAsync` implements the same
+two calls; `cufile_api` already resolves the async entry points and
+`cuFileStreamRegister` / `cuFileStreamDeregister` when the library has them
+(`has_async_read`, `has_async_write`, `has_stream_register`).
+
+`tools/gds/cufile_async_qd.cpp` measures what the async calls do on a given
+host without the backend.
 
 ## What discovery reports
 
@@ -221,16 +188,12 @@ Passive (`memory::topology_discovery::discover()`, no CUDA or cuFile loaded):
 | `network_device_info` | `active_ports`, `link_layer` (InfiniBand / Ethernet), `rate_gbps` |
 | `path_storage_info` | `preferred_io_size` (`st_blksize`; Storage Scale reports its block size here), `filesystem_block_size` (`f_bsize`) |
 
-Active (loads libcufile and opens its driver):
-
-| Where | What |
-|-------|------|
-| `cufile::platform_info` (`probe_platform()`) | every `cuFileDriverGetProperties` field (bounce cache and buffer size, pinned limit, poll threshold, feature and control flags, batch limits), plus cuFile's effective parameters (`cuFileGetParameter*`, libcufile ≥ 1.14): parallel I/O, I/O threads, request parallelism, poll mode, compat mode, RDMA transport |
-| `cufile::path_info` (`probe_path`, `cufile_ioctx::path_capability`) | the verdict for one file, now also requiring NFS over RDMA (`proto=rdma`), honouring the `cufile.json` denylists, and requiring `rdma_dev_addr_list` for Storage Scale |
+Active: `cufile::gds_available()` loads libcufile, opens its driver and reports
+whether a storage class has a GDS mode and compatibility mode is not forced.
 
 ## IBM Storage Scale checklist
 
-The planner warns about the items it can see. The rest need an administrator:
+These need an administrator:
 
 1. `gdscheck -p` lists `IBM Spectrum Scale : ...` with a GDS mode (dmabuf /
    peermem), not only `compat`.
@@ -244,88 +207,32 @@ The planner warns about the items it can see. The rest need an administrator:
      `RoundRobinMaxMin` (compute NICs).
    - `use_poll_mode` is false; Storage Scale converts polled I/O to synchronous.
    - Logging is at ERROR or WARN.
-   - `max_direct_io_size_kb` is at least `staging_piece_bytes` (16384 is the
-     maximum).
+   - `max_direct_io_size_kb` is at least `lane_bytes` (16384 is the maximum).
+   - `max_device_pinned_mem_size_kb` covers the arena.
    - `gpfs` is not in a denylist.
 4. `nvidia_peermem` is loaded, or DMA-BUF is enabled (`gdscheck -p`).
 5. **CPU architecture.** IBM's planning pages (Storage Scale 5.2.3 and 6.0.x)
    list GDS clients as x86 only. Confirm that Storage Scale GDS is supported on
    Grace / GB200 clients before counting on it there. Without it, every read
-   of a Storage Scale file is a compatibility-mode bounce through host memory,
-   and staging stays off.
+   of a Storage Scale file is a compatibility-mode bounce through host memory.
 6. Never fork after cuFile initialized. Make `/run/udev` readable in
    containers. Disable client-side checksums.
 
-Two user-level claims proved wrong when checked against the docs:
-- "Unaligned reads fall back to CPU compatibility mode." They use cuFile's GPU
-  bounce buffers. CPU compat applies to files under 4 KiB, special files,
-  batch and async APIs on Storage Scale, and resource failures.
-- "`max_direct_io_size_kb` should match a 16–32 MB GPFS block." Its maximum is
-  16 MiB, no document ties it to the block size, and GPFS blocks top out at
-  16 MiB.
+`tools/gds/make_cufile_json.py` writes the `rdma_dev_addr_list` of a GPU's
+closest NICs, and `docs/io/cufile-profiles/` holds commented `cufile.json`
+starting points per filesystem.
 
 ## Verifying the path a read took
 
-- `cufile_ioctx::stats()` (`reactor_stats`), or `stats(device)` for one GPU's
-  group: staged, direct and POSIX reads and bytes, `early_staged_reads`,
-  `cufile_failures`, `parked_slices`, and the staged and direct `cuFileWrite`
-  bodies (`staged_writes`, `direct_writes` and their bytes). On a GDS host,
-  Parquet device reads should land in `staged_bytes` and device-write bodies in
-  `staged_write_bytes`.
+- `cufile_ioctx::reactor_gauges()`: per GPU, the bytes queued and the cuFile
+  reads and writes completed with the file bytes they covered.
 - `gds_stats -p <pid> -l 3`: per-GPU `n_nvfs_reads` / `n_p2p_reads`
   (direct) versus `n_posix_reads` (compat), bounce-pool use, per-NIC RDMA
   bytes. `cufile.json` `profile.cufile_stats: 3` enables it.
 - `mmdiag --gds` (Storage Scale): counters of GDS requests GPFS returned to
   compat mode, with the reason.
-- The read probe in `test_cufile_reactor.cpp` (`[.cufile-bench]`), with
-  Parquet-shaped unaligned 1–8 MiB scenarios. It prints the plan, any
-  warnings and the path counters:
-
-  ```sh
-  CUCASCADE_IO_BENCH_FILE=/gpfs/fs1/bench.bin CUCASCADE_IO_BENCH_BYTES=$((16<<30)) \
-  CUCASCADE_IO_BENCH_REACTORS=0 CUCASCADE_IO_BENCH_BACKEND=cufile \
-  ./build/release/test/cucascade_io_tests "[.cufile-bench]"
-  ```
-
-  `CUCASCADE_IO_BENCH_REACTORS=0` plans per GPU, as the factory does.
-  `CUCASCADE_IO_BENCH_STAGING=always|never` forces the staging mode, and
-  `CUCASCADE_IO_BENCH_REACTORS_PER_GPU` overrides the reactor count. Compare
-  against `gdsio -x 0 -I 0 -i 4M -w 32 -d <gpu> -T 30` (gdsio registers its
-  buffers; add `-U` for unaligned I/O).
-
-## Tuning on the deployment host
-
-Every throughput-relevant knob is in `cufile::config` (see the reference below). The values
-the hardware needs are measured, not guessed, with the tuning sweep in
-`test/io/cufile/test_cufile_tune.cpp` (`[.cufile-tune]`), run on the deployment host against
-a large existing file on the storage the engine reads:
-
-```sh
-CUCASCADE_IO_TUNE_FILE=/gpfs/fs1/bench/big.bin ./build/release/test/cucascade_io_tests "[.cufile-tune]"
-```
-
-It prints:
-- the host's GDS setup: the cuFile platform (driver properties, effective parameters), the
-  file's verdict and block size, nvidia-fs and peer memory, `cufile.json`, GPUs (BAR1, NUMA,
-  CPUs, NICs) and NIC link rates. The default plan and its warnings follow.
-- **A.** Per-read latency (p50, p90, p99) and throughput by read size, one read in flight.
-  It compares direct aligned, direct unaligned (cuFile's bounce) and staged unaligned reads.
-  This is the latency Little's law needs: reactors per GPU ≈ target GB/s × latency / read size.
-- **B.** Parquet-shaped reads on one GPU (1–8 MiB at arbitrary offsets into arbitrary device
-  addresses) for every reactors-per-GPU depth × staging piece size × staging mode, with the
-  path counters of each point. Throughput grows with depth until the storage, the NIC or
-  cuFile saturates.
-- **C.** Every GPU at once with the best setting: a node total far below N × the single-GPU
-  number means the GPUs share a bottleneck (NIC, PCIe switch, storage servers).
-- The recommended `reactors_per_device` (the shallowest depth within 5% of the best),
-  `staging_mode` and `staging_piece_bytes` as YAML, plus the staging memory it needs.
-
-The sweep is controlled by `CUCASCADE_IO_TUNE_SECONDS` (per point, default 4),
-`_DEPTHS` (default `1,2,4,8,16,32,64`), `_PIECES_MIB` (`4,8,16`), `_MODES` (`auto,never`; add
-`always` to force staging), `_SIZES_KIB`, `_CHUNK_KIB` (`1024,8192`), `_GPUS`, `_SUBMITTERS`
-(threads per GPU, default 4) and `_SKIP` (e.g. `A,C`). Each point builds its own pool and
-frees its staging afterwards (`cufile::release_staging`), so slot sizes can change between
-points.
+- Compare against `gdsio -x 0 -I 0 -i 8M -w 32 -d <gpu> -T 30` (gdsio registers
+  its buffers; add `-U` for unaligned I/O).
 
 ## Configuration reference
 
@@ -333,41 +240,44 @@ points.
 
 | Field | Default | Meaning |
 |-------|---------|---------|
-| `staging_mode` | `automatic` | Stage through registered slots when cuFile reports GDS (`always` / `never` to force) |
-| `staging_piece_bytes` | 8 MiB | File bytes per staged call; also the split size of large device reads |
-| `staging_slots_per_reactor` | 2 | Slots a reactor holds per GPU; 1 disables early reads |
-| `fuse_gap_bytes` | 0 (off) | Read neighbouring small device slices of one vectored read (each at most half a piece, at most this far apart, together within one slot) with a single staged call. For files with small column chunks: a read's cost is mostly its fixed latency |
-| `max_staging_bytes_per_device` | 1 GiB | Process-wide cap on staging per GPU (0 = no cap) |
-| `reactors_per_device` | 0 (auto) | Reactors per GPU in a planned pool |
-| `pin_to_device_cpus` | true | Pin each group to its GPU's CPUs |
-| `devices` | empty (all) | GPUs a planned pool serves; list the ones the process reads into |
-| `storage_hint_path` | empty | A file on the main storage, used only to size the pool |
-| `gds_threshold` | 256 KiB | Smaller device reads use POSIX |
-| `max_op_bytes` | 64 MiB | Largest direct `cuFileRead`; byte quantum of a scheduling pass |
-| `max_inflight` | 32 | Async copies per reactor (parked slices excluded) |
-| `write_split_bytes` | 64 MiB | Write slices larger than this are cut into pieces of this size, spread over the group's reactors (0 = never) |
-| `poll_interval_us` | 50 | Completion poll period while copies are pending |
-| `use_odirect`, `compat_mode` | true, automatic | O_DIRECT / cuFile registration policy per file |
-| `fused_reads` | disabled | Opt-in fused `cuFileReadAsync` device reads on stream lanes, budgeted on top of `max_staging_bytes_per_device`; see [cufile-fused-lanes.md](cufile-fused-lanes.md#configuration-reference) |
-| `host_batch` | disabled | Opt-in cuFile-batch host reads of aligned bodies; see [cufile-fused-lanes.md](cufile-fused-lanes.md#configuration-reference) |
+| `lanes` | 32 | Lanes in each of a reactor's two lane sets (one reads, one writes): the read depth and the write depth of a GPU |
+| `lane_bytes` | 8 MiB | Bytes of a lane's arena slot, and so the most one cuFile call moves; a positive multiple of the write granule |
+| `coalesce_gap_bytes` | 1 MiB | Device reads of one request at most this far apart are served by one cuFile read |
+| `coalesce_gap_ratio` | 0.15 | Most of such a read that may be gaps |
+| `devices` | empty (all) | GPUs to serve, one reactor each |
+| `n_max_concurrent_scans` | GPU pipeline threads | Scan tasks the readahead manager may keep in flight against this backend |
 
-`io_config::cufile_n_reactors`: 0 = plan per GPU from the topology; > 0 = a flat pool of
-that many reactors.
+```cpp
+cucascade::io::io_config config;
+config.backend = cucascade::io::io_backend::cufile;
+// Optional overrides:
+// config.cufile.lanes      = 64;
+// config.cufile.lane_bytes = 4UL << 20;
+cucascade::io::io_context_registry registry{config, reservation_manager};
+```
 
 ## Known limitations
 
-- By default, the batch (`cuFileBatchIO*`) and stream (`cuFileReadAsync` /
-  `cuFileWriteAsync`) APIs are not used. Concurrency comes from reactor threads, one read in
-  flight each, so a GPU's queue depth is its reactor count. The opt-in fused stream lanes
-  (`cuFileReadAsync`, device reads) and host batch (`cuFileBatchIO*`, aligned host reads)
-  lift that limit; see [cufile-fused-lanes.md](cufile-fused-lanes.md). IBM documents both APIs
-  as compatibility mode on Storage Scale. On the reference GPFS-over-RoCE host,
-  `cuFileReadAsync` measured on the GDS fast path, while batch entries for GPU memory took the
-  POSIX fallback. Writes use neither.
-- The per-path verdict does not yet see NVMe multipath heads, NVMe/TCP, or
-  RAID levels and encryption inside device-mapper / md stacks. It is advisory:
-  reads never depend on it.
-- cuFile's own statistics (`cuFileGetStatsL3`) are not read in-process yet.
-  Use `gds_stats`.
+- The batch (`cuFileBatchIO*`) and stream (`cuFileReadAsync` /
+  `cuFileWriteAsync`) APIs are not used; see
+  [Plugging in the asynchronous APIs](#plugging-in-the-asynchronous-apis). IBM
+  documents both as compatibility mode on Storage Scale.
+- Every device read is copied once, device to device, out of the arena. Reads
+  that are already 4 KiB-aligned into registered memory do not skip it.
+- Device I/O on a file cuFile cannot register fails instead of falling back to
+  host staging.
+- The backend never arms the prefetching cache.
+- cuFile's own statistics (`cuFileGetStatsL3`) are not read in-process. Use
+  `gds_stats`.
 - With GDS 1.20, a process that also uses cuObject gets cuObject's cuFile
   configuration, whichever initialized first, with `parallel_io` forced off.
+
+## History
+
+The backend replaced an earlier one (per-GPU groups of single-read reactors
+with staged / direct / POSIX paths, an opt-in async engine, fused stream lanes
+and host batch reads). Its design record, reviews and measurements are kept
+under [gds-design/](gds-design/README.md), and its two operating guides,
+[cufile-reactor.md](cufile-reactor.md) and
+[cufile-fused-lanes.md](cufile-fused-lanes.md), are kept for the measurements
+and the libcufile configuration advice they hold.

@@ -24,8 +24,6 @@
 #include <cucascade/memory/config.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
 
-#include <cuda_runtime_api.h>
-
 #include <catch2/catch_all.hpp>
 
 #include <cstddef>
@@ -33,7 +31,6 @@
 #include <memory>
 #include <stdexcept>
 #include <string_view>
-#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -211,11 +208,9 @@ TEST_CASE("cufile routing takes local regular files only", "[io][registry][cufil
 TEST_CASE("cufile factory builds a cufile ioctx from the configured settings",
           "[io][registry][cufile]")
 {
-  auto config                 = config_for(io_backend::cufile);
-  config.cufile_n_reactors    = 1;
-  config.cufile.compat_mode   = cucascade::io::cufile::compat::on;
-  config.cufile.max_inflight  = 7;
-  config.cufile.gds_threshold = 1UL << 20;
+  auto config              = config_for(io_backend::cufile);
+  config.cufile.lanes      = 2;
+  config.cufile.lane_bytes = 1UL << 20;
   registry_fixture fixture{config};
 
   auto ctx = fixture.registry.make_ioctx(io_context_type::cufile);
@@ -223,17 +218,13 @@ TEST_CASE("cufile factory builds a cufile ioctx from the configured settings",
   CHECK(ctx->type() == io_context_type::cufile);
   CHECK_FALSE(ctx->can_use_fs_cache());
   CHECK(ctx->supports_device_read());
-  // compat::on reaches the reactor: the file is opened without O_DIRECT or a
-  // cuFile handle.
-  auto object       = ctx->open_io_object("/proc/self/exe");
-  auto const& typed = dynamic_cast<cucascade::io::cufile::cufile_io_object const&>(*object);
-  CHECK_FALSE(typed.cufile_registered());
-  CHECK(typed.direct_fd() == -1);
+  auto object = ctx->open_io_object("/proc/self/exe");
+  CHECK(dynamic_cast<cucascade::io::cufile::cufile_io_object const*>(object.get()) != nullptr);
   ctx->shutdown();
 
   // A malformed reactor configuration is reported as a null ioctx, not thrown.
-  auto bad                = config_for(io_backend::cufile);
-  bad.cufile.max_inflight = 0;
+  auto bad         = config_for(io_backend::cufile);
+  bad.cufile.lanes = 0;
   registry_fixture broken{bad};
   CHECK(broken.registry.make_ioctx(io_context_type::cufile) == nullptr);
 }
@@ -259,26 +250,6 @@ TEST_CASE("cufile routing leaves local files its checker declines to uring",
   fixture.registry.register_ioctx(
     io_context_type::cufile, [](std::string_view) { return true; }, null_factory);
   CHECK(fixture.registry.lookup_path("/proc/self/exe") == io_context_type::cufile);
-}
-
-TEST_CASE("cufile factory plans a pinned per-GPU pool by default", "[io][registry][cufile]")
-{
-  int devices = 0;
-  if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) {
-    std::ignore = cudaGetLastError();
-    SKIP("no CUDA device");
-  }
-  auto config = config_for(io_backend::cufile);
-  REQUIRE(config.cufile_n_reactors == 0);  // planned from the topology
-  config.cufile.reactors_per_device = 2;
-  config.cufile.staging_mode        = cucascade::io::cufile::staging::never;
-  registry_fixture fixture{config};
-  auto ctx = fixture.registry.make_ioctx(io_context_type::cufile);
-  REQUIRE(ctx != nullptr);
-  auto const& typed = dynamic_cast<cucascade::io::cufile::cufile_ioctx const&>(*ctx);
-  CHECK(typed.plan().groups.size() == static_cast<std::size_t>(devices));
-  CHECK(typed.plan().total_reactors() == 2 * static_cast<std::size_t>(devices));
-  ctx->shutdown();
 }
 #else
 TEST_CASE("cufile backend is refused by a build without cuFile", "[io][registry][cufile]")

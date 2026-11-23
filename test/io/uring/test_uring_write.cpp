@@ -18,6 +18,8 @@
 #include "io/detail/local_descriptor.hpp"
 #include "utils/child_test_runner.hpp"
 
+#include <cucascade/io/config.hpp>
+#include <cucascade/io/datasource_factory.hpp>
 #include <cucascade/io/io_context.hpp>
 #include <cucascade/io/io_errors.hpp>
 #include <cucascade/io/io_request.hpp>
@@ -26,8 +28,12 @@
 #include <cucascade/io/uring/types.hpp>
 #include <cucascade/io/uring/uring_ioctx.hpp>
 #include <cucascade/io/uring/uring_reactor.hpp>
+#include <cucascade/memory/config.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
+#include <cucascade/memory/memory_reservation_manager.hpp>
 #include <cucascade/memory/numa_region_pinned_host_allocator.hpp>
+
+#include <rmm/mr/cuda_memory_resource.hpp>
 
 #include <cuda_runtime_api.h>
 
@@ -1397,4 +1403,340 @@ TEST_CASE("uring a reactor that cannot set up io_uring fails start and every req
   CHECK(ctx->host_write(*writer, 0, bytes.size(), bytes.data()) == bytes.size());
   CHECK(ctx->host_read_io(*reader, 0, out.size(), out.data()) == out.size());
   CHECK(std::equal(bytes.begin(), bytes.end(), out.begin()));
+}
+
+// ---------------------------------------------------------------------------
+// Host-only reactors and the per-GPU pool
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/** The CPUs the thread of this process named @p name may run on; empty if there is none. */
+[[nodiscard]] std::vector<int> affinity_of_thread(std::string const& name)
+{
+  for (auto const& task : std::filesystem::directory_iterator("/proc/self/task")) {
+    std::ifstream in(task.path() / "comm");
+    std::string comm;
+    std::getline(in, comm);
+    if (comm != name) continue;
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    REQUIRE(::sched_getaffinity(std::stoi(task.path().filename().string()), sizeof(set), &set) ==
+            0);
+    std::vector<int> cpus;
+    for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+      if (CPU_ISSET(cpu, &set)) cpus.push_back(cpu);
+    }
+    return cpus;
+  }
+  return {};
+}
+
+/** The device bytes of @p device, copied back to the host. */
+[[nodiscard]] std::vector<std::uint8_t> host_copy_of(device_bytes const& device, std::size_t size)
+{
+  std::vector<std::uint8_t> out(size);
+  REQUIRE(cudaMemcpy(out.data(), device.get(), size, cudaMemcpyDeviceToHost) == cudaSuccess);
+  return out;
+}
+
+/** requests_started of every reactor of @p ctx, in reactor order. */
+[[nodiscard]] std::vector<std::uint64_t> requests_started(uring_ioctx& ctx)
+{
+  std::vector<std::uint64_t> out;
+  for (auto const& gauges : ctx.reactor_gauges()) {
+    out.push_back(gauges.requests_started);
+  }
+  return out;
+}
+
+/** A pinned staging resource of @p block_size blocks. */
+struct staging_resource {
+  explicit staging_resource(std::size_t block_size = write_context::block_size)
+    : mr{0, upstream, write_context::capacity, write_context::capacity, block_size, 64, 0}
+  {
+  }
+
+  [[nodiscard]] std::shared_ptr<uring_reactor::reactor_context> context()
+  {
+    return std::make_shared<uring_reactor::reactor_context>(cucascade::io::uring::config{}, &mr);
+  }
+
+  cucascade::memory::numa_region_pinned_host_memory_resource upstream{0};
+  cucascade::memory::fixed_size_host_memory_resource mr;
+};
+
+}  // namespace
+
+TEST_CASE("uring host-only reactors serve host I/O without staging", "[io][uring][host_only]")
+{
+  uring_ioctx ctx{
+    2, std::make_shared<uring_reactor::reactor_context>(cucascade::io::uring::config{}, nullptr)};
+  ctx.start();
+  CHECK(ctx.staging_block_size() == 0);
+
+  scratch_path path;
+  auto object = ctx.open_io_object_for_write(path.str());
+  shadow_file shadow;
+  std::size_t seed = 300;
+  for (std::size_t const offset : {std::size_t{0}, std::size_t{3}, std::size_t{4096}}) {
+    for (std::size_t const size : {std::size_t{1}, std::size_t{4096}, 5 * MiB + 7}) {
+      // A misaligned source cannot be written O_DIRECT without staging.
+      for (std::size_t const misalignment : {std::size_t{0}, std::size_t{8}}) {
+        auto const bytes = pattern(size, ++seed);
+        host_bytes source{bytes, misalignment};
+        auto const at = offset + (seed % 4) * 8 * MiB;
+        CHECK(ctx.host_write_async(*object, at, size, source.get()).get() == size);
+        shadow.write(at, bytes);
+      }
+    }
+  }
+  ctx.flush_async(*object).get();
+  CHECK(path.contents() == shadow.bytes());
+  CHECK(read_back(ctx, path.str()) == shadow.bytes());
+
+  // Device requests need staging.
+  auto reader = ctx.open_io_object(path.str());
+  device_bytes device{std::vector<std::uint8_t>(4096)};
+  cuda_stream stream;
+  CHECK(error_of(failure_of(ctx.device_read_async_io(
+          *reader, 0, 4096, device.get(), stream.ref()))) == std::errc::operation_not_supported);
+  CHECK(error_of(failure_of(ctx.device_write_async(
+          *object, 0, 4096, device.get(), stream.ref()))) == std::errc::operation_not_supported);
+  CHECK(read_back(ctx, path.str()) == shadow.bytes());
+  ctx.shutdown();
+}
+
+TEST_CASE("uring per-GPU pool separates the reads and the writes of a GPU", "[io][uring][per_gpu]")
+{
+  cpu_set_t allowed;
+  CPU_ZERO(&allowed);
+  REQUIRE(::sched_getaffinity(0, sizeof(allowed), &allowed) == 0);
+  int cpu = 0;
+  while (!CPU_ISSET(cpu, &allowed)) {
+    ++cpu;
+  }
+
+  staging_resource staging;
+  uring_ioctx ctx{std::vector<uring_ioctx::device_group>{{0, {cpu}, staging.context()}}};
+  ctx.start();
+  using counts = std::vector<std::uint64_t>;
+  REQUIRE(requests_started(ctx) == counts{0, 0});
+  CHECK(affinity_of_thread("ur-g0-r0_worker") == std::vector<int>{cpu});
+
+  cuda_stream stream;
+  scratch_path path;
+  auto writer            = ctx.open_io_object_for_write(path.str());
+  auto const size        = 3 * MiB + 5;
+  auto const host_data   = pattern(size, 400);
+  auto const device_data = pattern(size, 401);
+  device_bytes device_source{device_data};
+
+  // Reactor 1 writes ...
+  CHECK(ctx.host_write_async(*writer, 0, size, host_data.data()).get() == size);
+  CHECK(requests_started(ctx) == counts{0, 1});
+  CHECK(affinity_of_thread("ur-g0-wr_worker") == std::vector<int>{cpu});
+  CHECK(ctx.device_write_async(*writer, size, size, device_source.get(), stream.ref()).get() ==
+        size);
+  CHECK(requests_started(ctx) == counts{0, 2});
+  ctx.flush_async(*writer).get();
+  CHECK(requests_started(ctx) == counts{0, 3});
+
+  // ... and reactor 0 reads.
+  auto reader = ctx.open_io_object(path.str());
+  std::vector<std::uint8_t> host_out(size);
+  CHECK(ctx.host_read_async_io(*reader, 0, size, host_out.data()).get() == size);
+  CHECK(requests_started(ctx) == counts{1, 3});
+  CHECK(host_out == host_data);
+  device_bytes device_out{std::vector<std::uint8_t>(size)};
+  CHECK(ctx.device_read_async_io(*reader, size, size, device_out.get(), stream.ref()).get() ==
+        size);
+  CHECK(requests_started(ctx) == counts{2, 3});
+  CHECK(host_copy_of(device_out, size) == device_data);
+  ctx.shutdown();
+}
+
+TEST_CASE("uring per-GPU pool rejects groups it cannot serve", "[io][uring][per_gpu]")
+{
+  staging_resource staging;
+  staging_resource larger_blocks{2 * write_context::block_size};
+  using groups = std::vector<uring_ioctx::device_group>;
+  CHECK_THROWS_AS(uring_ioctx{groups{}}, std::invalid_argument);
+  CHECK_THROWS_AS((uring_ioctx{groups{{0, {}, staging.context()}}, 0}), std::invalid_argument);
+  CHECK_THROWS_AS((uring_ioctx{groups{{-1, {}, staging.context()}}}), std::invalid_argument);
+  CHECK_THROWS_AS(
+    (uring_ioctx{groups{{0, {}, staging.context()}, {1, {}, larger_blocks.context()}}}),
+    std::invalid_argument);
+}
+
+TEST_CASE("uring per-GPU pool starts a write reactor with its first write", "[io][uring][per_gpu]")
+{
+  staging_resource staging;
+  auto const pinned = [&] { return staging.mr.get_total_allocated_bytes(); };
+  auto const idle   = pinned();
+  uring_ioctx ctx{std::vector<uring_ioctx::device_group>{{0, {}, staging.context()}}};
+  ctx.start();
+  auto const reading = pinned();
+  CHECK(reading > idle);  // the reader's staging
+
+  scratch_path path;
+  auto writer     = ctx.open_io_object_for_write(path.str());
+  auto const data = pattern(MiB, 410);
+  CHECK(pinned() == reading);  // nothing for the writer yet
+
+  SECTION("which reserves the writer's staging")
+  {
+    CHECK(ctx.host_write_async(*writer, 0, data.size(), data.data()).get() == data.size());
+    CHECK(pinned() == reading + (reading - idle));
+    CHECK(read_back(ctx, path.str()) == data);
+    ctx.shutdown();
+  }
+  SECTION("but not once the pool is shut down")
+  {
+    ctx.shutdown();
+    CHECK_THROWS(ctx.host_write_async(*writer, 0, data.size(), data.data()).get());
+    CHECK(pinned() == reading);
+  }
+}
+
+TEST_CASE("uring per-GPU pool spreads the reads of a GPU over its read reactors",
+          "[io][uring][per_gpu]")
+{
+  staging_resource staging;
+  uring_ioctx ctx{std::vector<uring_ioctx::device_group>{{0, {}, staging.context()}}, 3};
+  ctx.start();
+  using counts = std::vector<std::uint64_t>;
+  REQUIRE(requests_started(ctx) == counts{0, 0, 0, 0});  // three readers, then the writer
+
+  cuda_stream stream;
+  scratch_path path;
+  auto writer     = ctx.open_io_object_for_write(path.str());
+  auto const size = MiB + 3;
+  auto const data = pattern(size, 420);
+  CHECK(ctx.host_write_async(*writer, 0, size, data.data()).get() == size);
+  CHECK(requests_started(ctx) == counts{0, 0, 0, 1});
+
+  auto reader = ctx.open_io_object(path.str());
+  for (int i = 0; i < 6; ++i) {
+    device_bytes out{std::vector<std::uint8_t>(size)};
+    CHECK(ctx.device_read_async_io(*reader, 0, size, out.get(), stream.ref()).get() == size);
+    CHECK(host_copy_of(out, size) == data);
+  }
+  // Idle readers tie on backlog, so the rotation serves them in turn.
+  CHECK(requests_started(ctx) == counts{2, 2, 2, 1});
+  ctx.shutdown();
+}
+
+TEST_CASE("a uring reactor that was shut down can be started again", "[io][uring]")
+{
+  staging_resource staging;
+  uring_reactor reactor{staging.context(), "restart"};
+  scratch_path path;
+  auto const data = pattern(MiB, 430);
+  std::size_t pinned{0};
+  for (int round = 0; round < 2; ++round) {
+    reactor.start();
+    if (round == 0) pinned = staging.mr.get_total_allocated_bytes();
+    CHECK(staging.mr.get_total_allocated_bytes() == pinned);  // the staging is kept, not doubled
+    auto const object = uring_reactor::create_io_object_for_write(path.str(), {});
+    CHECK(reactor.host_write(*object, 0, data.size(), data.data()) == data.size());
+    reactor.shutdown();
+    CHECK(path.contents() == data);
+  }
+}
+
+TEST_CASE("a uring context that was shut down can be started again", "[io][uring]")
+{
+  scratch_path path;
+  auto const data = pattern(MiB, 440);
+  staging_resource staging;
+  auto const per_gpu = GENERATE(false, true);
+  CAPTURE(per_gpu);
+  auto const ctx = per_gpu ? std::make_unique<uring_ioctx>(
+                               std::vector<uring_ioctx::device_group>{{0, {}, staging.context()}})
+                           : std::make_unique<uring_ioctx>(1, staging.context());
+  for (int round = 0; round < 2; ++round) {
+    ctx->start();
+    auto writer = ctx->open_io_object_for_write(path.str());
+    // Timed: a context that stayed shut down would never serve the write.
+    CHECK(
+      ctx->host_write_async(*writer, 0, data.size(), data.data()).get(std::chrono::seconds{10}) ==
+      data.size());
+    CHECK(read_back(*ctx, path.str()) == data);
+    ctx->shutdown();
+  }
+}
+
+TEST_CASE("the uring factory spreads uring_n_reactors read reactors over the GPUs",
+          "[io][uring][per_gpu]")
+{
+  cucascade::memory::gpu_memory_space_config gpu;
+  gpu.device_id       = 0;
+  gpu.memory_capacity = 1UL << 30;
+  gpu.mr_factory_fn   = [](int, std::size_t) {
+    return ::cuda::mr::any_resource<::cuda::mr::device_accessible>{rmm::mr::cuda_memory_resource{}};
+  };
+  cucascade::memory::host_memory_space_config host;
+  host.numa_id         = 0;
+  host.memory_capacity = 256UL << 20;
+  host.mr_factory_fn   = [](int, std::size_t) {
+    return ::cuda::mr::any_resource<::cuda::mr::device_accessible>{
+      cucascade::memory::numa_region_pinned_host_memory_resource{-1}};
+  };
+  std::vector<cucascade::memory::memory_space_config> configs;
+  configs.emplace_back(gpu);
+  configs.emplace_back(host);
+  cucascade::memory::memory_reservation_manager manager{std::move(configs)};
+
+  auto context = std::dynamic_pointer_cast<uring_ioctx>(
+    cucascade::io::make_uring_ioctx_factory(manager)(cucascade::io::io_config{}));
+  REQUIRE(context != nullptr);
+  // One GPU: io_config's four reactors read for it, plus its write reactor.
+  CHECK(context->reactor_gauges().size() == 5);
+}
+
+TEST_CASE("uring per-GPU pool sends a device request to the reactors of its GPU",
+          "[io][uring][per_gpu][.multi-device]")
+{
+  int device_count = 0;
+  REQUIRE(cudaGetDeviceCount(&device_count) == cudaSuccess);
+  if (device_count < 2) { SKIP("requires two CUDA devices"); }
+
+  staging_resource staging;
+  uring_ioctx ctx{
+    std::vector<uring_ioctx::device_group>{{0, {}, staging.context()}, {1, {}, staging.context()}}};
+  ctx.start();
+  using counts = std::vector<std::uint64_t>;
+
+  scratch_path path;
+  auto writer     = ctx.open_io_object_for_write(path.str());
+  auto const size = 2 * MiB + 9;
+  std::vector<std::vector<std::uint8_t>> written;
+  for (int gpu = 0; gpu < 2; ++gpu) {
+    REQUIRE(cudaSetDevice(gpu) == cudaSuccess);
+    written.push_back(pattern(size, 500 + static_cast<std::size_t>(gpu)));
+    device_bytes source{written.back()};
+    cuda_stream stream;
+    CHECK(ctx
+            .device_write_async(
+              *writer, static_cast<std::size_t>(gpu) * size, size, source.get(), stream.ref())
+            .get() == size);
+  }
+  // Reactors 2i and 2i + 1 read and write for GPU i (one reader per GPU).
+  CHECK(requests_started(ctx) == counts{0, 1, 0, 1});
+
+  auto reader = ctx.open_io_object(path.str());
+  for (int gpu = 0; gpu < 2; ++gpu) {
+    REQUIRE(cudaSetDevice(gpu) == cudaSuccess);
+    device_bytes out{std::vector<std::uint8_t>(size)};
+    cuda_stream stream;
+    CHECK(ctx
+            .device_read_async_io(
+              *reader, static_cast<std::size_t>(gpu) * size, size, out.get(), stream.ref())
+            .get() == size);
+    CHECK(host_copy_of(out, size) == written[static_cast<std::size_t>(gpu)]);
+  }
+  CHECK(requests_started(ctx) == counts{1, 1, 1, 1});
+  REQUIRE(cudaSetDevice(0) == cudaSuccess);
+  ctx.shutdown();
 }

@@ -33,10 +33,9 @@ class ioctx;
  */
 enum class disk_io_backend : std::uint8_t {
   automatic,  ///< cufile when GPUDirect Storage is really available (not compat mode), else uring
-              ///< when this process may use io_uring, else cufile (its POSIX path)
   uring,      ///< io_uring reactors; device data is staged through private pinned host memory
-  cufile,     ///< cuFile reactors (GDS); forced even when cuFile only runs in compatibility mode
-              ///< or libcufile is absent (every transfer then takes the POSIX path)
+  cufile,     ///< cuFile reactors (GDS), one per GPU; forced even when cuFile only runs in
+              ///< compatibility mode (it fails to start when libcufile is absent)
 };
 
 /**
@@ -50,7 +49,7 @@ struct disk_io_context_options {
   disk_io_backend backend{disk_io_backend::automatic};
 
   /// The io stack's own static configuration. Used: uring_n_reactors / uring for uring,
-  /// cufile_n_reactors / cufile for cufile. Ignored: backend (see @ref backend) and cache (the
+  /// cufile for cufile. Ignored: backend (see @ref backend) and cache (the
   /// DISK tier never arms a prefetching cache).
   io::io_config io{};
 
@@ -71,15 +70,14 @@ struct disk_io_context_options {
  * Resolving disk_io_backend::automatic probes the platform once per process: it opens the cuFile
  * driver to ask whether GPUDirect Storage is really available (cuFile then writes its
  * `cufile.log` into the working directory unless cufile.json / CUFILE_LOGFILE_PATH points it
- * elsewhere) and sets up a one-entry io_uring ring to check that io_uring is allowed here. When
- * automatic resolved to uring but the reactors then fail to set up their own rings, it falls back
- * to the cuFile reactor's POSIX path (in a build with the cuFile backend).
+ * elsewhere). Every backend needs io_uring (the cuFile reactors serve host I/O through it), which
+ * is checked with a one-entry ring.
  *
  * @param options Backend selection and its static configuration.
  * @return The started context; reactors are shut down and joined when the last owner releases it.
  * @throws std::invalid_argument if the selected backend is configured with zero reactors.
- * @throws std::system_error if uring is requested but this process may not use io_uring (e.g.
- *         EPERM under a container seccomp profile).
+ * @throws std::system_error if this process may not use io_uring (e.g. EPERM under a container
+ *         seccomp profile).
  * @throws std::runtime_error (or the backend's exception) if the context cannot be built.
  *
  * @note Prefer to release every context (and every memory space or reservation manager holding

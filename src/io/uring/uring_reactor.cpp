@@ -484,7 +484,7 @@ void pwrite_all(int fd, std::uint8_t const* source, std::size_t bytes, std::size
 
   bool const direct_fd   = detail::odirect_available(cfg.use_odirect, file.odirect_handle());
   bool const can_stage   = block_size != 0;
-  bool const direct_ok   = direct_fd && block_size % IO_BLOCK_SIZE == 0;
+  bool const direct_ok   = direct_fd && can_stage && block_size % IO_BLOCK_SIZE == 0;
   auto const granule     = write_granule();
   auto const source_from = [&](std::size_t offset) { return host + (offset - slice.rng.offset); };
 
@@ -666,17 +666,16 @@ void pwrite_all(int fd, std::uint8_t const* source, std::size_t bytes, std::size
 
 }  // namespace
 
-uring_reactor::uring_reactor(std::shared_ptr<reactor_context> ctx, std::string_view tname)
-  : _ctx(std::move(ctx)), _tname(tname)
+uring_reactor::uring_reactor(std::shared_ptr<reactor_context> ctx,
+                             std::string_view tname,
+                             reactor_placement where)
+  : _ctx(std::move(ctx)), _tname(tname), _placement(std::move(where))
 {
   if (_ctx == nullptr) {
     throw std::invalid_argument("uring_reactor: reactor_context must be non-null");
   }
-  if (_ctx->host_memory_resource() == nullptr) {
-    throw std::invalid_argument("uring_reactor: host memory resource must be non-null");
-  }
   _config              = _ctx->cfg();
-  _bounce_slot_size    = _ctx->host_memory_resource()->get_block_size();
+  _bounce_slot_size    = staging_block_size();
   _slices_per_pass     = effective_slices_per_pass(_config.slices_per_pass);
   _low_service_quantum = std::min(_slices_per_pass, max_slices_per_pass);
 }
@@ -736,23 +735,27 @@ void uring_reactor::record_queue_delay(grouped_io_request const& request) noexce
 void uring_reactor::start()
 {
   if (_worker.joinable()) return;
-  if (_bounce_slot_size == 0) {
-    throw std::invalid_argument("uring_reactor: staging block size must be non-zero");
-  }
+  // A host-only reactor (no host memory resource) reserves no staging; one
+  // started again after a shutdown() still holds its own.
+  if (auto* const mr = _ctx->host_memory_resource(); mr != nullptr && _bounce_storage == nullptr) {
+    if (_bounce_slot_size == 0) {
+      throw std::invalid_argument("uring_reactor: staging block size must be non-zero");
+    }
 
-  auto const slot_count =
-    std::clamp(STAGING_BUDGET_BYTES / _bounce_slot_size, std::size_t{1}, MAX_NUM_SLOTS);
-  auto const staging_bytes = slot_count * _bounce_slot_size;
-  try {
-    _bounce_storage = _ctx->host_memory_resource()->allocate_multiple_blocks(staging_bytes);
-  } catch (rmm::out_of_memory const& e) {
-    throw std::runtime_error("uring_reactor: cannot reserve " + std::to_string(staging_bytes) +
-                             " bytes of pinned staging (" + std::to_string(slot_count) + " x " +
-                             std::to_string(_bounce_slot_size) + "): " + e.what());
-  }
-  if (_bounce_storage->get_blocks().size() < slot_count) {
-    _bounce_storage.reset();
-    throw std::runtime_error("uring_reactor: failed to allocate all staging slots");
+    auto const slot_count =
+      std::clamp(STAGING_BUDGET_BYTES / _bounce_slot_size, std::size_t{1}, MAX_NUM_SLOTS);
+    auto const staging_bytes = slot_count * _bounce_slot_size;
+    try {
+      _bounce_storage = mr->allocate_multiple_blocks(staging_bytes);
+    } catch (rmm::out_of_memory const& e) {
+      throw std::runtime_error("uring_reactor: cannot reserve " + std::to_string(staging_bytes) +
+                               " bytes of pinned staging (" + std::to_string(slot_count) + " x " +
+                               std::to_string(_bounce_slot_size) + "): " + e.what());
+    }
+    if (_bounce_storage->get_blocks().size() < slot_count) {
+      _bounce_storage.reset();
+      throw std::runtime_error("uring_reactor: failed to allocate all staging slots");
+    }
   }
 
   std::promise<void> ready;
@@ -762,6 +765,7 @@ void uring_reactor::start()
     try {
       _rejection_error = nullptr;
       _accepting.store(true, std::memory_order_release);
+      _stop_source = std::stop_source{};  // a shutdown() before this start() used the last one
       _worker =
         std::jthread([this, ready = std::move(ready)](
                        std::stop_token stop_token) mutable { worker_loop(stop_token, ready); },
@@ -1062,8 +1066,19 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token, std::promise<
   };
 
   try {
-    auto const blocks     = _bounce_storage->get_blocks();
-    auto const slot_count = blocks.size();
+    // A reactor dedicated to one GPU (see reactor_placement): the worker stays on the
+    // GPU's NUMA node and on its device for every copy and event it makes.
+    if (!_placement.cpus.empty() &&
+        !cucascade::exec::thread_util::set_current_thread_affinity(_placement.cpus)) {
+      CUCASCADE_LOG_WARN("uring_reactor {}: cannot pin the worker to its CPUs", _tname);
+    }
+    if (_placement.device >= 0) { CUCASCADE_CUDA_TRY(cudaSetDevice(_placement.device)); }
+
+    // A host-only reactor has no staging blocks: its slots only bound the
+    // operations in flight, and no buffers are registered.
+    bool const host_only  = _bounce_storage == nullptr;
+    auto const blocks     = host_only ? std::span<std::byte*>{} : _bounce_storage->get_blocks();
+    auto const slot_count = host_only ? MAX_NUM_SLOTS : blocks.size();
     unique_ring ring{static_cast<unsigned>(2 * slot_count)};
 
     std::vector<iovec> registered_buffers;
@@ -1071,7 +1086,7 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token, std::promise<
     for (auto* block : blocks) {
       registered_buffers.push_back(iovec{block, _bounce_slot_size});
     }
-    bool const fixed_supported = ring.register_buffers(registered_buffers);
+    bool const fixed_supported = !host_only && ring.register_buffers(registered_buffers);
 
     slot_pool available_slots{slot_count};
     std::vector<io_slot> slots;
@@ -1098,8 +1113,12 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token, std::promise<
       std::shared_ptr<const io_object> obj;
       std::shared_ptr<grouped_coordinator> coordinator;
       prepared_io_slice slice;
-      std::unique_ptr<cucascade::cuda::cuda_event> ready;
+      /// Back in @c idle_gates once the write leaves @c gated.
+      std::shared_ptr<cucascade::cuda::cuda_event> ready;
     };
+    // The events of gated writes that have left, by device, for the next ones:
+    // a gate is recycled, not created per write.
+    std::unordered_map<int, std::vector<std::unique_ptr<cucascade::cuda::cuda_event>>> idle_gates;
     std::vector<gated_write> gated;
     std::unique_ptr<grouped_io_request> active;
     // A low-priority request set aside, part-expanded, while high requests run.
@@ -1279,7 +1298,7 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token, std::promise<
         // entry that was already settled elsewhere instead of completing a foreign op.
         assert(slot.state == slot_state::copying && slot.op != nullptr);
         if (slot.state != slot_state::copying || slot.op == nullptr) continue;
-        auto const status = cudaEventQuery(slot.copy_event->get());
+        auto const status = slot.copy_event->query_raw_status();
         if (status == cudaErrorNotReady) {
           *output++ = *it;
           continue;
@@ -1514,7 +1533,7 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token, std::promise<
         auto& slot = slots[static_cast<std::size_t>(*it)];
         assert(slot.state == slot_state::staging && slot.op != nullptr);
         if (slot.state != slot_state::staging || slot.op == nullptr) continue;
-        auto const status = cudaEventQuery(slot.copy_event->get());
+        auto const status = slot.copy_event->query_raw_status();
         if (status == cudaErrorNotReady) {
           *output++ = *it;
           continue;
@@ -1546,23 +1565,23 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token, std::promise<
     // after every blocking stream, which a query of it does not report, so it is
     // checked through the event.
     auto write_gate =
-      [&](prepared_io_slice const& slice) -> std::unique_ptr<cucascade::cuda::cuda_event> {
+      [&](prepared_io_slice const& slice) -> std::shared_ptr<cucascade::cuda::cuda_event> {
       int device = slice.d_buffer.device_id;
       if (device < 0) { CUCASCADE_CUDA_TRY(cudaGetDevice(&device)); }
       rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{device}};
-      auto const stream = slice.d_buffer.stream.get();
-      bool const legacy = stream == nullptr || stream == cudaStreamLegacy;
-      if (!legacy) {
-        auto const state = cudaStreamQuery(stream);
-        if (state == cudaSuccess) return nullptr;
-        std::ignore = cudaGetLastError();
-        if (state != cudaErrorNotReady) {
-          throw cucascade::cuda_error(std::string{"uring_reactor: cudaStreamQuery failed: "} +
-                                      cudaGetErrorString(state));
-        }
+      auto const stream = slice.d_buffer.stream;
+      bool const legacy = stream.get() == nullptr || stream.get() == cudaStreamLegacy;
+      if (!legacy && stream.is_done()) return nullptr;
+
+      auto& idle = idle_gates[device];
+      if (idle.empty()) {
+        idle.push_back(std::make_unique<cucascade::cuda::cuda_event>(cudaEventDisableTiming));
       }
-      auto event = std::make_unique<cucascade::cuda::cuda_event>(cudaEventDisableTiming);
-      CUCASCADE_CUDA_TRY(cudaEventRecord(event->get(), legacy ? cudaStreamLegacy : stream));
+      auto* const taken = idle.back().release();
+      idle.pop_back();
+      std::shared_ptr<cucascade::cuda::cuda_event> const event{
+        taken, [&idle](cucascade::cuda::cuda_event* returned) { idle.emplace_back(returned); }};
+      event->record(legacy ? ::cuda::stream_ref{cudaStreamLegacy} : stream);
       if (legacy) {
         auto const state = event->query_raw_status();
         if (state == cudaSuccess) return nullptr;
@@ -1802,7 +1821,12 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token, std::promise<
             _queued_bytes.fetch_sub(slice.size(), std::memory_order_relaxed);
 
             try {
-              std::unique_ptr<cucascade::cuda::cuda_event> gate;
+              if (host_only && slice.has_device_request()) {
+                throw std::system_error(
+                  std::make_error_code(std::errc::operation_not_supported),
+                  "uring_reactor: a host-only reactor cannot serve device requests");
+              }
+              std::shared_ptr<cucascade::cuda::cuda_event> gate;
               if (slice.is_write() && slice.has_device_request()) gate = write_gate(slice);
               if (gate != nullptr) {
                 gated.reserve(gated.size() + 1);  // the push below then cannot throw

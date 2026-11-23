@@ -16,13 +16,18 @@
  * limitations under the License.
  */
 
+#include <cucascade/cuda/event.hpp>
 #include <cucascade/error.hpp>
 #include <cucascade/io/cache/config.hpp>
 #include <cucascade/io/cache/fs_cache.hpp>
 #include <cucascade/io/io_context.hpp>
 #include <cucascade/io/io_errors.hpp>
+#include <cucascade/io/templated_ioctx.hpp>
 #include <cucascade/io/types.hpp>
 #include <cucascade/log/logging.hpp>
+#include <cucascade/memory/stream_pool.hpp>
+
+#include <rmm/cuda_device.hpp>
 
 #include <algorithm>
 #include <cassert>
@@ -31,7 +36,9 @@
 #include <cstdint>
 #include <exception>
 #include <limits>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -41,6 +48,79 @@
 #include <vector>
 
 namespace cucascade::io {
+namespace detail {
+namespace {
+
+/// The stand-in streams of one device and the event that orders one after a
+/// per-thread default stream; recycled across calls and kept for the process.
+struct stand_in_pool {
+  explicit stand_in_pool(rmm::cuda_device_id device) : streams(device)
+  {
+    rmm::cuda_set_device_raii const guard{device};
+    ordering = std::make_unique<cuda::cuda_event>();
+  }
+
+  memory::exclusive_stream_pool streams;
+  std::mutex mutex;  ///< Guards @c ordering.
+  std::unique_ptr<cuda::cuda_event> ordering;
+};
+
+stand_in_pool& stand_ins_of(int device)
+{
+  static std::mutex mutex;
+  static auto* const pools = new std::map<int, std::unique_ptr<stand_in_pool>>{};
+  std::lock_guard const lock(mutex);
+  auto& pool = (*pools)[device];
+  if (pool == nullptr) { pool = std::make_unique<stand_in_pool>(rmm::cuda_device_id{device}); }
+  return *pool;
+}
+
+/// A pooled non-blocking stream ordered after the work the calling thread has
+/// queued on its per-thread default stream of @p device; usable from any thread.
+std::shared_ptr<memory::borrowed_stream> per_thread_stand_in(int device)
+{
+  using policy = memory::exclusive_stream_pool::stream_acquire_policy;
+  auto& pool   = stand_ins_of(device);
+  auto stand_in =
+    std::make_shared<memory::borrowed_stream>(pool.streams.acquire_stream(policy::GROW));
+  rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{device}};
+  // A stream waits on the event as recorded when the wait is queued, so the
+  // event is free for the next caller as soon as these two calls return.
+  std::lock_guard const lock(pool.mutex);
+  pool.ordering->record(::cuda::stream_ref{cudaStreamPerThread});  // this thread's own stream
+  pool.ordering->wait(stand_in->get());
+  return stand_in;
+}
+
+}  // namespace
+
+void resolve_default_streams(std::vector<prepared_io_slice>& slices)
+{
+  std::vector<std::pair<int, std::shared_ptr<memory::borrowed_stream>>> stand_ins;
+  for (auto& slice : slices) {
+    if (!slice.has_device_request()) continue;
+    if (slice.d_buffer.stream.get() == nullptr) {
+      slice.d_buffer.stream = ::cuda::stream_ref{cudaStreamLegacy};
+      continue;
+    }
+    if (slice.d_buffer.stream.get() != cudaStreamPerThread) continue;
+    auto const device =
+      slice.d_buffer.device_id >= 0 ? slice.d_buffer.device_id : current_cuda_device();
+    std::shared_ptr<memory::borrowed_stream> stand_in;
+    for (auto const& [served, existing] : stand_ins) {
+      if (served == device) stand_in = existing;
+    }
+    if (stand_in == nullptr) {
+      stand_in = per_thread_stand_in(device);
+      stand_ins.emplace_back(device, stand_in);
+    }
+    slice.d_buffer.stream       = stand_in->get();
+    slice.d_buffer.stream_owner = stand_in;
+  }
+}
+
+}  // namespace detail
+
 namespace {
 
 using nvtx_range = nvtx3::scoped_range_in<libcucascade_domain>;

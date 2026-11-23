@@ -31,10 +31,10 @@ namespace cucascade::io {
 enum class io_backend {
   /// cuCascade's own IO stack: uring for local paths, REST for @c s3:// URLs.
   native,
-  /// The cuFile / GPUDirect Storage read reactor: local regular files are
-  /// served by @c cufile_ioctx instead of uring (device destinations via
-  /// @c cuFileRead, everything else via POSIX); @c s3:// URLs still go to the
-  /// REST backend.  Needs a build that found @c cufile.h
+  /// The cuFile / GPUDirect Storage reactors: local regular files are served by
+  /// @c cufile_ioctx instead of uring (device buffers through cuFile, host
+  /// buffers through each reactor's host-only uring reactor); @c s3:// URLs
+  /// still go to the REST backend.  Needs a build that found @c cufile.h
   /// (@c CUCASCADE_HAS_CUFILE); without it no cuFile backend is registered and
   /// local paths resolve to nothing rather than to another backend.
   cufile,
@@ -57,7 +57,7 @@ enum class io_backend {
  * Sub-configs:
  *  - @c uring   — uring reactor tunables (local-disk IO path).
  *  - @c rest    — REST reactor tunables (S3/object-store IO path).
- *  - @c cufile  — cuFile / GDS read reactor tunables (local-disk GDS path);
+ *  - @c cufile  — cuFile / GDS reactor tunables (local-disk GDS path);
  *    always present for ABI stability; backend availability is gated by
  *    @c CUCASCADE_HAS_CUFILE.
  *  - @c cache   — caching mode, eviction policy and prefetching-cache tunables.
@@ -67,7 +67,10 @@ struct io_config {
   /// IO backend that serves managed reads.
   io_backend backend{io_backend::native};
 
-  /// Number of uring reactor worker threads for the local-disk IO path.
+  /// Number of uring reactor worker threads for the local-disk IO path.  When the
+  /// reservation manager has GPU spaces, @c make_uring_ioctx_factory spreads them over the
+  /// GPUs as read reactors (`max(1, uring_n_reactors / #GPUs)` each) and adds one write
+  /// reactor per GPU, started by the first write.
   std::size_t uring_n_reactors{4};
 
   /// Number of REST reactor worker threads for the S3/object-store IO path (each its own
@@ -85,18 +88,9 @@ struct io_config {
   /// worker-owned.
   rest::config rest{};
 
-  /// cuFile reactor worker threads for the GDS local-disk IO path.  Each reactor
-  /// keeps one synchronous transfer in flight, so this is the backend's queue
-  /// depth.  0 (the default) plans the pool from the discovered topology: a
-  /// group of @c cufile.reactors_per_device reactors per visible GPU, pinned to
-  /// that GPU's CPUs, each GPU's reads served by its own group (see
-  /// @c cufile::plan_cufile_pool).  A positive value is one flat pool of that
-  /// many unpinned reactors shared by every GPU.
-  std::size_t cufile_n_reactors{0};
-
-  /// cuFile / GDS read reactor configuration.  Only consulted when
-  /// @c backend == @ref io_backend::cufile.  Not derived from @ref cache: the
-  /// cuFile backend never arms the prefetching cache.
+  /// cuFile / GDS reactor configuration (one reactor per GPU).  Only consulted
+  /// when @c backend == @ref io_backend::cufile.  Not derived from @ref cache:
+  /// the cuFile backend never arms the prefetching cache.
   cufile::config cufile{};
 
   /// The read path's caching configuration: mode, eviction policy and the

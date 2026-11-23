@@ -319,58 +319,28 @@ TEST_CASE("make_disk_io_context rejects a uring backend without reactors", "[dis
   REQUIRE_THROWS_AS(make_disk_io_context(options), std::invalid_argument);
 }
 
-TEST_CASE("make_disk_io_context plans a cuFile pool for zero reactors", "[disk][io][context]")
+TEST_CASE("without io_uring the DISK tier fails fast", "[disk][io][no_uring]")
 {
-  // As in the scan factory, 0 cuFile reactors plans a group per GPU.
-  disk_io_context_options options;
-  options.backend              = disk_io_backend::cufile;
-  options.io.cufile_n_reactors = 0;
-  auto context                 = make_disk_io_context(options);
-  REQUIRE(context != nullptr);
-  REQUIRE(context->type() == io::io_context_type::cufile);
-}
-
-TEST_CASE("without io_uring the DISK tier fails fast or falls back", "[disk][io][no_uring]")
-{
-  if (run_in_child_process("without io_uring the DISK tier fails fast or falls back",
+  if (run_in_child_process("without io_uring the DISK tier fails fast",
                            "CUCASCADE_DISK_NO_URING_CHILD")) {
     return;
   }
   // Child: io_uring is forbidden from here on, before anything set up a ring.
   forbid_io_uring();
 
-  // A forced uring context fails at construction with the real cause ...
-  disk_io_context_options forced;
-  forced.backend = disk_io_backend::uring;
-  try {
-    [[maybe_unused]] auto context = make_disk_io_context(forced);
-    FAIL("make_disk_io_context built a uring context although io_uring is forbidden");
-  } catch (std::system_error const& error) {
-    REQUIRE(error.code().value() == EPERM);
+  // Every backend needs io_uring (the cuFile reactors serve host I/O through it), so a context
+  // fails at construction with the real cause.
+  for (auto const backend : test::disk_test_backends) {
+    CAPTURE(test::to_string(backend));
+    disk_io_context_options options;
+    options.backend = backend;
+    try {
+      [[maybe_unused]] auto context = make_disk_io_context(options);
+      FAIL("make_disk_io_context built a context although io_uring is forbidden");
+    } catch (std::system_error const& error) {
+      REQUIRE(error.code().value() == EPERM);
+    }
   }
-
-  // ... while automatic, and so a DISK space without a context, picks a backend that works.
-  REQUIRE(make_disk_io_context()->type() != io::io_context_type::uring);
-  scratch_dir dir;
-  auto space   = test::make_disk_space(disk_io_backend::automatic, 16, dir.string());
-  auto gpu_rep = make_gpu_rep(make_sequence_table(300'000, 2, shared_stream()));
-  auto from_gpu =
-    registry().convert<disk_data_representation>(*gpu_rep, space.get(), shared_stream());
-  REQUIRE(space->get_io_context()->type() != io::io_context_type::uring);
-  auto back = registry().convert<gpu_table_representation>(
-    *from_gpu, shared_gpu_space().get(), shared_stream());
-  test::expect_cudf_tables_equal_on_stream(
-    gpu_rep->get_table_view(), back->get_table_view(), shared_stream());
-  auto host_rep = registry().convert<host_data_representation>(
-    *gpu_rep, shared_host_space().get(), shared_stream());
-  auto from_cpu =
-    registry().convert<disk_data_representation>(*host_rep, space.get(), shared_stream());
-  auto host_back = registry().convert<host_data_representation>(
-    *from_cpu, shared_host_space().get(), shared_stream());
-  auto back_from_host = registry().convert<gpu_table_representation>(
-    *host_back, shared_gpu_space().get(), shared_stream());
-  test::expect_cudf_tables_equal_on_stream(
-    gpu_rep->get_table_view(), back_from_host->get_table_view(), shared_stream());
 }
 
 TEST_CASE("default_disk_io_context is shared by every caller", "[disk][io][context]")

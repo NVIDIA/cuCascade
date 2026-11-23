@@ -167,19 +167,21 @@ class io_context_registry {
 // unconfigured credentials, …) is logged and reported as a null ioctx rather
 // than thrown, matching @c io_context_registry::make_ioctx.
 
-/// io_uring local-disk backend.  Builds a @c uring_reactor::reactor_context from
-/// @c config.uring and @c config.uring_n_reactors. Pinned staging uses the
-/// HOST-tier resource block size; physical grouping is chosen by the worker.
+/// io_uring local-disk backend.  When @p reservation_manager has GPU spaces:
+/// `max(1, config.uring_n_reactors / #GPUs)` read @c uring_reactor s and one
+/// write reactor (started by the first write) per GPU, pinned to the GPU's
+/// NUMA node and staging from that node's HOST-tier resource.  Otherwise
+/// @c config.uring_n_reactors reactors sharing one
+/// @c uring_reactor::reactor_context.  Pinned staging uses the HOST-tier
+/// resource block size; physical grouping is chosen by the worker.
 io_context_registry::factory_type make_uring_ioctx_factory(
   cucascade::memory::memory_reservation_manager& reservation_manager);
 
 #ifdef CUCASCADE_HAS_CUFILE
-/// cuFile / GPUDirect Storage local-disk read backend.  Builds a
-/// @c cufile_reactor::reactor_context from @c config.cufile and a pool of
-/// @c config.cufile_n_reactors reactors.  Takes no reservation manager: the
-/// reactors borrow their pinned host scratch from the registered HOST memory
-/// pools (@c memory::find_host_pool), or keep their own when there are none.
-/// Declared only in a build that found @c cufile.h.
+/// cuFile / GPUDirect Storage local-disk backend.  Builds a @c cufile_ioctx --
+/// a reactor per GPU -- from @c config.cufile.  Takes no reservation manager:
+/// the reactors stage through their own registered device memory.  Declared
+/// only in a build that found @c cufile.h.
 io_context_registry::factory_type make_cufile_ioctx_factory();
 #endif
 

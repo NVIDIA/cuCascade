@@ -479,4 +479,13 @@ class topology_discovery {
   std::optional<system_topology_info> _topology;  ///< Discovered topology information.
 };
 
+/**
+ * @brief The topology the first call discovered (with
+ *        @c NetworkDeviceVerification::EXISTS_ACTIVE), kept for the process.
+ *
+ * For callers that place work by GPU and NUMA node on every construction, such
+ * as the I/O context factories.  Empty when that discovery failed.
+ */
+[[nodiscard]] system_topology_info const& process_topology();
+
 }  // namespace cucascade::memory

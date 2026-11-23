@@ -1958,8 +1958,8 @@ static std::unique_ptr<idata_representation> convert_disk_to_gpu(
   // particular backend implements it:
   //  1. The read future resolves only after every byte is in device memory, on whichever stream
   //     the backend used (uring: its H2D copies on `stream`, settled once their event completes;
-  //     cuFile: a synchronous cuFileRead, or POSIX + H2D on its own copy stream, settled after the
-  //     copy events). So the buffers are complete when read_disk_file_device() returns.
+  //     cuFile: a cuFileRead into a lane's slot, then copies on the lane's stream, settled after
+  //     the copy event). So the buffers are complete when read_disk_file_device() returns.
   //  2. A backend writes the destinations only after the work enqueued on `stream` before the read
   //     (uring copies on `stream`; cuFile waits for `stream` before it writes from elsewhere). The
   //     destinations are stream-ordered allocations on `stream`, so this ordering is required.

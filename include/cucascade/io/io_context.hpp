@@ -515,16 +515,6 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
   /// the bytes are in place: no further synchronization of @p stream is needed
   /// to finish the read (ordering later consumer work is the caller's
   /// business).  The destinations must stay valid until the future settles.
-  ///
-  /// Exception: a cuFile context with async_engine.mode != legacy may return a
-  /// successful device-only read once copies are enqueued and joined onto the
-  /// original non-PTDS stream. Keep destinations alive and synchronize that
-  /// stream before host or foreign-stream access. Do not graph-capture it while
-  /// reads are in flight; late copy errors surface at stream synchronization.
-  /// Original PTDS callers and legacy/POSIX fallback remain host-complete, and so
-  /// do the fused-lane reads of a cuFile context (fused_reads.enabled): a lane
-  /// read settles only once its device-to-device copies completed, like the
-  /// synchronous path.
   virtual exec::semi_future<size_t> device_readv_async_io(
     const io_object& obj,
     std::span<const slice> slices,

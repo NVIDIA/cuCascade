@@ -56,9 +56,7 @@ namespace cucascade::io {
  * expands a slice into N physical operations it adds N-1 credits, then every
  * success, failure, or cancellation settles exactly one credit. The first
  * error stops further dispatch immediately, but the future is not fulfilled
- * until all already-published operations have drained. Opt-in engine success may
- * settle after destination copies are enqueued and joined (AM-1); failed futures
- * additionally wait for engine accessor-retirement guards.
+ * until all already-published operations have drained.
  *
  * A successful future resolves with @c bytes_requested, the bytes of the
  * slices as clamped to EOF at dispatch, so a reactor reports a slice as
@@ -69,47 +67,6 @@ namespace cucascade::io {
 class grouped_coordinator final {
  public:
   using error_type = std::variant<std::exception_ptr, cudaError_t, std::error_code>;
-
-  /** Weak registration: retain this token while interested. Callback runs once on the
-   * failing/registering thread, outside coordinator locks; it must be noexcept, nonblocking
-   * and capture only weak backend ownership. Registration after failure fires immediately.
-   * Concurrent token destruction may race an already acquired callback, so weak-lock the
-   * target inside it. Neither the coordinator nor the token keeps a backend alive.
-   */
-  class failure_notification {
-   public:
-    explicit failure_notification(std::function<void()> callback) : _callback(std::move(callback))
-    {
-    }
-    void notify() noexcept
-    {
-      if (!_fired.exchange(true)) {
-        try {
-          _callback();
-        } catch (...) { /* Failure notification cannot throw. */
-        }
-      }
-    }
-
-   private:
-    std::atomic<bool> _fired{false};
-    std::function<void()> _callback;
-  };
-  void register_failure_notification(std::shared_ptr<failure_notification> const& token)
-  {
-    {
-      std::lock_guard lock(_state_mutex);
-      if (should_continue()) {
-        if (_failure_notifications.size() >= _failure_prune_at) {
-          std::erase_if(_failure_notifications, [](auto const& entry) { return entry.expired(); });
-          _failure_prune_at = std::max<std::size_t>(16, _failure_notifications.size() * 2);
-        }
-        _failure_notifications.emplace_back(token);
-        return;
-      }
-    }
-    token->notify();
-  }
 
   grouped_coordinator(std::size_t bytes_requested, std::size_t initial_tasks)
     : _bytes_requested(bytes_requested), _tasks_remaining(initial_tasks)
@@ -157,17 +114,6 @@ class grouped_coordinator final {
 
   void on_complete() noexcept { settle_one(); }
 
-  /// Engine success credits may settle at enqueue (AM-1). If a sibling fails, however,
-  /// the failed future must not let the caller free destinations still touched by those
-  /// successful copies. Register before handoff and release only after physical retirement.
-  void retain_async_access() noexcept { _async_accessors.fetch_add(1); }
-  void release_async_access() noexcept
-  {
-    auto const previous = _async_accessors.fetch_sub(1, std::memory_order_acq_rel);
-    assert(previous != 0);
-    if (previous == 1) resolve_if_ready();
-  }
-
   void report_error(error_type const& error,
                     std::source_location loc = std::source_location::current()) noexcept
   {
@@ -184,15 +130,9 @@ class grouped_coordinator final {
         converted = std::current_exception();
       }
 
-      std::vector<std::weak_ptr<failure_notification>> notifications;
-      {
-        std::lock_guard lock(_state_mutex);
-        assert(_first_exception == nullptr);
-        _first_exception = std::move(converted);
-        notifications.swap(_failure_notifications);
-      }
-      for (auto const& weak : notifications)
-        if (auto token = weak.lock()) token->notify();
+      std::lock_guard lock(_state_mutex);
+      assert(_first_exception == nullptr);
+      _first_exception = std::move(converted);
     }
     settle_one();
   }
@@ -249,7 +189,6 @@ class grouped_coordinator final {
       if (_tasks_remaining.load(std::memory_order_acquire) != 0 || !_future_taken || _fulfilled) {
         return;
       }
-      if (_first_exception && _async_accessors.load(std::memory_order_acquire) != 0) return;
       _fulfilled = true;
       error      = _first_exception;
     }
@@ -264,11 +203,8 @@ class grouped_coordinator final {
   std::size_t const _bytes_requested;
   std::atomic<std::size_t> _tasks_remaining;
   std::atomic<bool> _continue{true};
-  std::atomic<std::size_t> _async_accessors{0};
 
   mutable std::mutex _state_mutex;
-  std::vector<std::weak_ptr<failure_notification>> _failure_notifications;
-  std::size_t _failure_prune_at{16};
   std::exception_ptr _first_exception;
   bool _future_taken{false};
   bool _fulfilled{false};

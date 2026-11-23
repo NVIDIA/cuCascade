@@ -29,6 +29,12 @@
 
 #include <liburing.h>
 
+// <liburing.h> includes <linux/fs.h>, whose BLOCK_SIZE macro breaks the moodycamel queue a
+// header included after this one may bring in.  Nothing here uses it.
+#ifdef BLOCK_SIZE
+#undef BLOCK_SIZE
+#endif
+
 #include <array>
 #include <filesystem>
 #include <memory>
@@ -66,13 +72,13 @@ inline constexpr std::array<disk_io_backend, 3> disk_test_backends{
 }
 
 /**
- * @brief make_disk_io_context() for @p backend, or null when that backend cannot run in this
- *        process: only uring where io_uring is forbidden. Any other failure propagates, so a
+ * @brief make_disk_io_context() for @p backend, or null when it cannot run in this process:
+ *        io_uring, which every backend needs, is forbidden. Any other failure propagates, so a
  *        backend regression fails the test instead of skipping it.
  */
 [[nodiscard]] inline std::shared_ptr<io::ioctx> try_make_disk_io_context(disk_io_backend backend)
 {
-  if (backend == disk_io_backend::uring && !io_uring_usable()) { return nullptr; }
+  if (!io_uring_usable()) { return nullptr; }
   disk_io_context_options options;
   options.backend = backend;
   return make_disk_io_context(options);

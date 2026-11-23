@@ -20,18 +20,15 @@
 #include <cucascade/cudf/disk_io_context.hpp>
 #ifdef CUCASCADE_HAS_CUFILE
 #include <cucascade/io/cufile/cufile_ioctx.hpp>
-#include <cucascade/io/cufile/platform.hpp>
 #endif
 #include <cucascade/io/io_context.hpp>
 #include <cucascade/io/uring/uring_ioctx.hpp>
-#include <cucascade/log/logging.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/numa_region_pinned_host_allocator.hpp>
 
 #include <liburing.h>
 
 #include <cstddef>
-#include <cstring>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -118,21 +115,7 @@ class owning_uring_reactor_context final : private owned_uring_staging,
 {
   if (requested != disk_io_backend::automatic) { return requested; }
   if (detail::gds_is_available()) { return disk_io_backend::cufile; }
-  if (uring_setup_errno() == 0) { return disk_io_backend::uring; }
-#ifdef CUCASCADE_HAS_CUFILE
-  // The cuFile reactor needs no io_uring ring: without GDS it serves every transfer with POSIX
-  // I/O (staged through its own pinned scratch for device data).
-  CUCASCADE_LOG_WARN(
-    "disk tier: io_uring is unavailable in this process ({}); DISK spaces without an explicit io "
-    "context use the cuFile reactor's POSIX path",
-    std::strerror(uring_setup_errno()));
-  return disk_io_backend::cufile;
-#else
-  throw std::system_error(uring_setup_errno(),
-                          std::generic_category(),
-                          "make_disk_io_context: io_uring is unavailable in this process and "
-                          "this build has no cuFile backend to fall back to");
-#endif
+  return disk_io_backend::uring;
 }
 
 void validate(disk_io_context_options const& options, disk_io_backend backend)
@@ -141,7 +124,8 @@ void validate(disk_io_context_options const& options, disk_io_backend backend)
   if (backend == disk_io_backend::uring && cfg.uring_n_reactors == 0) {
     throw std::invalid_argument("make_disk_io_context: io.uring_n_reactors must be at least 1");
   }
-  if (backend == disk_io_backend::uring && uring_setup_errno() != 0) {
+  // The cuFile reactors serve host I/O through an io_uring reactor of their own.
+  if (uring_setup_errno() != 0) {
     throw std::system_error(uring_setup_errno(),
                             std::generic_category(),
                             "make_disk_io_context: io_uring is unavailable in this process "
@@ -157,8 +141,8 @@ void validate(disk_io_context_options const& options, disk_io_backend backend)
   switch (backend) {
     case disk_io_backend::cufile: {
 #ifdef CUCASCADE_HAS_CUFILE
-      // As the scan factory builds it: 0 reactors plans a pinned group per GPU.
-      return io::cufile::make_cufile_ioctx(cfg.cufile_n_reactors, cfg.cufile);
+      // As the scan factory builds it: a reactor per GPU.
+      return std::make_shared<io::cufile::cufile_ioctx>(cfg.cufile);
 #else
       throw std::invalid_argument(
         "make_disk_io_context: the cufile backend was requested but this build has no cufile.h");
@@ -196,26 +180,7 @@ std::shared_ptr<io::ioctx> make_disk_io_context(disk_io_context_options const& o
   if (!context) {
     throw std::runtime_error("make_disk_io_context: failed to build the io context");
   }
-  try {
-    context->start();
-  } catch (std::system_error const& error) {
-#ifdef CUCASCADE_HAS_CUFILE
-    // The one-entry probe passed, but a reactor could not set up its own ring
-    // (larger depth, setup flags, memlock limits): for automatic that is still
-    // "io_uring unavailable" -- fall back to the cuFile reactor's POSIX path.
-    if (options.backend == disk_io_backend::automatic && backend == disk_io_backend::uring) {
-      CUCASCADE_LOG_WARN(
-        "disk tier: io_uring reactors could not start ({}); DISK spaces without an explicit io "
-        "context use the cuFile reactor's POSIX path",
-        error.what());
-      context.reset();
-      context = build_context(options, disk_io_backend::cufile);
-      context->start();
-      return context;
-    }
-#endif
-    throw;
-  }
+  context->start();
   return context;
 }
 

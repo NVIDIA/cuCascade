@@ -19,6 +19,8 @@
 #include <cucascade/io/cache/types.hpp>
 #include <cucascade/io/templated_ioctx.hpp>
 
+#include <cuda_runtime_api.h>
+
 #include <catch2/catch_all.hpp>
 
 #include <algorithm>
@@ -35,6 +37,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <span>
 #include <stop_token>
 #include <string>
@@ -302,6 +305,44 @@ struct reactor_pool {
 };
 
 }  // namespace
+
+TEST_CASE("per-thread default streams resolve to recycled stand-in streams",
+          "[io][templated_ioctx][gpu]")
+{
+  int devices = 0;
+  if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) {
+    std::ignore = cudaGetLastError();
+    SKIP("requires a CUDA device");
+  }
+  std::uint8_t byte{};  // named, never touched
+  auto const resolve = [&](std::size_t count) {
+    std::vector<cucascade::io::prepared_io_slice> slices;
+    for (std::size_t i = 0; i < count; ++i) {
+      slices.emplace_back(
+        cucascade::io::range{i, 1},
+        cucascade::io::device_buffer{&byte, ::cuda::stream_ref{cudaStreamPerThread}, 0});
+    }
+    cucascade::io::detail::resolve_default_streams(slices);
+    return slices;
+  };
+
+  // The slices of one call share one stand-in ...
+  auto const pair = resolve(2);
+  CHECK(pair[0].d_buffer.stream.get() != cudaStreamPerThread);
+  CHECK(pair[0].d_buffer.stream == pair[1].d_buffer.stream);
+  CHECK(pair[0].d_buffer.stream_owner != nullptr);
+  // ... and a call made while they hold it gets another.
+  auto const other = resolve(1);
+  CHECK(other[0].d_buffer.stream != pair[0].d_buffer.stream);
+
+  // A stand-in is back in its device's pool with its last slice: the calls
+  // that follow reuse the pool's streams instead of creating one each.
+  std::set<cudaStream_t> seen;
+  for (int call = 0; call < 200; ++call) {
+    seen.insert(resolve(1)[0].d_buffer.stream.get());
+  }
+  CHECK(seen.size() <= 16);
+}
 
 TEST_CASE("next_reactor sends a read to the two least-backlogged reactors",
           "[io][templated_ioctx][next_reactor]")

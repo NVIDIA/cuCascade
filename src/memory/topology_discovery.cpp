@@ -1357,4 +1357,21 @@ void topology_discovery::discover_runtime_attributes(system_topology_info& topol
   }
 }
 
+system_topology_info const& process_topology()
+{
+  static system_topology_info const topology = [] {
+    try {
+      topology_discovery discovery;
+      if (discovery.discover(NetworkDeviceVerification::EXISTS_ACTIVE)) {
+        return discovery.get_topology();
+      }
+    } catch (std::exception const& e) {
+      CUCASCADE_LOG_WARN("topology discovery failed ({}); I/O reactors are not NUMA-placed",
+                         e.what());
+    }
+    return system_topology_info{};
+  }();
+  return topology;
+}
+
 }  // namespace cucascade::memory
