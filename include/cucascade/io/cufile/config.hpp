@@ -51,6 +51,34 @@ struct config {
   /// Most of such a read that may be gaps.
   double coalesce_gap_ratio{0.15};
 
+  /// Register every lane slot of the arena with cuFile on its own (cuFileBufRegister per slot)
+  /// instead of the arena as one buffer.  cuFile's GPFS / WekaFS userspace-RDMA path serves a read
+  /// directly only while its registration has no other I/O in flight and bounces the rest through
+  /// its GPU bounce pool (plus a GPU->GPU copy); a lane owns its slot for one read at a time, so a
+  /// registration per slot keeps every read on the direct path.  false = one registration.
+  bool register_per_slot{true};
+
+  /// Create the lanes' streams (the slot -> destination copies) at the device's greatest stream
+  /// priority, so those copies are not queued behind the caller's compute (e.g. parquet decode);
+  /// a lane holds its slot, and so its read depth, until its copy has drained.
+  bool high_priority_copies{true};
+
+  /// Read slots in the arena for every read lane (at least 1).  With @c async_copies a lane reads
+  /// into one slot while the copy out of its previous slot is still draining, so 2 lets every lane
+  /// start its next read the moment its last one returns.
+  std::size_t read_slots_per_lane{2};
+
+  /// Hand a read segment's slot -> destination copies to the reactor's completion thread, which
+  /// gives the slot back and settles the segment once they have finished, instead of the lane
+  /// waiting for them: a lane only ever blocks inside cuFileRead (or for a free slot).  false = the
+  /// lane drains its copies before it takes the next segment.
+  bool async_copies{true};
+
+  /// How long the completion thread sleeps between polls when none of the copies it watches has
+  /// finished, in microseconds.  It never blocks on one copy, so a copy stalled behind its
+  /// caller's stream does not hold up the settlement of the others.
+  std::size_t copy_poll_us{10};
+
   /// The GPUs to serve, one reactor each; empty serves every visible GPU.
   std::vector<int> devices;
 
@@ -62,8 +90,12 @@ struct config {
   /// request -- one page for a local NVMe syscall.
   [[nodiscard]] std::size_t merge_gap_size() const noexcept { return io::IO_BLOCK_SIZE; }
 
-  /// Registered device memory one reactor (one GPU) holds: a slot per lane.
-  [[nodiscard]] std::size_t arena_bytes() const noexcept { return 2 * lanes * lane_bytes; }
+  /// Registered device memory one reactor (one GPU) holds: @c read_slots_per_lane read slots and
+  /// one write slot per lane.
+  [[nodiscard]] std::size_t arena_bytes() const noexcept
+  {
+    return (read_slots_per_lane + 1) * lanes * lane_bytes;
+  }
 };
 
 }  // namespace cucascade::io::cufile

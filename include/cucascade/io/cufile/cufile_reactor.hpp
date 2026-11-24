@@ -24,6 +24,7 @@
 #include <cucascade/io/types.hpp>
 #include <cucascade/io/uring/uring_reactor.hpp>
 
+#include <cuda_runtime_api.h>
 #include <sys/types.h>
 
 #include <atomic>
@@ -90,8 +91,12 @@ class cufile_io_object final : public uring::local_io_object {
  * A device request is cut into segments of at most one slot at submission:
  *  - read: the destinations of a request that lie close together share one
  *    segment (see @c config::coalesce_gap_bytes).  A lane reads the segment's
- *    page-aligned window into its slot, then copies each destination's bytes
- *    out of the slot.
+ *    page-aligned window into its slot, then queues the copies of each
+ *    destination's bytes out of the slot.  With @c config::async_copies it hands
+ *    the slot and the segment to the reactor's completion thread -- which gives
+ *    the slot back and settles the segment once the copies have finished -- and
+ *    takes another slot for its next read at once (the arena holds
+ *    @c config::read_slots_per_lane read slots per lane).
  *  - write: a lane copies the source bytes into its slot and writes the
  *    granule-aligned body from there; an unaligned head and tail are written by
  *    the host reactor.
@@ -234,14 +239,21 @@ class cufile_reactor {
   struct gate_pool;
   struct lane;
   struct lane_set;
+  struct copy_job;
+  struct completer;
 
   /// Cut a device request into the segments its lanes will serve.
   [[nodiscard]] std::vector<segment> plan(grouped_io_request const& request) const;
   /// The loop of lane @p self: serve the segments of @p set until it stops.
   void run(lane_set& set, lane& self);
-  /// Serve @p work through the arena slot at offset @p slot.
-  void read_segment(lane& self, std::size_t slot, segment const& work);
+  /// Serve @p work through the arena slot at offset @p slot.  Returns true when it handed the
+  /// slot and @p work (moved from) to the completion thread, false when the read is done.
+  bool read_segment(lane& self, std::size_t slot, segment& work);
   void write_segment(lane& self, std::size_t slot, segment const& work);
+  /// The loop of the completion thread: settle read segments as their copies finish.
+  void complete_copies();
+  /// Give @p job's slot back and settle (or, for a failed copy, fail) its segment.
+  void finish_copy(copy_job& job, cudaError_t status) noexcept;
 
   config _config;
   int _device;
@@ -252,6 +264,9 @@ class cufile_reactor {
   std::unique_ptr<gate_pool> _gates;
   std::unique_ptr<lane_set> _readers;
   std::unique_ptr<lane_set> _writers;
+  /// The copy-done events of read segments in flight, recycled like the gates.
+  std::unique_ptr<gate_pool> _copy_events;
+  std::unique_ptr<completer> _completer;
   std::atomic<std::size_t> _queued_bytes{0};
   std::atomic<std::uint64_t> _reads{0};
   std::atomic<std::uint64_t> _bytes_read{0};
