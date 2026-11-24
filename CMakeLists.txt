@@ -344,11 +344,14 @@ if(CUCASCADE_WARNINGS_AS_ERRORS)
   list(APPEND CUCASCADE_CXX_WARNING_FLAGS -Werror)
 endif()
 
-# Warning flags for CUDA (passed to host compiler via -Xcompiler)
+# Warning flags for CUDA (passed to host compiler via -Xcompiler). -Wpedantic is left out: the
+# host compiler sees nvcc's preprocessed output, whose line markers it reports as a GCC extension.
 set(CUCASCADE_CUDA_WARNING_FLAGS)
 foreach(flag ${CUCASCADE_CXX_WARNING_FLAGS})
-  list(APPEND CUCASCADE_CUDA_WARNING_FLAGS
-       "$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=${flag}>")
+  if(NOT flag STREQUAL "-Wpedantic")
+    list(APPEND CUCASCADE_CUDA_WARNING_FLAGS
+         "$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=${flag}>")
+  endif()
 endforeach()
 
 # =============================================================================
