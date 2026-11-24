@@ -185,6 +185,63 @@ TEST_CASE("a reclaimed chunk goes back to the lowest priority", "[cache][evictio
   CHECK(cache.claimed_bytes() == after + range_bytes);
 }
 
+TEST_CASE("a refill restores the priority a reclaim cleared", "[cache][eviction][explicit]")
+{
+  constexpr std::size_t range_bytes = 16 * mib;
+  cache_test_fixture fixture{allocation_cache_config()};
+  auto& cache      = checked_cache(fixture);
+  auto cache_range = [&](std::size_t offset, std::uint8_t eviction_priority) {
+    auto source = fixture.open(object_path, 4 * range_bytes);
+    REQUIRE(source != nullptr);
+    advise_range(*source, offset, range_bytes, eviction_priority);
+    REQUIRE(source->prepare_prefetch(false) == prepare_result::prepared);
+  };
+  cache_range(0, /*eviction_priority=*/5);
+  {
+    // A request names the cached range at priority 5, and a forced reclaim then empties its chunks
+    // before the request prepares, clearing their priority.
+    auto source = fixture.open(object_path, 4 * range_bytes);
+    REQUIRE(source != nullptr);
+    advise_range(*source, 0, range_bytes, /*eviction_priority=*/5);
+    REQUIRE(cache.reclaim(reclaim_mode::forced, std::numeric_limits<std::size_t>::max()) >=
+            range_bytes);
+    REQUIRE(cache.claimed_bytes() == 0);
+    // The refill raises them back to 5.
+    REQUIRE(source->prepare_prefetch(false) == prepare_result::prepared);
+  }
+  // Cached after the refill at priority 0, so oldest-first order alone would keep it.
+  cache_range(range_bytes, /*eviction_priority=*/0);
+  auto const claimed = cache.claimed_bytes();
+  REQUIRE(claimed >= 2 * range_bytes);
+
+  cache.evict(range_bytes);
+  REQUIRE(wait_for_cache([&] { return cache.claimed_bytes() <= claimed - range_bytes; }, 2s));
+
+  auto const after = cache.claimed_bytes();
+  cache_range(0, /*eviction_priority=*/5);
+  CHECK(cache.claimed_bytes() == after);
+  cache_range(range_bytes, /*eviction_priority=*/0);
+  CHECK(cache.claimed_bytes() == after + range_bytes);
+}
+
+TEST_CASE("the cache rejects an eviction batch fraction outside (0, 1]",
+          "[cache][eviction][explicit]")
+{
+  auto const fraction         = GENERATE(0.0, -0.25, 1.5, std::numeric_limits<double>::quiet_NaN());
+  auto cfg                    = allocation_cache_config();
+  cfg.eviction_batch_fraction = fraction;
+  cache_test_fixture fixture{cfg};
+  CHECK(fixture.context->cache() == nullptr);
+}
+
+TEST_CASE("the cache accepts an eviction batch fraction of 1", "[cache][eviction][explicit]")
+{
+  auto cfg                    = allocation_cache_config();
+  cfg.eviction_batch_fraction = 1.0;
+  cache_test_fixture fixture{cfg};
+  CHECK(fixture.context->cache() != nullptr);
+}
+
 TEST_CASE("blocking prepare waits for earlier asynchronous eviction before retrying",
           "[cache][eviction][explicit][prepare]")
 {

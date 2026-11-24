@@ -1003,21 +1003,28 @@ struct cached_chunk {
   /// node of the buffer taken.  Not reset when the buffer is reclaimed.
   std::atomic<std::int32_t> numa_node{-1};
   /// Eviction priority: the evictor reclaims lower values first. Raised (never lowered) by every
-  /// request that names the chunk, and back to 0 once its buffer is reclaimed (see
-  /// @ref reset_eviction_priority).
+  /// request that names the chunk, cleared by whoever reclaims its buffer, and raised again by each
+  /// request when it attaches buffers to its chunks, so a raise that a reclaim cleared is restored
+  /// by the refill.
   std::atomic<std::uint8_t> eviction_priority{0};
 
   /// Number of distinct values of @ref eviction_priority.
   static constexpr std::size_t eviction_priority_levels =
     std::size_t{std::numeric_limits<std::uint8_t>::max()} + 1;
 
-  /// Return the priority to 0 after this thread claimed the chunk's buffer, unless a request
-  /// raised it since @p seen was read: that request is about to refill the chunk, and its
-  /// priority stands.
-  void reset_eviction_priority(std::uint8_t seen) noexcept
+  /// Raise the priority to @p priority if it is lower.
+  void raise_eviction_priority(std::uint8_t priority) noexcept
   {
-    std::ignore =
-      eviction_priority.compare_exchange_strong(seen, std::uint8_t{0}, std::memory_order_relaxed);
+    auto cur = eviction_priority.load(std::memory_order_relaxed);
+    while (cur < priority &&
+           !eviction_priority.compare_exchange_weak(cur, priority, std::memory_order_relaxed)) {}
+  }
+
+  /// Return the priority to 0. Only the thread that holds the chunk in `evicting` calls this,
+  /// before @c mark_empty, so no new buffer (and no refill's raise) can be attached yet.
+  void clear_eviction_priority() noexcept
+  {
+    eviction_priority.store(std::uint8_t{0}, std::memory_order_relaxed);
   }
 };
 

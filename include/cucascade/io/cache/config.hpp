@@ -118,7 +118,7 @@ struct config {
 
   /// Share of the pool's allocated chunks the evictor frees in one pass once it starts evicting
   /// (the default 0.25 frees a quarter of the cache at a time; a smaller value evicts just enough
-  /// to stay under the threshold).
+  /// to stay under the threshold). Must be in (0, 1]; @c fs_cache rejects anything else.
   double eviction_batch_fraction{0.25};
 
   /// Derived from @ref eviction by @ref apply_mode; not settable on its own.
