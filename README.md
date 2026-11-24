@@ -154,7 +154,6 @@ pre-commit autoupdate
 
 ## Support
 
-- Level: Experimental
 - How to get help: GitHub Issues
 - For NVIDIA product security concerns: https://www.nvidia.com/en-us/security
 
