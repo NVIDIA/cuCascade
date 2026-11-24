@@ -153,7 +153,8 @@ std::unique_ptr<advising_reader> scan_cache::open(std::string const& path)
   auto object = _state->objects.find_or_open(
     path, [&] { return _state->context->open_io_object(path, open_hint::parquet_footer_probe); });
   // The reader's context shares ownership of the whole cache, so the reader may outlive this
-  // object.
+  // object. The aliasing pointer keeps `state` alive, not the context alone: it is safe only while
+  // everything the context borrows (the reservation manager, the registry) is owned by `state`.
   return std::make_unique<advising_reader>(std::shared_ptr<ioctx>(_state, _state->context.get()),
                                            std::move(object),
                                            _state->admission,

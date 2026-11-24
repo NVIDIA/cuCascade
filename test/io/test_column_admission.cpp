@@ -26,6 +26,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <vector>
 
 namespace {
@@ -332,7 +333,55 @@ TEST_CASE("a malformed layout is rejected", "[cache][admission]")
   std::array<std::uint64_t, 1> const wrapping{std::numeric_limits<std::uint64_t>::max() - 9};
   CHECK_THROWS_AS(policy.register_layout("f1", "t", columns, column_of_chunk, wrapping, sizes),
                   std::invalid_argument);
+  // A range that does not wrap but ends past the largest signed 64-bit offset.
+  std::array<std::uint64_t, 1> const past_int64{
+    static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()) - 5};
+  CHECK_THROWS_AS(policy.register_layout("f1", "t", columns, column_of_chunk, past_int64, sizes),
+                  std::invalid_argument);
   CHECK_FALSE(policy.has_layout("f1"));
+}
+
+TEST_CASE("a read that does not fit a signed 64-bit range is rejected", "[cache][admission]")
+{
+  constexpr auto max = static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max());
+  column_admission policy(config(1 << 20));
+  register_file(policy, "f1");
+  for (std::string const path : {"f1", "other"}) {
+    CHECK_THROWS_AS(policy.advise(path, 0, max + 1, object_size), std::invalid_argument);
+    CHECK_THROWS_AS(policy.advise(path, max - 5, 10, object_size), std::invalid_argument);
+    CHECK_THROWS_AS(policy.advise(path, 0, 10, max + 1), std::invalid_argument);
+  }
+  // A read that ends exactly at the largest offset is widened without overflowing.
+  auto const advice = policy.advise("other", max - 10, 10, max);
+  REQUIRE(advice.ranges.size() == 1);
+  CHECK(static_cast<std::uint64_t>(advice.ranges[0].offset() + advice.ranges[0].size()) == max);
+}
+
+TEST_CASE("a chunk covered by more than 65535 admitted pieces is counted once",
+          "[cache][admission]")
+{
+  // One-byte columns, all in the first cache chunk, and a budget of that one chunk. Each is read
+  // on its own, so a wrapped count shows as a refusal as soon as it wraps.
+  constexpr std::uint32_t n_columns = 65540;
+  constexpr std::size_t big_chunk   = 1 << 20;
+  column_admission policy(
+    {.budget_bytes = big_chunk, .chunk_bytes = big_chunk, .rank_margin = 1.5});
+  std::vector<std::string> columns;
+  std::vector<std::uint32_t> column_of_chunk;
+  std::vector<std::uint64_t> offsets;
+  std::vector<std::uint64_t> const sizes(n_columns, 1);
+  for (std::uint32_t c = 0; c < n_columns; ++c) {
+    columns.push_back("c" + std::to_string(c));
+    column_of_chunk.push_back(c);
+    offsets.push_back(c);
+  }
+  policy.register_layout("f1", "t", columns, column_of_chunk, offsets, sizes);
+  for (std::uint32_t c = 0; c < n_columns; ++c) {
+    std::ignore = policy.advise("f1", c, 1, big_chunk);
+  }
+  auto const all = policy.stats();
+  REQUIRE(all.size() == n_columns);
+  CHECK(std::ranges::all_of(all, [](column_stats const& s) { return s.refused == 0; }));
 }
 
 TEST_CASE("a zero chunk size is rejected", "[cache][admission]")

@@ -771,6 +771,65 @@ TEST_CASE("a host read of several cold chunks fills them with one backend slice"
   CHECK(holds_pattern(again, span_offset));
 }
 
+TEST_CASE("a merged host fill completed one backend read at a time copies only finished chunks",
+          "[cache][read-arbitration][fill-merge]")
+{
+  if (run_in_child("CUCASCADE_CACHE_ARBITRATION_CHILD", 30s)) { return; }
+  arbitration_fixture fixture;
+  advise_range(*fixture.datasource, span_offset, span_size);
+  REQUIRE(fixture.datasource->prepare_prefetch(false) == prepare_result::prepared);
+  std::vector<std::uint8_t> destination(span_size, 0);
+  held_request fill;
+  read_cleanup cleanup{*fixture.context, {&fill, nullptr}};
+  auto read = launched(
+    fixture.datasource->host_read_async(span_offset, destination.size(), destination.data()));
+  fill.request = fixture.context->backend().wait_take(2s);
+  check_one_slice(fill, span_offset, span_size);
+
+  // Complete the slice as a reactor that split it into two reads does: each completion names only
+  // the chunks its read filled. The last two chunks hold bytes no read has written yet.
+  auto slice        = fill.request->take_front();
+  auto const chunks = slice.h_buffer.fragments();
+  REQUIRE(chunks.size() == 4);
+  auto const fill_chunks = [&](std::size_t begin, std::size_t end) {
+    for (auto i = begin; i < end; ++i) {
+      auto* chunk = chunks[i];
+      auto const piece =
+        cucascade::io::intersect(cucascade::io::range{slice.offset(), slice.size()},
+                                 cucascade::io::range{chunk->offset, controlled_chunk_bytes});
+      for (auto offset = piece.offset; offset < piece.end(); ++offset) {
+        chunk->data[offset - chunk->offset] = pattern(offset);
+      }
+    }
+  };
+  for (auto i = 2; i < 4; ++i) {
+    std::fill_n(chunks[i]->data, controlled_chunk_bytes, std::uint8_t{0xee});
+  }
+  fill.request->coordinator->add_tasks(1);
+  fill_chunks(0, 2);
+  (*slice.on_complete)(chunks.subspan(0, 2), true);
+  fill.request->coordinator->on_complete();
+
+  // Only the finished chunks are copied and cached; the read is still waiting.
+  CHECK(read.wait_for(50ms) == std::future_status::timeout);
+  auto const split = chunks[2]->offset - span_offset;
+  CHECK(holds_pattern(std::span{destination}.first(split), span_offset));
+  CHECK(std::ranges::all_of(std::span{destination}.subspan(split),
+                            [](auto byte) { return byte == 0; }));
+  for (auto i = 0; i < 4; ++i) {
+    CHECK((chunks[i]->state.load().state() == cucascade::io::cache::chunk_state::cached) ==
+          (i < 2));
+  }
+
+  fill_chunks(2, 4);
+  (*slice.on_complete)(chunks.subspan(2, 2), true);
+  fill.request->coordinator->on_complete();
+  fill.request.reset();
+  REQUIRE(read.wait_for(2s) == std::future_status::ready);
+  CHECK(read.get() == destination.size());
+  CHECK(holds_pattern(destination, span_offset));
+}
+
 TEST_CASE("a multi-range host read does not merge fills across its ranges",
           "[cache][read-arbitration][fill-merge]")
 {

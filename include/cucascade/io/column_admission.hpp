@@ -113,7 +113,7 @@ class column_admission {
    * @param offsets For each column chunk, its byte offset in the file.
    * @param sizes For each column chunk, its size in bytes.
    * @throws std::invalid_argument If the arrays differ in length, a column index is out of range,
-   * or a column chunk's end overflows.
+   * or a column chunk's end does not fit in a signed 64-bit offset.
    */
   void register_layout(std::string const& path,
                        std::string const& table,
@@ -133,6 +133,8 @@ class column_admission {
    * admitted parts are returned. For an unregistered file the whole read is advised.
    *
    * @param object_bytes Size of the object, to clip the chunk-aligned ranges.
+   * @throws std::invalid_argument If the read's end or @p object_bytes does not fit in a signed
+   * 64-bit offset.
    */
   [[nodiscard]] admission_advice advise(std::string const& path,
                                         std::uint64_t offset,
@@ -155,7 +157,7 @@ class column_admission {
     std::uint32_t file;             // index of the file in registration order
     std::vector<segment> segments;  // sorted by offset
     /// For each cache chunk of the file, how many admitted pieces cover it.
-    std::vector<std::uint16_t> chunk_refs;
+    std::vector<std::uint32_t> chunk_refs;
   };
   struct column_state {
     std::string name;

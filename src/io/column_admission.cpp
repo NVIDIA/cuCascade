@@ -32,6 +32,14 @@ namespace {
 /// no ranked column.
 constexpr double max_eviction_priority = 250.0;
 
+/// Whether [@p offset, @p offset + @p size) can be held by a @c byte_range, whose offset and size
+/// are signed 64-bit.
+constexpr bool fits_offset(std::uint64_t offset, std::uint64_t size) noexcept
+{
+  constexpr auto max = static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max());
+  return offset <= max && size <= max - offset;
+}
+
 }  // namespace
 
 column_admission::column_admission(column_admission_config config) : _config(config)
@@ -106,7 +114,7 @@ void column_admission::register_layout(std::string const& path,
     throw std::invalid_argument("column_admission: column index out of range");
   }
   for (std::size_t k = 0; k < offsets.size(); ++k) {
-    if (sizes[k] > std::numeric_limits<std::uint64_t>::max() - offsets[k]) {
+    if (!fits_offset(offsets[k], sizes[k])) {
       throw std::invalid_argument("column_admission: column chunk range overflows");
     }
   }
@@ -224,6 +232,9 @@ admission_advice column_admission::advise(std::string const& path,
                                           std::uint64_t size,
                                           std::uint64_t object_bytes)
 {
+  if (!fits_offset(offset, size) || !fits_offset(object_bytes, 0)) {
+    throw std::invalid_argument("column_admission: read range overflows");
+  }
   admission_advice advice;
   std::vector<byte_range> wanted;
 
@@ -262,12 +273,16 @@ admission_advice column_admission::advise(std::string const& path,
     }
   }
 
-  // Widen to whole cache chunks (clipped to the object) and merge ranges that now touch.
-  auto const chunk  = static_cast<std::int64_t>(_config.chunk_bytes);
+  // Widen to whole cache chunks (clipped to the object) and merge ranges that now touch. Every end
+  // is at most INT64_MAX (checked above), so rounding it up in unsigned arithmetic cannot wrap.
+  auto const chunk  = _config.chunk_bytes;
   auto const object = static_cast<std::int64_t>(object_bytes);
   for (auto const& range : wanted) {
-    auto begin = range.offset() / chunk * chunk;
-    auto end   = std::min((range.offset() + range.size() + chunk - 1) / chunk * chunk, object);
+    auto const range_end = static_cast<std::uint64_t>(range.offset() + range.size());
+    auto begin =
+      static_cast<std::int64_t>(static_cast<std::uint64_t>(range.offset()) / chunk * chunk);
+    auto end = static_cast<std::int64_t>(
+      std::min((range_end + chunk - 1) / chunk * chunk, static_cast<std::uint64_t>(object)));
     if (!advice.ranges.empty()) {
       auto const& last = advice.ranges.back();
       if (begin <= last.offset() + last.size()) {

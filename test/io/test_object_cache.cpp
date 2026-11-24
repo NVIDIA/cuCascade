@@ -106,3 +106,53 @@ TEST_CASE("concurrent first opens of a path share one open", "[io][object_cache]
   }
   CHECK(seen[7]->object_path() == "s3://b/7");
 }
+
+TEST_CASE("callers waiting on a failed open get its error, and later opens do not hang",
+          "[io][object_cache]")
+{
+  constexpr int n_waiters = 4;
+  auto const object       = std::make_shared<fake_object>("s3://b/a");
+  for (int round = 0; round < 50; ++round) {
+    object_cache cache;
+    std::atomic<bool> opening{false};
+    std::atomic<int> waiting{0};
+    std::thread opener([&] {
+      CHECK_THROWS_WITH(
+        cache.find_or_open("s3://b/a",
+                           [&]() -> std::shared_ptr<io_object> {
+                             opening = true;
+                             while (waiting.load() < n_waiters) {
+                               std::this_thread::yield();
+                             }
+                             // Vary how far the waiters are into their wait.
+                             std::this_thread::sleep_for(std::chrono::microseconds{round * 20});
+                             throw std::runtime_error("unreachable endpoint");
+                           }),
+        "unreachable endpoint");
+    });
+    while (!opening.load()) {
+      std::this_thread::yield();
+    }
+    // Each waiter either waits on the failed open and gets its error, or, arriving after it was
+    // dropped, opens again itself. None sees a broken promise or blocks for good.
+    std::vector<std::thread> waiters;
+    std::atomic<int> errors{0};
+    std::atomic<int> reopened{0};
+    for (int w = 0; w < n_waiters; ++w) {
+      waiters.emplace_back([&] {
+        ++waiting;
+        try {
+          if (cache.find_or_open("s3://b/a", [&] { return object; }) == object) { ++reopened; }
+        } catch (std::runtime_error const& e) {
+          if (std::string{e.what()} == "unreachable endpoint") { ++errors; }
+        }
+      });
+    }
+    opener.join();
+    for (auto& waiter : waiters) {
+      waiter.join();
+    }
+    CHECK(errors.load() + reopened.load() == n_waiters);
+    CHECK(cache.find_or_open("s3://b/a", [&] { return object; }) == object);
+  }
+}
