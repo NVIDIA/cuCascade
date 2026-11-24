@@ -88,6 +88,7 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
   # IO test executable - links the cudf-free cucascade-io datasource layer.
   add_executable(
     cucascade_io_tests
+    exec/test_thread_util.cpp
     io/test_advising_reader.cpp
     io/test_column_admission.cpp
     io/test_datasource_registry.cpp
@@ -204,7 +205,7 @@ endif()
 add_executable(
   cucascade_topology_discovery_tests
   memory/test_topology_discovery.cpp memory/test_net_topology.cpp
-  unittest_topology_discovery.cpp)
+  memory/test_cpu_constraints.cpp unittest_topology_discovery.cpp)
 set_target_properties(cucascade_topology_discovery_tests
                       PROPERTIES CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
 

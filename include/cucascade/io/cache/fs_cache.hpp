@@ -142,6 +142,8 @@ struct prefetch_request {
   /// Preferred NUMA node for the staging buffers, derived from the requesting
   /// GPU's topology.  -1 means "no preference" (allocate from any arena).
   int preferred_numa{-1};
+  /// Eviction priority the request gives the chunks it names (see @c cached_chunk).
+  std::uint8_t eviction_priority{0};
   /// Eviction started by a failed nonblocking prepare. A later blocking retry
   /// waits for this pass rather than requesting the same shortfall twice.
   std::shared_ptr<std::latch> pending_eviction;
