@@ -141,6 +141,8 @@ struct prefetch_request {
   /// Preferred NUMA node for the staging buffers, derived from the requesting
   /// GPU's topology.  -1 means "no preference" (allocate from any arena).
   int preferred_numa{-1};
+  /// Eviction priority the request gives the chunks it names (see @c cached_chunk).
+  std::uint8_t eviction_priority{0};
   /// Eviction started by a failed nonblocking prepare. A later blocking retry
   /// waits for this pass rather than requesting the same shortfall twice.
   std::shared_ptr<std::latch> pending_eviction;
@@ -429,6 +431,14 @@ class fs_cache {
     _before_chunk_materialise = std::move(hook);
   }
 
+  /// Test-only hook run inside @ref prepare after the request has attached buffers to its chunks
+  /// and before it checks that every chunk has one, with no cache lock held, so it may reclaim.
+  /// Configure only while no prepare can run.
+  void set_before_prepare_publish_for_testing(std::function<void()> hook)
+  {
+    _before_prepare_publish = std::move(hook);
+  }
+
   /// Test-only hook run inside @ref reclaim for each chunk the sweep is about to
   /// claim: after the chunk passed the sweep's filters (for a NUMA-scoped
   /// reclaim, including the node hint read before the claim) and before
@@ -543,7 +553,8 @@ class fs_cache {
 
   [[nodiscard]] cache_handle initiate_prefetching_request(const io_object& obj,
                                                           std::span<const byte_range> ranges,
-                                                          std::optional<int> gpu_id = {});
+                                                          std::optional<int> gpu_id      = {},
+                                                          std::uint8_t eviction_priority = 0);
 
   /// Attach staging buffers to @p handle's request, so a following @ref prefetch
   /// has chunks it can claim: a chunk without a buffer cannot be taken for
@@ -632,6 +643,7 @@ class fs_cache {
 
   std::function<void()> _before_prefetch_claim;
   std::function<void()> _before_request_enqueue;
+  std::function<void()> _before_prepare_publish;
   std::function<void()> _before_chunk_materialise;
   std::function<void(cached_chunk const&)> _before_reclaim_claim;
   const config _cfg;

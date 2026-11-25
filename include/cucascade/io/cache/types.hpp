@@ -35,6 +35,7 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <span>
@@ -1001,6 +1002,32 @@ struct cached_chunk {
   /// read is only a hint, and only a read after a successful claim names the
   /// node of the buffer taken.  Not reset when the buffer is reclaimed.
   std::atomic<std::int32_t> numa_node{-1};
+  /// Eviction priority: the evictor reclaims lower values first. Raised (never lowered) by every
+  /// request that names the chunk, cleared by whoever reclaims its buffer, and raised again by each
+  /// request when it attaches buffers to its chunks, so a raise that a reclaim cleared is restored
+  /// by the refill.
+  std::atomic<std::uint8_t> eviction_priority{0};
+
+  /// Number of distinct values of @ref eviction_priority.
+  static constexpr std::size_t eviction_priority_levels =
+    std::size_t{std::numeric_limits<std::uint8_t>::max()} + 1;
+
+  /// Raise the priority to @p priority if it is lower.
+  void raise_eviction_priority(std::uint8_t priority) noexcept
+  {
+    auto cur = eviction_priority.load(std::memory_order_relaxed);
+    while (cur < priority &&
+           !eviction_priority.compare_exchange_weak(cur, priority, std::memory_order_relaxed)) {}
+  }
+
+  /// Return the priority to 0. Only the thread that holds the chunk in `evicting` calls this,
+  /// before @c mark_empty, so no new buffer (and no refill's raise) can be attached yet. Relaxed
+  /// is enough: @c mark_empty is a release, and a refill's @c mark_queued is an acquire that reads
+  /// it, so this store happens before the refill's raise and cannot overwrite it.
+  void clear_eviction_priority() noexcept
+  {
+    eviction_priority.store(std::uint8_t{0}, std::memory_order_relaxed);
+  }
 };
 
 static_assert(std::atomic<std::int32_t>::is_always_lock_free,

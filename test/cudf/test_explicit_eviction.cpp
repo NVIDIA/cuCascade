@@ -33,6 +33,7 @@
 #include <regex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -120,6 +121,173 @@ TEST_CASE("an explicit evict reclaims a disposed request the pressure rule would
   cache.evict(claimed);
   INFO(cache.summary());
   CHECK(wait_for_cache([&] { return cache.claimed_bytes() == 0; }, 2s));
+}
+
+TEST_CASE("an explicit evict reclaims the lowest-priority chunks first",
+          "[cache][eviction][explicit]")
+{
+  constexpr std::size_t range_bytes = 16 * mib;
+  cache_test_fixture fixture{allocation_cache_config()};
+  auto& cache      = checked_cache(fixture);
+  auto cache_range = [&](std::size_t offset, std::uint8_t eviction_priority) {
+    auto source = fixture.open(object_path, 4 * range_bytes);
+    REQUIRE(source != nullptr);
+    advise_range(*source, offset, range_bytes, eviction_priority);
+    REQUIRE(source->prepare_prefetch(false) == prepare_result::prepared);
+  };
+  // The high-priority range is cached first, so oldest-first order alone would evict it first.
+  cache_range(0, /*eviction_priority=*/5);
+  cache_range(range_bytes, /*eviction_priority=*/0);
+  // Advising a range again at a lower priority does not lower it.
+  cache_range(0, /*eviction_priority=*/0);
+  auto const claimed = cache.claimed_bytes();
+  REQUIRE(claimed >= 2 * range_bytes);
+
+  cache.evict(range_bytes);
+  REQUIRE(wait_for_cache([&] { return cache.claimed_bytes() <= claimed - range_bytes; }, 2s));
+
+  // Asking for a range again claims staging memory only if its chunks were evicted.
+  auto const after = cache.claimed_bytes();
+  cache_range(0, /*eviction_priority=*/5);
+  CHECK(cache.claimed_bytes() == after);
+  cache_range(range_bytes, /*eviction_priority=*/0);
+  CHECK(cache.claimed_bytes() == after + range_bytes);
+}
+
+TEST_CASE("a reclaimed chunk goes back to the lowest priority", "[cache][eviction][explicit]")
+{
+  constexpr std::size_t range_bytes = 16 * mib;
+  cache_test_fixture fixture{allocation_cache_config()};
+  auto& cache      = checked_cache(fixture);
+  auto cache_range = [&](std::size_t offset, std::uint8_t eviction_priority) {
+    auto source = fixture.open(object_path, 4 * range_bytes);
+    REQUIRE(source != nullptr);
+    advise_range(*source, offset, range_bytes, eviction_priority);
+    REQUIRE(source->prepare_prefetch(false) == prepare_result::prepared);
+  };
+  cache_range(0, /*eviction_priority=*/5);
+  REQUIRE(cache.reclaim(reclaim_mode::forced, std::numeric_limits<std::size_t>::max()) >=
+          range_bytes);
+  REQUIRE(cache.claimed_bytes() == 0);
+
+  // Refilled at priority 0 before the other range, so it is the oldest of the lowest priority.
+  cache_range(0, /*eviction_priority=*/0);
+  cache_range(range_bytes, /*eviction_priority=*/0);
+  auto const claimed = cache.claimed_bytes();
+  REQUIRE(claimed >= 2 * range_bytes);
+
+  cache.evict(range_bytes);
+  REQUIRE(wait_for_cache([&] { return cache.claimed_bytes() <= claimed - range_bytes; }, 2s));
+
+  auto const after = cache.claimed_bytes();
+  cache_range(range_bytes, /*eviction_priority=*/0);
+  CHECK(cache.claimed_bytes() == after);
+  cache_range(0, /*eviction_priority=*/0);
+  CHECK(cache.claimed_bytes() == after + range_bytes);
+}
+
+TEST_CASE("a refill restores the priority a reclaim cleared", "[cache][eviction][explicit]")
+{
+  constexpr std::size_t range_bytes = 16 * mib;
+  cache_test_fixture fixture{allocation_cache_config()};
+  auto& cache      = checked_cache(fixture);
+  auto cache_range = [&](std::size_t offset, std::uint8_t eviction_priority) {
+    auto source = fixture.open(object_path, 4 * range_bytes);
+    REQUIRE(source != nullptr);
+    advise_range(*source, offset, range_bytes, eviction_priority);
+    REQUIRE(source->prepare_prefetch(false) == prepare_result::prepared);
+  };
+  cache_range(0, /*eviction_priority=*/5);
+  {
+    // A request names the cached range at priority 5, and a forced reclaim then empties its chunks
+    // before the request prepares, clearing their priority.
+    auto source = fixture.open(object_path, 4 * range_bytes);
+    REQUIRE(source != nullptr);
+    advise_range(*source, 0, range_bytes, /*eviction_priority=*/5);
+    REQUIRE(cache.reclaim(reclaim_mode::forced, std::numeric_limits<std::size_t>::max()) >=
+            range_bytes);
+    REQUIRE(cache.claimed_bytes() == 0);
+    // The refill raises them back to 5.
+    REQUIRE(source->prepare_prefetch(false) == prepare_result::prepared);
+  }
+  // Cached after the refill at priority 0, so oldest-first order alone would keep it.
+  cache_range(range_bytes, /*eviction_priority=*/0);
+  auto const claimed = cache.claimed_bytes();
+  REQUIRE(claimed >= 2 * range_bytes);
+
+  cache.evict(range_bytes);
+  REQUIRE(wait_for_cache([&] { return cache.claimed_bytes() <= claimed - range_bytes; }, 2s));
+
+  auto const after = cache.claimed_bytes();
+  cache_range(0, /*eviction_priority=*/5);
+  CHECK(cache.claimed_bytes() == after);
+  cache_range(range_bytes, /*eviction_priority=*/0);
+  CHECK(cache.claimed_bytes() == after + range_bytes);
+}
+
+TEST_CASE("a request that comes out short keeps its priority on another request's refill",
+          "[cache][eviction][explicit]")
+{
+  constexpr std::size_t range_bytes = 16 * mib;
+  cache_test_fixture fixture{allocation_cache_config()};
+  auto& cache      = checked_cache(fixture);
+  auto cache_range = [&](std::size_t offset, std::uint8_t eviction_priority) {
+    auto source = fixture.open(object_path, 4 * range_bytes);
+    REQUIRE(source != nullptr);
+    advise_range(*source, offset, range_bytes, eviction_priority);
+    REQUIRE(source->prepare_prefetch(false) == prepare_result::prepared);
+  };
+  {
+    // Two requests name the same range, `high` at 5 and `low` at 0.
+    auto high = fixture.open(object_path, 4 * range_bytes);
+    auto low  = fixture.open(object_path, 4 * range_bytes);
+    REQUIRE(high != nullptr);
+    REQUIRE(low != nullptr);
+    advise_range(*high, 0, range_bytes, /*eviction_priority=*/5);
+    advise_range(*low, 0, range_bytes, /*eviction_priority=*/0);
+    // A forced reclaim takes the buffers `high` has just attached, so it comes out short.
+    bool fired = false;
+    cache.set_before_prepare_publish_for_testing([&] {
+      if (std::exchange(fired, true)) { return; }
+      REQUIRE(cache.reclaim(reclaim_mode::forced, std::numeric_limits<std::size_t>::max()) >=
+              range_bytes);
+    });
+    REQUIRE(high->prepare_prefetch(false) == prepare_result::allocation_failed);
+    cache.set_before_prepare_publish_for_testing({});
+    // `low` refills the range, and `high` is never retried.
+    REQUIRE(low->prepare_prefetch(false) == prepare_result::prepared);
+  }
+  // Cached after the refill at priority 0, so oldest-first order alone would keep it.
+  cache_range(range_bytes, /*eviction_priority=*/0);
+  auto const claimed = cache.claimed_bytes();
+  REQUIRE(claimed >= 2 * range_bytes);
+
+  cache.evict(range_bytes);
+  REQUIRE(wait_for_cache([&] { return cache.claimed_bytes() <= claimed - range_bytes; }, 2s));
+
+  auto const after = cache.claimed_bytes();
+  cache_range(0, /*eviction_priority=*/5);
+  CHECK(cache.claimed_bytes() == after);
+  cache_range(range_bytes, /*eviction_priority=*/0);
+  CHECK(cache.claimed_bytes() == after + range_bytes);
+}
+
+TEST_CASE("the cache rejects an eviction batch fraction outside (0, 1]",
+          "[cache][eviction][explicit]")
+{
+  auto const fraction         = GENERATE(0.0, -0.25, 1.5, std::numeric_limits<double>::quiet_NaN());
+  auto cfg                    = allocation_cache_config();
+  cfg.eviction_batch_fraction = fraction;
+  cache_test_fixture fixture{cfg};
+  CHECK(fixture.context->cache() == nullptr);
+}
+
+TEST_CASE("the cache accepts an eviction batch fraction of 1", "[cache][eviction][explicit]")
+{
+  auto cfg                    = allocation_cache_config();
+  cfg.eviction_batch_fraction = 1.0;
+  cache_test_fixture fixture{cfg};
+  CHECK(fixture.context->cache() != nullptr);
 }
 
 TEST_CASE("blocking prepare waits for earlier asynchronous eviction before retrying",
