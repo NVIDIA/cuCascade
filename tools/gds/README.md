@@ -1,13 +1,9 @@
 # GDS diagnostics
 
-## Phase 7 qualification tooling
+## Qualification tooling
 
-See [QUALIFICATION.md](QUALIFICATION.md) for `qualify.sh`, its example config,
-`analyze_gates.py`, verified soak/recreation sampling,
-and separate ASan+UBSan/TSan build and run commands. Compat smoke and raw
-nvidia-fs snapshots are not GDS evidence.
-
-The harness was written to qualify the async engine of the superseded cuFile
+The `qualify.sh` harness (example config `qualify.example.conf`, gates in
+`analyze_gates.py`) was written to qualify the async engine of the superseded cuFile
 backend. The engine benchmark it drives (`cucascade_cufile_engine_bench`) and the
 B-10 runner were removed with that backend, so only the steps that do not need
 them run: `topology`, `B-0`, `B-1` and `B-2`.
@@ -35,9 +31,7 @@ the script leaves them unchanged and warns about them and enabled dynamic routin
 **[verify]** multi-GPU list semantics, policy support and `rdma_dynamic_routing`
 depend on libcufile. This never controls GPFS `verbsPorts`, WEKA `net=` or VAST
 `localports=`. Export before launch: libcufile reads the file when its driver
-opens, which the first cuFile context or `gds_available()` probe does. See
-[Selecting NICs for a GPU](../../docs/io/cufile-reactor.md#selecting-nics-for-a-gpu)
-for the four-GPU example.
+opens, which the first cuFile context or `gds_available()` probe does.
 
 `qualify.sh` defaults to `RECORD_NIC_COUNTERS=1` (`NIC_SYSFS_ROOT=/sys`): every
 engine bench invocation (none can run at present, see above) gets
@@ -48,8 +42,6 @@ These host-global traffic deltas are hints, not cuFile/direct-path proof.
 
 ## Standalone cuFile async-QD harness
 
-Phase 1 / P0 (B-0 and initial B-1 components), per
-`docs/io/gds-design/{05-final-design,06-design-amendments,07-implementation-plan}.md`.
 The read harness uses the shared cuFile loader, not the reactor or cuDF.
 An explicit `--prepare-file` option creates a NEW deterministic pattern file.
 The target requires `CUCASCADE_BUILD_IO=ON` and `cufile.h`. It is excluded from

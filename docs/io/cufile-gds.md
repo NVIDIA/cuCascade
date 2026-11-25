@@ -375,9 +375,7 @@ cucascade::io::io_context_registry registry{config, reservation_manager};
 - The I/O depth of a GPU is `lanes` synchronous `cuFileRead` calls per context
   (32 by default), bounded by the arena's read slots (64), which also hold the
   segments whose copies have not finished; writes have their own `lanes` slots.
-  This design has not yet been measured on a GDS host: the figures in
-  [cufile-fused-lanes.md](cufile-fused-lanes.md) (86.6 GiB/s on GB200 + GPFS)
-  are of the replaced 128-lane `cuFileReadAsync` design.
+  This design has not yet been measured on a GDS host.
 - The backend never arms the prefetching cache.
 - cuFile's own statistics (`cuFileGetStatsL3`) are not read in-process. Use
   `gds_stats`.
@@ -388,8 +386,4 @@ cucascade::io::io_context_registry registry{config, reservation_manager};
 
 The backend replaced an earlier one (per-GPU groups of single-read reactors
 with staged / direct / POSIX paths, an opt-in async engine, fused stream lanes
-and host batch reads). Its design record, reviews and measurements are kept
-under [gds-design/](gds-design/README.md), and its two operating guides,
-[cufile-reactor.md](cufile-reactor.md) and
-[cufile-fused-lanes.md](cufile-fused-lanes.md), are kept for the measurements
-and the libcufile configuration advice they hold.
+and host batch reads).

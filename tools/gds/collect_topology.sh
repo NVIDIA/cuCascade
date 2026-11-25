@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # collect_topology.sh - read-only host topology collector for GDS/cuFile
-# performance planning (docs/io/gds-design/06-design-amendments.md AM-7).
+# performance planning.
 #
 # Rules this script follows:
 #   * `set -u` only; never `set -e`. Every probe is best-effort.
