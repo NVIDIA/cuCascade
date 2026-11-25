@@ -841,6 +841,14 @@ prepare_result fs_cache::prepare_request(prefetch_request& req, bool wait_for_ev
 
   std::ignore        = _completion_poll.drain_all();
   auto const& chunks = *req.chunks;
+  // A reclaim since this request raised its chunks cleared their priority. Raise them again on
+  // every path that leaves the request retryable, so a refill of a range this request named, by
+  // this request or by another, keeps the priority even if this request is never retried.
+  auto const restore_eviction_priority = [&] {
+    for (auto* c : chunks) {
+      c->raise_eviction_priority(req.eviction_priority);
+    }
+  };
 
   auto n_chunks_needed = static_cast<std::size_t>(std::ranges::count_if(
     chunks, [](cached_chunk* c) { return c->state.get_state() == chunk_state::empty; }));
@@ -862,6 +870,7 @@ prepare_result fs_cache::prepare_request(prefetch_request& req, bool wait_for_ev
           req.pending_eviction = std::move(processed);
         }
       }
+      restore_eviction_priority();
       return prepare_result::allocation_failed;
     }
 
@@ -887,6 +896,7 @@ prepare_result fs_cache::prepare_request(prefetch_request& req, bool wait_for_ev
     buffers        = _pool->allocate_bulk(n_chunks_needed, numa_allocated);
     if (buffers.size() != n_chunks_needed) {
       if (!buffers.empty()) { _pool->deallocate_bulk(std::move(buffers), numa_allocated); }
+      restore_eviction_priority();
       return prepare_result::allocation_failed;
     }
   }
@@ -930,13 +940,11 @@ prepare_result fs_cache::prepare_request(prefetch_request& req, bool wait_for_ev
   // short request anyway would promise buffers it does not have -- the
   // prefetch would claim nothing, settle `ready`, and the consumer would pay
   // for every chunk as a miss.
+  if (_before_prepare_publish) { _before_prepare_publish(); }
+  // Before the check: a request that comes out short has still attached buffers, and the chunks
+  // it lost to a reclaim are empty and will be refilled.
+  restore_eviction_priority();
   if (!all_chunks_have_buffers(chunks)) { return prepare_result::allocation_failed; }
-
-  // A reclaim between this request's raise and now cleared it, and the buffers attached above are
-  // a refill of what the request asked for: raise them again.
-  for (auto* c : chunks) {
-    c->raise_eviction_priority(req.eviction_priority);
-  }
 
   // Only now is there something to publish, so only now does the producer enter
   // the `preparing` window: every path above leaves it `queued` and retryable,

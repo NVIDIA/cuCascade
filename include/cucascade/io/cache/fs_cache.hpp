@@ -431,6 +431,14 @@ class fs_cache {
     _before_chunk_materialise = std::move(hook);
   }
 
+  /// Test-only hook run inside @ref prepare after the request has attached buffers to its chunks
+  /// and before it checks that every chunk has one, with no cache lock held, so it may reclaim.
+  /// Configure only while no prepare can run.
+  void set_before_prepare_publish_for_testing(std::function<void()> hook)
+  {
+    _before_prepare_publish = std::move(hook);
+  }
+
   /// Test-only hook run inside @ref reclaim for each chunk the sweep is about to
   /// claim: after the chunk passed the sweep's filters (for a NUMA-scoped
   /// reclaim, including the node hint read before the claim) and before
@@ -635,6 +643,7 @@ class fs_cache {
 
   std::function<void()> _before_prefetch_claim;
   std::function<void()> _before_request_enqueue;
+  std::function<void()> _before_prepare_publish;
   std::function<void()> _before_chunk_materialise;
   std::function<void(cached_chunk const&)> _before_reclaim_claim;
   const config _cfg;
