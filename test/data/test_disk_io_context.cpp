@@ -30,7 +30,9 @@
 #include <cucascade/exec/semi_future.hpp>
 #include <cucascade/io/config.hpp>
 #ifdef CUCASCADE_HAS_CUFILE
+#include <cucascade/io/cufile/cufile_api.hpp>
 #include <cucascade/io/cufile/cufile_ioctx.hpp>
+#include <cucascade/io/cufile/detail.hpp>
 #endif
 #include <cucascade/io/datasource_factory.hpp>
 #include <cucascade/io/io_context.hpp>
@@ -456,6 +458,41 @@ TEST_CASE("mount_supports_gds follows the filesystem under the mount", "[disk][i
                           every_class, storage.filesystem_type, storage.all_devices_nvme());
   REQUIRE(detail::mount_supports_gds(dir.string(), every_class) == expected);
   REQUIRE(dir.file_count() == 0);  // the probe file is gone
+#endif
+}
+
+TEST_CASE("a space on a GDS mount spills through uring when the cuFile context cannot be built",
+          "[disk][io][context]")
+{
+#ifdef CUCASCADE_HAS_CUFILE
+  if (!test::io_uring_usable()) {
+    WARN("io_uring cannot run in this process");
+    return;
+  }
+  auto const* loaded = io::cufile::cufile_api::loaded();
+  int devices        = 0;
+  if (loaded == nullptr || cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) {
+    std::ignore = cudaGetLastError();
+    SKIP("requires libcufile and a CUDA device");
+  }
+  // libcufile's table with a driver that does not open: the cuFile reactors cannot start.
+  auto table        = *loaded;
+  table.driver_open = []() -> CUfileError_t {
+    CUfileError_t status{};
+    status.err = CU_FILE_DRIVER_NOT_INITIALIZED;
+    return status;
+  };
+  io::cufile::detail::set_cufile_api_for_testing(&table);
+  struct restore {
+    ~restore() { io::cufile::detail::set_cufile_api_for_testing(nullptr); }
+  } const restored;
+
+  scratch_dir dir;
+  auto const context = detail::adopt_disk_io_context(dir.string(), /*gds=*/true);
+  REQUIRE(context->type() == io::io_context_type::uring);
+  REQUIRE(detail::adopt_disk_io_context(dir.string(), /*gds=*/false) == context);
+#else
+  SKIP("requires a build with cufile.h");
 #endif
 }
 

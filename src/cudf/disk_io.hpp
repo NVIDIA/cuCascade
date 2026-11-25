@@ -32,6 +32,7 @@
 #include <cucascade/io/types.hpp>
 
 #include <cstddef>
+#include <memory>
 #include <span>
 #include <string>
 
@@ -61,6 +62,13 @@ namespace detail {
  * @throws std::runtime_error if the probe file cannot be created.
  */
 [[nodiscard]] bool mount_supports_gds(std::string const& mount_path, unsigned int status_flags);
+
+/**
+ * @brief The shared context a DISK space on @p mount_path adopts: the cuFile one when @p gds,
+ *        unless it cannot be built (logged), and the uring one otherwise.
+ */
+[[nodiscard]] std::shared_ptr<io::ioctx> adopt_disk_io_context(std::string const& mount_path,
+                                                               bool gds);
 
 /**
  * @brief Write device buffers into an existing (freshly created) batch file and wait.

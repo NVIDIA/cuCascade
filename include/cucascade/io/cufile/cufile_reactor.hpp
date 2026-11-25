@@ -25,6 +25,7 @@
 #include <cucascade/io/uring/uring_reactor.hpp>
 
 #include <cuda_runtime_api.h>
+
 #include <sys/types.h>
 
 #include <atomic>
@@ -46,8 +47,12 @@ class device_arena;
  *
  * The arena is @c cudaMalloc memory outside RMM (@c config::arena_bytes()), so a
  * process that hands the rest of the GPU to a memory pool reserves it first.
- * Every reactor of @p device with the same @c config::lanes and
- * @c config::lane_bytes shares it; the GPU keeps it for the life of the process.
+ * Every later reactor of @p device it covers -- at least as many lanes, read
+ * slots and slot bytes, registered the same way -- shares it (their lanes share
+ * the arena's slots); the GPU keeps it for the life of the process.  A reactor it
+ * does not cover gets an arena that covers both (logged); when that cannot be
+ * allocated, the GPU keeps the arena it has and the error propagates.
+ * @throws std::invalid_argument for a @p cfg no arena can be built from.
  */
 void reserve_arena(int device, config const& cfg);
 
@@ -57,8 +62,8 @@ void reserve_arena(int device, config const& cfg);
  *
  * Host I/O uses the descriptors, device I/O the handle.  When libcufile, its
  * driver or the registration is unavailable the object still opens (the reason
- * is logged) and serves host I/O only: device I/O on it fails with
- * @c std::errc::operation_not_supported.
+ * is logged); a reactor then moves its device I/O through a pinned host bounce
+ * buffer with @c pread / @c pwrite.
  */
 class cufile_io_object final : public uring::local_io_object {
  public:
@@ -77,13 +82,17 @@ class cufile_io_object final : public uring::local_io_object {
  * @brief The cuFile (GPUDirect Storage) reactor of one GPU.
  *
  * Device I/O runs on lanes.  A lane is a thread that takes one slot of the
- * GPU's arena -- @c cudaMalloc memory registered with cuFile once -- for each
- * segment it serves, and blocks in one synchronous cuFile call at a time, so
- * the lane count is the I/O depth.  There are two sets of @c config::lanes
- * lanes, one reading and one writing, each with its own queue, so reads never
- * wait behind writes; the arena holds a read slot and a write slot of
- * @c config::lane_bytes for every lane.  The arena belongs to the GPU: the
- * reactors of several contexts on one GPU share its slots, and so its depth.
+ * GPU's arena -- @c cudaMalloc memory registered with cuFile (per slot, or as a
+ * whole) -- for each segment it serves, and blocks in one synchronous cuFile
+ * call at a time, so the lane count is the I/O depth.  There are two sets of
+ * @c config::lanes lanes, one reading and one writing, each with its own queue,
+ * so reads never wait behind writes; the arena holds
+ * @c config::read_slots_per_lane read slots and one write slot of
+ * @c config::lane_bytes for every lane, and hands out registered slots before
+ * any a registration failed for.  The arena belongs to the GPU: the reactors of
+ * several contexts on one GPU share its slots, and so its depth (see
+ * @c reserve_arena).  A file cuFile could not register is read and written
+ * through a pinned host bounce buffer of the lane instead of cuFile.
  *
  * A lane serves high-priority segments first, and a waiting low-priority one
  * after every few high ones, so neither starves.
@@ -91,12 +100,14 @@ class cufile_io_object final : public uring::local_io_object {
  * A device request is cut into segments of at most one slot at submission:
  *  - read: the destinations of a request that lie close together share one
  *    segment (see @c config::coalesce_gap_bytes).  A lane reads the segment's
- *    page-aligned window into its slot, then queues the copies of each
- *    destination's bytes out of the slot.  With @c config::async_copies it hands
- *    the slot and the segment to the reactor's completion thread -- which gives
- *    the slot back and settles the segment once the copies have finished -- and
- *    takes another slot for its next read at once (the arena holds
- *    @c config::read_slots_per_lane read slots per lane).
+ *    page-aligned window into its slot -- never past the end of the file: a
+ *    window ending in its partial last page reads the whole pages in one call
+ *    and the rest of the file in another -- then queues the copies of each
+ *    destination's bytes out of the slot.  With @c config::async_copies it
+ *    queues them on a stream of their own (so they wait for no other caller's
+ *    work) and hands the slot and the segment to the reactor's completion
+ *    thread -- which gives the slot back and settles the segment once the
+ *    copies have finished -- and takes another slot for its next read at once.
  *  - write: a lane copies the source bytes into its slot and writes the
  *    granule-aligned body from there; an unaligned head and tail are written by
  *    the host reactor.
@@ -166,8 +177,9 @@ class cufile_reactor {
   /// Present for the reactor concept; does nothing.
   void interrupt() noexcept {}
 
-  /// Stop the lanes (each finishes the segment it is in) and cancel what is
-  /// still queued with @c operation_canceled.  Idempotent.
+  /// Stop the lanes (each finishes the segment it is in; one still waiting for an
+  /// arena slot gives up) and cancel what is still queued with
+  /// @c operation_canceled.  Idempotent.
   void shutdown();
 
   /// What the reactor has queued and what it has moved since it was built.
@@ -237,10 +249,12 @@ class cufile_reactor {
   struct part;
   struct segment;
   struct gate_pool;
+  struct stream_pool;
   struct lane;
   struct lane_set;
   struct copy_job;
   struct completer;
+  struct trace_state;
 
   /// Cut a device request into the segments its lanes will serve.
   [[nodiscard]] std::vector<segment> plan(grouped_io_request const& request) const;
@@ -249,11 +263,24 @@ class cufile_reactor {
   /// Serve @p work through the arena slot at offset @p slot.  Returns true when it handed the
   /// slot and @p work (moved from) to the completion thread, false when the read is done.
   bool read_segment(lane& self, std::size_t slot, segment& work);
+  /// Read @p work's window into the slot with cuFile, never past the end of the file; returns
+  /// the bytes read.
+  std::size_t read_cufile(std::size_t slot, segment const& work);
+  /// Read @p work's window into the slot through the lane's pinned bounce buffer (a file cuFile
+  /// could not register); returns the bytes read.
+  std::size_t read_bounced(lane& self, std::size_t slot, segment const& work);
   void write_segment(lane& self, std::size_t slot, segment const& work);
+  /// Write the first @p size bytes of the slot at file offset @p offset through the lane's pinned
+  /// bounce buffer (a file cuFile could not register).
+  void write_bounced(
+    lane& self, std::size_t slot, segment const& work, std::size_t offset, std::size_t size);
   /// The loop of the completion thread: settle read segments as their copies finish.
   void complete_copies();
-  /// Give @p job's slot back and settle (or, for a failed copy, fail) its segment.
-  void finish_copy(copy_job& job, cudaError_t status) noexcept;
+  /// Give @p job's slot back and settle its segment: its copies are done.
+  void finish_copy(copy_job& job) noexcept;
+  /// Fail @p job's segment with @p status once the GPU's context is out of service (its copies
+  /// cannot run any more), keeping its slot, stream and event out of service for good.
+  void retire_copy(copy_job& job, cudaError_t status) noexcept;
 
   config _config;
   int _device;
@@ -266,7 +293,13 @@ class cufile_reactor {
   std::unique_ptr<lane_set> _writers;
   /// The copy-done events of read segments in flight, recycled like the gates.
   std::unique_ptr<gate_pool> _copy_events;
+  /// The streams of the copies of read segments in flight, one each, recycled.
+  std::unique_ptr<stream_pool> _copy_streams;
   std::unique_ptr<completer> _completer;
+  /// CUCASCADE_CUFILE_TRACE's counters for this reactor; null when it is unset.
+  std::unique_ptr<trace_state> _trace;
+  /// Set while the reactor shuts down: a lane waiting for an arena slot gives up.
+  std::atomic<bool> _stopping{false};
   std::atomic<std::size_t> _queued_bytes{0};
   std::atomic<std::uint64_t> _reads{0};
   std::atomic<std::uint64_t> _bytes_read{0};

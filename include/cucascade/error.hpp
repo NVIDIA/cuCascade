@@ -46,6 +46,49 @@ struct cuda_error : public std::runtime_error {
   using std::runtime_error::runtime_error;
 };
 
+/// Whether @p status is one the CUDA runtime documents as leaving the process's CUDA context
+/// unusable ("any further CUDA work will return the same error ... the process must be
+/// terminated and relaunched"): nothing queued on the GPU runs any more.  The newer codes are
+/// matched by value, since older toolkits do not name them.  cudaErrorExternalDevice (911) is
+/// left out: it is terminal only in its asynchronous form, and the status alone does not say
+/// which form it is.
+[[nodiscard]] inline bool terminal_cuda_status(cudaError_t status) noexcept
+{
+  switch (status) {
+    case cudaErrorIllegalAddress:
+    case cudaErrorLaunchTimeout:
+    case cudaErrorAssert:
+    case cudaErrorHardwareStackError:
+    case cudaErrorIllegalInstruction:
+    case cudaErrorMisalignedAddress:
+    case cudaErrorInvalidAddressSpace:
+    case cudaErrorInvalidPc:
+    case cudaErrorLaunchFailure:
+    case cudaErrorMpsClientTerminated: return true;
+    default: break;
+  }
+  switch (static_cast<int>(status)) {
+    case 226:  // cudaErrorContained
+    case 721:  // cudaErrorTensorMemoryLeak
+      return true;
+    default: return false;
+  }
+}
+
+/// A CUDA error that keeps its status, so a caller can tell one that put the device's context
+/// out of service (see terminal_cuda_status) from an ordinary one.
+class cuda_status_error : public cuda_error {
+ public:
+  cuda_status_error(cudaError_t status, std::string const& what) : cuda_error(what), _status(status)
+  {
+  }
+
+  [[nodiscard]] cudaError_t error_code() const noexcept { return _status; }
+
+ private:
+  cudaError_t _status;
+};
+
 struct logic_error : public std::logic_error {
   using std::logic_error::logic_error;
 };

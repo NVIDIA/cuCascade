@@ -39,4 +39,16 @@ namespace cucascade::io::cufile::detail {
 /// @p api's @c driver_open outcome.
 void set_cufile_api_for_testing(cufile_api const* api) noexcept;
 
+/// Forget the arena kept for every GPU (see @c reserve_arena), so the next reactor allocates and
+/// registers a new one.  A reactor that is running keeps the arena it has until it shuts down.
+void release_arenas_for_testing() noexcept;
+
+/// Make the reactors' completion threads take @p event_error (a @c cudaError_t) as the outcome
+/// of every query of a read segment's copy-done event, as though @c cudaEventQuery had reported
+/// an error of earlier asynchronous work, and @p stream_error as the outcome of every query of
+/// the copies' stream (a status the CUDA runtime documents as terminal puts the context out of
+/// service).  A lane's own synchronizations are not affected.  @c cudaSuccess (0) restores the
+/// real outcomes.
+void fail_copy_queries_for_testing(int event_error, int stream_error = 0) noexcept;
+
 }  // namespace cucascade::io::cufile::detail

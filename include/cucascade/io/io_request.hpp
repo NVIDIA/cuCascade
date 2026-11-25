@@ -19,6 +19,7 @@
 #pragma once
 
 #include <cucascade/cuda/device_copy_batch.hpp>
+#include <cucascade/error.hpp>
 #include <cucascade/exec/semi_future.hpp>
 #include <cucascade/io/types.hpp>
 
@@ -114,12 +115,17 @@ class grouped_coordinator final {
 
   void on_complete() noexcept { settle_one(); }
 
+  /// The request resolves with the first error reported -- unless a later one is a CUDA failure
+  /// that put the device's context out of service (see terminal_cuda_status), which replaces an
+  /// ordinary first error: it is the one a caller must not miss.
   void report_error(error_type const& error,
                     std::source_location loc = std::source_location::current()) noexcept
   {
-    bool expected = true;
-    if (_continue.compare_exchange_strong(
-          expected, false, std::memory_order_acq_rel, std::memory_order_acquire)) {
+    bool expected    = true;
+    bool const first = _continue.compare_exchange_strong(
+      expected, false, std::memory_order_acq_rel, std::memory_order_acquire);
+    bool const terminal = is_terminal(error);
+    if (first || terminal) {
       std::exception_ptr converted;
       try {
         converted = to_exception_ptr(error, loc);
@@ -131,8 +137,10 @@ class grouped_coordinator final {
       }
 
       std::lock_guard lock(_state_mutex);
-      assert(_first_exception == nullptr);
-      _first_exception = std::move(converted);
+      if (_first_exception == nullptr || (terminal && !_first_terminal)) {
+        _first_exception = std::move(converted);
+        _first_terminal  = terminal;
+      }
     }
     settle_one();
   }
@@ -150,6 +158,23 @@ class grouped_coordinator final {
   }
 
  private:
+  /// Whether @p error is a CUDA failure that put the device's context out of service.
+  [[nodiscard]] static bool is_terminal(error_type const& error) noexcept
+  {
+    if (auto const* status = std::get_if<cudaError_t>(&error)) {
+      return terminal_cuda_status(*status);
+    }
+    if (auto const* thrown = std::get_if<std::exception_ptr>(&error); thrown && *thrown) {
+      try {
+        std::rethrow_exception(*thrown);
+      } catch (cuda_status_error const& e) {
+        return terminal_cuda_status(e.error_code());
+      } catch (...) {
+      }
+    }
+    return false;
+  }
+
   [[nodiscard]] static std::exception_ptr to_exception_ptr(error_type const& error,
                                                            std::source_location loc)
   {
@@ -157,10 +182,12 @@ class grouped_coordinator final {
       return std::get<std::exception_ptr>(error);
     }
     if (std::holds_alternative<cudaError_t>(error)) {
+      // Typed, so the status survives: a caller tells a fatal (sticky) error apart by it.
       auto const value = std::get<cudaError_t>(error);
       return std::make_exception_ptr(
-        std::runtime_error("CUDA error: " + std::string(cudaGetErrorString(value)) + " at " +
-                           loc.file_name() + ":" + std::to_string(loc.line())));
+        cuda_status_error(value,
+                          "CUDA error: " + std::string(cudaGetErrorString(value)) + " at " +
+                            loc.file_name() + ":" + std::to_string(loc.line())));
     }
 
     auto const value = std::get<std::error_code>(error);
@@ -206,6 +233,8 @@ class grouped_coordinator final {
 
   mutable std::mutex _state_mutex;
   std::exception_ptr _first_exception;
+  /// Whether @c _first_exception is a terminal CUDA failure (see report_error).
+  bool _first_terminal{false};
   bool _future_taken{false};
   bool _fulfilled{false};
   exec::promise<std::size_t> _promise;

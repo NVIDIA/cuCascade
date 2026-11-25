@@ -21,6 +21,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <string>
 
 namespace cucascade {
 
@@ -122,7 +123,8 @@ struct disk_io_context_options {
  *
  * A space without a context adopts the shared cuFile context when it allows GDS
  * (disk_memory_space_config::allow_gds, the default) and its mount is on a filesystem the cuFile
- * driver serves through GPUDirect Storage; otherwise the shared uring context. The mount check
+ * driver serves through GPUDirect Storage (disk_mount_uses_gds()); otherwise, and when the cuFile
+ * context cannot be built (a warning is logged), the shared uring context. The mount check
  * runs once per space, on this first use: it opens the cuFile driver, and when the driver has a
  * GDS mode it creates and removes one probe file in the mount to find its filesystem and drives.
  * A space with allow_gds off never opens the cuFile driver. The check is a prediction (see
@@ -139,5 +141,18 @@ struct disk_io_context_options {
  */
 [[nodiscard]] std::shared_ptr<io::ioctx> resolve_disk_io_context(
   memory::memory_space const& disk_space);
+
+/**
+ * @brief Whether a DISK space on @p mount_path that allows GDS adopts the shared cuFile context
+ *        (the check resolve_disk_io_context() makes).
+ *
+ * For a caller that reserves the cuFile arenas (io::cufile::reserve_arena()) before its GPU memory
+ * pools claim the devices, rather than leave the shared context to allocate them at the first
+ * spill. Opens the cuFile driver, and when it has a GDS mode creates and removes one probe file in
+ * @p mount_path.
+ *
+ * @throws std::runtime_error if the probe file cannot be created.
+ */
+[[nodiscard]] bool disk_mount_uses_gds(std::string const& mount_path);
 
 }  // namespace cucascade

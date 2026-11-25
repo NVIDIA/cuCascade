@@ -23,6 +23,7 @@
 #endif
 #include <cucascade/io/io_context.hpp>
 #include <cucascade/io/uring/uring_ioctx.hpp>
+#include <cucascade/log/logging.hpp>
 #include <cucascade/memory/disk_table.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/memory_space.hpp>
@@ -33,6 +34,7 @@
 
 #include <array>
 #include <cstddef>
+#include <exception>
 #include <filesystem>
 #include <memory>
 #include <mutex>
@@ -235,13 +237,38 @@ std::shared_ptr<io::ioctx> default_disk_io_context()
   return shared_disk_io_context(resolve_backend(disk_io_backend::automatic));
 }
 
+namespace detail {
+
+std::shared_ptr<io::ioctx> adopt_disk_io_context(std::string const& mount_path, bool gds)
+{
+  if (gds) {
+    try {
+      return shared_disk_io_context(disk_io_backend::cufile);
+    } catch (std::exception const& e) {
+      // E.g. the GPU has no room left for a cuFile arena: the space still spills, through uring.
+      CUCASCADE_LOG_WARN(
+        "disk tier: the cuFile context for the GDS mount '{}' could not be built ({}); its files "
+        "go through io_uring",
+        mount_path,
+        e.what());
+    }
+  }
+  return shared_disk_io_context(disk_io_backend::uring);
+}
+
+}  // namespace detail
+
+bool disk_mount_uses_gds(std::string const& mount_path)
+{
+  return detail::mount_supports_gds(mount_path, detail::gds_status_flags());
+}
+
 std::shared_ptr<io::ioctx> resolve_disk_io_context(memory::memory_space const& disk_space)
 {
   return disk_space.get_or_init_io_context([&disk_space] {
-    bool const gds = disk_space.allow_gds() &&
-                     detail::mount_supports_gds(std::string(disk_space.get_disk_mount_path()),
-                                                detail::gds_status_flags());
-    return shared_disk_io_context(gds ? disk_io_backend::cufile : disk_io_backend::uring);
+    auto const mount_path = std::string(disk_space.get_disk_mount_path());
+    return detail::adopt_disk_io_context(mount_path,
+                                         disk_space.allow_gds() && disk_mount_uses_gds(mount_path));
   });
 }
 

@@ -52,9 +52,10 @@ least-backlogged reactors.
  cufile_reactor of GPU g
  ├─ read lanes   cf-g<g>-rd0 .. rd<N-1>   queue: high / low priority segments
  ├─ write lanes  cf-g<g>-wr0 .. wr<N-1>   queue: high / low priority segments
+ ├─ completion   cf-g<g>-cp               settles read segments as their copies finish
  ├─ host reactor cf-g<g>-host             a host-only io_uring reactor
- └─ arena        cudaMalloc, registered with cuFile once:
-                 N read slots + N write slots of lane_bytes each
+ └─ arena        cudaMalloc, registered with cuFile per slot (or as a whole):
+                 read_slots_per_lane × N read slots + N write slots of lane_bytes each
 ```
 
 A **lane** is a thread that blocks in one synchronous cuFile call at a time, so
@@ -64,11 +65,12 @@ lanes are pinned to the CPUs of the GPU's NUMA node when discovery knows it,
 and each makes its GPU current once, when it starts.
 
 For every segment it serves, a lane takes one **slot** of the arena:
-`lane_bytes` (default 8 MiB) of device memory at a 4 KiB-aligned offset of a
-buffer registered with `cuFileBufRegister`. Every cuFile call therefore has an
-aligned file offset, an aligned size and an aligned offset into registered
-memory, which is what zero-copy DMA needs and what a Parquet chunk read into an
-RMM buffer never has.
+`lane_bytes` (default 8 MiB) of device memory registered with
+`cuFileBufRegister` (each slot on its own by default). Every cuFile call
+therefore has an aligned file offset, an aligned size and an aligned offset
+into registered memory, which is what zero-copy DMA needs and what a Parquet
+chunk read into an RMM buffer never has. The one exception is a window ending
+in the file's partial last block (below).
 
 A lane serves high-priority segments first, and a waiting low-priority one
 after every four high ones, so neither starves.
@@ -91,15 +93,43 @@ at most one slot:
 A read lane then:
 
 1. reads the segment's page-aligned window into its slot with one `cuFileRead`
-   (a failed call is retried twice; past the end of the file cuFile returns
-   short, which is fine as long as every part's bytes arrived);
-2. copies each part out of the slot into its destination, device to device, on
-   the lane's own stream, part by part (two touching destinations can be
-   separate allocations);
-3. waits for those copies, then settles the parts.
+   (a failed call is retried twice). It never asks for bytes past the end of
+   the file -- some nvidia-fs builds hit a `BUG_ON` there (GDS known issues,
+   DDN EXAScaler 2.12.5_ddn10) -- so a window ending in the file's partial last
+   block is read in two calls: its whole blocks, then the rest of the file.
+   Fewer bytes than the parts need fail the segment;
+2. queues the copies of each part out of the slot into its destination, device
+   to device, part by part (two touching destinations can be separate
+   allocations). With `async_copies` (the default) they go on a stream of
+   their own, taken from a pool, and the lane hands the slot and the segment
+   to the reactor's completion thread and takes its next segment at once;
+   otherwise they go on the lane's stream and the lane waits for them;
+3. the completion thread polls the copies' events every `copy_poll_us` and,
+   once they are done, gives the slot back and settles the parts. It never
+   blocks, so one segment's copies hold up no other segment. An error from
+   the event query (`cudaEventQuery` also reports errors of earlier
+   asynchronous work) does not count as done: the thread polls the copies'
+   stream (`cudaStreamQuery`) instead, and an error there counts only when it
+   is one the CUDA runtime documents as leaving the context unusable ("any
+   further CUDA work will return the same error ... the process must be
+   terminated and relaunched": an illegal address, a launch failure or
+   timeout, a device assert, ...). Any other error -- an allocation failure,
+   say -- may be earlier work's, so the segment stays pending: its slot and
+   the caller's buffers stay the copies'. On a terminal status nothing queued
+   on the context can run: the parts fail with that status
+   (`cucascade::cuda_status_error`, which keeps it; the request reports it
+   even when another of its parts failed first with an ordinary error), and
+   the slot, the stream
+   and the event are retired for the life of the reactor (logged as an
+   error), never handed to another segment. A lane whose failed segment's
+   work cannot be drained before such a status retires its slot and
+   quarantines the copy stream the same way.
 
 The future of a read settles only once the bytes are in the destination, so
-they are visible from any stream.
+they are visible from any stream. A slot stays taken until its copies are
+done, so `read_slots_per_lane` (default 2) lets a lane read again while its
+last copies drain, and a copy waiting for a busy caller holds only its own
+slot.
 
 ## How a device write is served
 
@@ -122,8 +152,12 @@ Host reads, host writes and flushes are served by a host-only
 memory and rejects device requests. The backend makes no `pread` / `pwrite`
 calls of its own.
 
-A file that cannot be registered with cuFile still opens and serves host I/O;
-device I/O on it fails with `std::errc::operation_not_supported`. The reason is
+A file that cannot be registered with cuFile (`cuFileHandleRegister` fails,
+e.g. `CU_FILE_IO_NOT_SUPPORTED` on an unsupported filesystem with compatibility
+mode off) still opens. Its device I/O runs on the lanes as usual, but a lane
+moves the bytes between the file and its slot through a pinned host bounce
+buffer of its own (at most 1 MiB, taken on its first such segment) with the
+host reactor's synchronous `pread` / `pwrite` instead of cuFile. The reason is
 logged once, as a warning, for the first such file.
 
 ## Ordering against the caller's stream
@@ -137,33 +171,57 @@ caller's stream handle. `cudaStreamPerThread`, which names a different stream
 on every thread, is replaced at dispatch by a stand-in stream ordered after it.
 
 Nothing is created per request: a lane owns its stream and its completion
-event, the gate events are recycled by the reactor, and the stand-in streams
-come from a pool.
+event; the gate events, the copy-done events and the copy streams are recycled
+by the reactor, and the stand-in streams come from a pool.
 
 The storage round trip of a read never waits for the caller's stream; only the
-copies out of the slot do.
+copies out of the slot do, each segment's on its own stream, so one caller's
+busy stream holds up no other caller's copies.
 
 ## Registered arena memory
 
 The arena is allocated with `cudaMalloc` outside RMM and registered with
-`cuFileBufRegister` once, as a whole:
+`cuFileBufRegister`, one registration per slot (`register_per_slot`, the
+default) or one for the whole arena:
 
 ```
-arena bytes per GPU = 2 × lanes × lane_bytes      (512 MiB by default)
+arena bytes per GPU = (read_slots_per_lane + 1) × lanes × lane_bytes
+                    = 768 MiB by default (64 read + 32 write slots of 8 MiB)
+registrations       = (read_slots_per_lane + 1) × lanes = 96 by default (1 as a whole)
 ```
 
-It belongs to the GPU, not to a reactor. The reactors of several contexts on
-one GPU that ask for the same `lanes` and `lane_bytes` share its slots, and so
-its depth; the GPU keeps it for the life of the process. Reserve it **before**
-RMM claims the device:
+A registration per slot keeps one I/O per registration, which is what cuFile's
+GPFS / WekaFS userspace-RDMA path needs to stay direct.
+
+It belongs to the GPU, not to a reactor: an arena serves every reactor on the
+GPU it covers -- at least as many lanes, read slots (`lanes ×
+read_slots_per_lane`) and slot bytes, registered the same way -- and their
+lanes share its slots, and so its depth. A reactor it does not cover gets an
+arena that covers both: the larger of the two read-slot counts, write-slot
+counts and slot sizes (logged as a warning; the old one is freed when its last
+reactor stops). When that arena cannot be allocated, or its size is not
+representable, the GPU keeps the old one and the reactor's start fails. When
+no reactor holds the old arena any more, its pinned mappings are released
+before the new one is handed out, and the new one retries the registrations
+the two could not both hold; slots still unregistered are logged with the
+count. Registration runs with the arena's GPU current, whichever GPU the
+caller has current.
+Retired slots do not count: an arena whose slots were retired (see above) no
+longer covers the reactors it was built for, and a lane waiting for a slot of
+a kind that is all retired fails its segment instead of waiting. The GPU keeps
+its arena for the life of the process. Reserve it **before** RMM claims the
+device:
 
 ```cpp
 cucascade::io::cufile::reserve_arena(device, config.cufile);
 ```
 
-When the registration fails (BAR1 or cuFile's pinned limit exhausted; a T4 has
-256 MiB of BAR1), a warning is logged and I/O still works: cuFile then moves
-the bytes through its own bounce buffers.
+When a registration fails (BAR1 or cuFile's pinned limit exhausted; a T4 has
+256 MiB of BAR1), a warning is logged and I/O still works: lanes take
+registered slots before unregistered ones, and a call into an unregistered slot
+passes the byte's own address with a zero buffer offset (cuFile takes an offset
+into registered buffers only), so cuFile moves the bytes through its own bounce
+buffers.
 
 ## Plugging in the asynchronous APIs
 
@@ -220,9 +278,15 @@ allows GDS and its mount supports it, otherwise the shared uring context.
   that passes, cuFile can still serve a file in compatibility mode (denylists
   in `cufile.json`, mount options, RDMA setup), which works but is slower than
   uring; set `allow_gds` off for that space.
-- The shared cuFile context uses the `cufile::config` defaults, so it takes the
-  arena of every visible GPU (shared with any other context of the same lane
-  geometry). A space given its own context is never changed.
+- `disk_mount_uses_gds()` makes the same check, so a caller can reserve an
+  arena covering the shared context's shape (`io_config{}.cufile`) with
+  `cufile::reserve_arena()` before its memory pools claim the GPUs.
+- The shared cuFile context uses the `cufile::config` defaults and serves every
+  visible GPU, so it takes an arena on each that has none whose slots fit
+  (shared with every other context on the GPU). When it cannot be built (no
+  room for an arena, a driver that does not open), a warning is logged and the
+  space adopts the shared uring context instead. A space given its own context
+  is never changed.
 
 ## IBM Storage Scale checklist
 
@@ -259,6 +323,12 @@ starting points per filesystem.
 
 - `cufile_ioctx::reactor_gauges()`: per GPU, the bytes queued and the cuFile
   reads and writes completed with the file bytes they covered.
+- `CUCASCADE_CUFILE_TRACE=1`: each reactor prints a summary of its reads on
+  stderr when it shuts down (`[cufile-trace] gpu <g> ...`): segments
+  outstanding / queued / copying at once and `cuFileRead` calls in flight
+  (mean and max; reads bounced through host memory are not counted), time in
+  each stage, and the copy rate: GPU time from the end of the waits for the
+  callers' streams, and total time from the end of the read.
 - `gds_stats -p <pid> -l 3`: per-GPU `n_nvfs_reads` / `n_p2p_reads`
   (direct) versus `n_posix_reads` (compat), bounce-pool use, per-NIC RDMA
   bytes. `cufile.json` `profile.cufile_stats: 3` enables it.
@@ -277,6 +347,11 @@ starting points per filesystem.
 | `lane_bytes` | 8 MiB | Bytes of a lane's arena slot, and so the most one cuFile call moves; a positive multiple of the write granule |
 | `coalesce_gap_bytes` | 1 MiB | Device reads of one request at most this far apart are served by one cuFile read |
 | `coalesce_gap_ratio` | 0.15 | Most of such a read that may be gaps |
+| `read_slots_per_lane` | 2 | Read slots in the arena per read lane (at least 1); with `async_copies`, 2 lets a lane read again while its last copies drain |
+| `register_per_slot` | true | One `cuFileBufRegister` per slot instead of one for the arena |
+| `async_copies` | true | Hand a read segment's copies to the completion thread instead of the lane waiting for them |
+| `copy_poll_us` | 10 | How long the completion thread sleeps between polls of the copies it watches |
+| `high_priority_copies` | true | Create the copy streams at the device's greatest stream priority |
 | `devices` | empty (all) | GPUs to serve, one reactor each |
 | `n_max_concurrent_scans` | GPU pipeline threads | Scan tasks the readahead manager may keep in flight against this backend |
 
@@ -297,8 +372,12 @@ cucascade::io::io_context_registry registry{config, reservation_manager};
   documents both as compatibility mode on Storage Scale.
 - Every device read is copied once, device to device, out of the arena. Reads
   that are already 4 KiB-aligned into registered memory do not skip it.
-- Device I/O on a file cuFile cannot register fails instead of falling back to
-  host staging.
+- The I/O depth of a GPU is `lanes` synchronous `cuFileRead` calls per context
+  (32 by default), bounded by the arena's read slots (64), which also hold the
+  segments whose copies have not finished; writes have their own `lanes` slots.
+  This design has not yet been measured on a GDS host: the figures in
+  [cufile-fused-lanes.md](cufile-fused-lanes.md) (86.6 GiB/s on GB200 + GPFS)
+  are of the replaced 128-lane `cuFileReadAsync` design.
 - The backend never arms the prefetching cache.
 - cuFile's own statistics (`cuFileGetStatsL3`) are not read in-process. Use
   `gds_stats`.
