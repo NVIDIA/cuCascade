@@ -31,9 +31,11 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <future>
 #include <memory>
+#include <span>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -677,4 +679,264 @@ TEST_CASE("every prefetch refusal reports neither success nor coverage exactly o
   CHECK_FALSE(seen[0].ok);
   CHECK_FALSE(seen[0].covered);
   CHECK(fixture.context->backend().pending_count() == 0);
+}
+
+namespace {
+/// A read spanning four chunks, starting and ending inside one.
+constexpr std::size_t span_offset = controlled_chunk_bytes / 2;
+constexpr std::size_t span_size   = 3 * controlled_chunk_bytes;
+
+std::uint8_t pattern(std::size_t offset) { return static_cast<std::uint8_t>((offset * 131U + 7U)); }
+
+/// Complete every slice of @p fill with bytes that depend on their object offset, so a byte that
+/// lands in the wrong place shows.
+void complete_with_pattern(held_request& fill)
+{
+  REQUIRE(fill.request != nullptr);
+  while (!fill.request->empty()) {
+    auto slice = fill.request->take_front();
+    REQUIRE(slice.is_fragmented());
+    for (auto* chunk : slice.h_buffer.fragments()) {
+      auto const piece =
+        cucascade::io::intersect(cucascade::io::range{slice.offset(), slice.size()},
+                                 cucascade::io::range{chunk->offset, controlled_chunk_bytes});
+      for (auto offset = piece.offset; offset < piece.end(); ++offset) {
+        chunk->data[offset - chunk->offset] = pattern(offset);
+      }
+    }
+    if (slice.has_device_request()) {
+      std::vector<std::uint8_t> bytes(slice.size());
+      for (std::size_t i = 0; i < bytes.size(); ++i) {
+        bytes[i] = pattern(slice.offset() + i);
+      }
+      auto const stream = slice.d_buffer.stream.get();
+      REQUIRE(cudaMemcpyAsync(
+                slice.d_buffer.data, bytes.data(), bytes.size(), cudaMemcpyHostToDevice, stream) ==
+              cudaSuccess);
+      REQUIRE(cudaStreamSynchronize(stream) == cudaSuccess);
+    }
+    if (slice.on_complete) { (*slice.on_complete)(slice.h_buffer.fragments(), true); }
+    fill.request->coordinator->on_complete();
+  }
+  fill.request.reset();
+}
+
+bool holds_pattern(std::span<std::uint8_t const> bytes, std::size_t offset)
+{
+  for (std::size_t i = 0; i < bytes.size(); ++i) {
+    if (bytes[i] != pattern(offset + i)) { return false; }
+  }
+  return true;
+}
+
+/// The one slice of @p fill must cover the whole span with all four chunks.
+void check_one_slice(held_request& fill, std::size_t offset, std::size_t size)
+{
+  REQUIRE(fill.request != nullptr);
+  REQUIRE(fill.request->remaining_slices() == 1);
+  auto const& slice = fill.request->front();
+  CHECK(slice.is_fragmented());
+  CHECK(slice.offset() == offset);
+  CHECK(slice.size() == size);
+  CHECK(slice.h_buffer.fragments().size() == 4);
+}
+}  // namespace
+
+TEST_CASE("a host read of several cold chunks fills them with one backend slice",
+          "[cache][read-arbitration][fill-merge]")
+{
+  if (run_in_child("CUCASCADE_CACHE_ARBITRATION_CHILD", 30s)) { return; }
+  arbitration_fixture fixture;
+  advise_range(*fixture.datasource, span_offset, span_size);
+  REQUIRE(fixture.datasource->prepare_prefetch(false) == prepare_result::prepared);
+  std::vector<std::uint8_t> destination(span_size);
+  held_request fill;
+  read_cleanup cleanup{*fixture.context, {&fill, nullptr}};
+  auto read = launched(
+    fixture.datasource->host_read_async(span_offset, destination.size(), destination.data()));
+  fill.request = fixture.context->backend().wait_take(2s);
+  check_one_slice(fill, span_offset, span_size);
+  complete_with_pattern(fill);
+  REQUIRE(read.wait_for(2s) == std::future_status::ready);
+  CHECK(read.get() == destination.size());
+  CHECK(holds_pattern(destination, span_offset));
+
+  // The chunks are cached: a second read needs no backend work.
+  std::vector<std::uint8_t> again(span_size);
+  auto cached =
+    launched(fixture.datasource->host_read_async(span_offset, again.size(), again.data()));
+  REQUIRE(cached.wait_for(2s) == std::future_status::ready);
+  CHECK(cached.get() == again.size());
+  CHECK(fixture.context->backend().pending_count() == 0);
+  CHECK(holds_pattern(again, span_offset));
+}
+
+TEST_CASE("a merged host fill completed one backend read at a time copies only finished chunks",
+          "[cache][read-arbitration][fill-merge]")
+{
+  if (run_in_child("CUCASCADE_CACHE_ARBITRATION_CHILD", 30s)) { return; }
+  arbitration_fixture fixture;
+  advise_range(*fixture.datasource, span_offset, span_size);
+  REQUIRE(fixture.datasource->prepare_prefetch(false) == prepare_result::prepared);
+  std::vector<std::uint8_t> destination(span_size, 0);
+  held_request fill;
+  read_cleanup cleanup{*fixture.context, {&fill, nullptr}};
+  auto read = launched(
+    fixture.datasource->host_read_async(span_offset, destination.size(), destination.data()));
+  fill.request = fixture.context->backend().wait_take(2s);
+  check_one_slice(fill, span_offset, span_size);
+
+  // Complete the slice as a reactor that split it into two reads does: each completion names only
+  // the chunks its read filled. The last two chunks hold bytes no read has written yet.
+  auto slice        = fill.request->take_front();
+  auto const chunks = slice.h_buffer.fragments();
+  REQUIRE(chunks.size() == 4);
+  auto const fill_chunks = [&](std::size_t begin, std::size_t end) {
+    for (auto i = begin; i < end; ++i) {
+      auto* chunk = chunks[i];
+      auto const piece =
+        cucascade::io::intersect(cucascade::io::range{slice.offset(), slice.size()},
+                                 cucascade::io::range{chunk->offset, controlled_chunk_bytes});
+      for (auto offset = piece.offset; offset < piece.end(); ++offset) {
+        chunk->data[offset - chunk->offset] = pattern(offset);
+      }
+    }
+  };
+  for (auto i = 2; i < 4; ++i) {
+    std::fill_n(chunks[i]->data, controlled_chunk_bytes, std::uint8_t{0xee});
+  }
+  fill.request->coordinator->add_tasks(1);
+  fill_chunks(0, 2);
+  (*slice.on_complete)(chunks.subspan(0, 2), true);
+  fill.request->coordinator->on_complete();
+
+  // Only the finished chunks are copied and cached; the read is still waiting.
+  CHECK(read.wait_for(50ms) == std::future_status::timeout);
+  auto const split = chunks[2]->offset - span_offset;
+  CHECK(holds_pattern(std::span{destination}.first(split), span_offset));
+  CHECK(std::ranges::all_of(std::span{destination}.subspan(split),
+                            [](auto byte) { return byte == 0; }));
+  for (auto i = 0; i < 4; ++i) {
+    CHECK((chunks[i]->state.load().state() == cucascade::io::cache::chunk_state::cached) ==
+          (i < 2));
+  }
+
+  fill_chunks(2, 4);
+  (*slice.on_complete)(chunks.subspan(2, 2), true);
+  fill.request->coordinator->on_complete();
+  fill.request.reset();
+  REQUIRE(read.wait_for(2s) == std::future_status::ready);
+  CHECK(read.get() == destination.size());
+  CHECK(holds_pattern(destination, span_offset));
+}
+
+TEST_CASE("a multi-range host read does not merge fills across its ranges",
+          "[cache][read-arbitration][fill-merge]")
+{
+  if (run_in_child("CUCASCADE_CACHE_ARBITRATION_CHILD", 30s)) { return; }
+  // Each range completes into its own part of the caller's buffer, so two ranges that meet in the
+  // object keep their own slices. Here they land in the buffer in the opposite order.
+  arbitration_fixture fixture;
+  advise_range(*fixture.datasource, 0, 2 * controlled_chunk_bytes);
+  REQUIRE(fixture.datasource->prepare_prefetch(false) == prepare_result::prepared);
+  std::vector<std::uint8_t> destination(2 * controlled_chunk_bytes);
+  std::array<cucascade::io::slice, 2> const ranges{
+    cucascade::io::slice{0, controlled_chunk_bytes, destination.data() + controlled_chunk_bytes},
+    cucascade::io::slice{controlled_chunk_bytes, controlled_chunk_bytes, destination.data()}};
+  held_request first;
+  held_request second;
+  read_cleanup cleanup{*fixture.context, {&first, &second}};
+  auto read     = launched(fixture.datasource->host_read_ranges_async(ranges));
+  first.request = fixture.context->backend().wait_take(2s);
+  REQUIRE(first.request != nullptr);
+  second.request = fixture.context->backend().wait_take(100ms);
+  auto const slices =
+    first.request->remaining_slices() + (second.request ? second.request->remaining_slices() : 0);
+  CHECK(slices == 2);
+  complete_with_pattern(first);
+  if (second.request) { complete_with_pattern(second); }
+  REQUIRE(read.wait_for(2s) == std::future_status::ready);
+  CHECK(read.get() == destination.size());
+  auto const bytes = std::span<std::uint8_t const>{destination};
+  CHECK(holds_pattern(bytes.first(controlled_chunk_bytes), controlled_chunk_bytes));
+  CHECK(holds_pattern(bytes.last(controlled_chunk_bytes), 0));
+}
+
+TEST_CASE("a device read of several cold chunks fills them with one backend slice",
+          "[cache][read-arbitration][fill-merge][gpu_execution]")
+{
+  if (run_in_child("CUCASCADE_CACHE_ARBITRATION_CHILD", 30s)) { return; }
+  arbitration_fixture fixture;
+  advise_range(*fixture.datasource, span_offset, span_size);
+  REQUIRE(fixture.datasource->prepare_prefetch(false) == prepare_result::prepared);
+  rmm::cuda_stream stream;
+  rmm::device_buffer destination(span_size, stream);
+  stream_cleanup drain{stream};
+  held_request fill;
+  read_cleanup cleanup{*fixture.context, {&fill, nullptr}};
+  auto read    = launched(fixture.datasource->device_read_async(
+    span_offset, span_size, static_cast<std::uint8_t*>(destination.data()), stream));
+  fill.request = fixture.context->backend().wait_take(2s);
+  check_one_slice(fill, span_offset, span_size);
+  CHECK(fill.request->front().has_device_request());
+  complete_with_pattern(fill);
+  REQUIRE(read.wait_for(2s) == std::future_status::ready);
+  CHECK(read.get() == span_size);
+  std::vector<std::uint8_t> host(span_size);
+  REQUIRE(cudaMemcpyAsync(
+            host.data(), destination.data(), host.size(), cudaMemcpyDeviceToHost, stream.value()) ==
+          cudaSuccess);
+  stream.synchronize();
+  CHECK(holds_pattern(host, span_offset));
+}
+
+TEST_CASE("a prefetch of several chunks fills them with one backend slice",
+          "[cache][read-arbitration][fill-merge]")
+{
+  if (run_in_child("CUCASCADE_CACHE_ARBITRATION_CHILD", 30s)) { return; }
+  arbitration_fixture fixture;
+  advise_range(*fixture.datasource, span_offset, span_size);
+  REQUIRE(fixture.datasource->prepare_prefetch(false) == prepare_result::prepared);
+  held_request fill;
+  read_cleanup cleanup{*fixture.context, {&fill, nullptr}};
+  fixture.prefetch(fill);
+  REQUIRE(fill.request->remaining_slices() == 1);
+  CHECK(fill.request->front().h_buffer.fragments().size() == 4);
+  complete_with_pattern(fill);
+
+  std::vector<std::uint8_t> destination(span_size);
+  auto read = launched(
+    fixture.datasource->host_read_async(span_offset, destination.size(), destination.data()));
+  REQUIRE(read.wait_for(2s) == std::future_status::ready);
+  CHECK(read.get() == destination.size());
+  CHECK(fixture.context->backend().pending_count() == 0);
+  CHECK(holds_pattern(destination, span_offset));
+}
+
+TEST_CASE("a failed merged fill fails the read and leaves every chunk to load again",
+          "[cache][read-arbitration][fill-merge]")
+{
+  if (run_in_child("CUCASCADE_CACHE_ARBITRATION_CHILD", 30s)) { return; }
+  arbitration_fixture fixture;
+  advise_range(*fixture.datasource, span_offset, span_size);
+  REQUIRE(fixture.datasource->prepare_prefetch(false) == prepare_result::prepared);
+  std::vector<std::uint8_t> destination(span_size);
+  held_request fill;
+  read_cleanup cleanup{*fixture.context, {&fill, nullptr}};
+  auto failed = launched(
+    fixture.datasource->host_read_async(span_offset, destination.size(), destination.data()));
+  fill.request = fixture.context->backend().wait_take(2s);
+  check_one_slice(fill, span_offset, span_size);
+  fill.cancel();
+  REQUIRE(failed.wait_for(2s) == std::future_status::ready);
+  CHECK_THROWS(failed.get());
+
+  auto retried = launched(
+    fixture.datasource->host_read_async(span_offset, destination.size(), destination.data()));
+  fill.request = fixture.context->backend().wait_take(2s);
+  check_one_slice(fill, span_offset, span_size);
+  complete_with_pattern(fill);
+  REQUIRE(retried.wait_for(2s) == std::future_status::ready);
+  CHECK(retried.get() == destination.size());
+  CHECK(holds_pattern(destination, span_offset));
 }

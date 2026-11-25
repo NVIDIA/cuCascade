@@ -56,12 +56,10 @@
 
 #include <algorithm>
 #include <cassert>
-#include <cctype>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
-#include <fstream>
 #include <functional>
 #include <mutex>
 #include <sstream>
@@ -531,33 +529,6 @@ std::unique_ptr<idata_representation> convert_gpu_to_host_fast(
 // =============================================================================
 
 /**
- * @brief Best-effort lookup of the NUMA node a GPU's PCI device is attached to.
- *        Returns -1 if the device id is invalid, the PCI bus id is unknown, or
- *        /sys/bus/pci/devices/<bus>/numa_node is unreadable / -1. Pure topology
- *        query — no allocation, no side effects.
- */
-int resolve_gpu_numa_node(int device_id) noexcept
-{
-  if (device_id < 0) { return -1; }
-  char pci_buf[32] = {0};
-  if (cudaDeviceGetPCIBusId(pci_buf, sizeof(pci_buf), device_id) != cudaSuccess) { return -1; }
-  std::string pci(pci_buf);
-  for (auto& c : pci) {
-    c = static_cast<char>(std::tolower(c));
-  }
-  std::ifstream f("/sys/bus/pci/devices/" + pci + "/numa_node");
-  if (!f.is_open()) { return -1; }
-  std::string content;
-  std::getline(f, content);
-  if (content.empty()) { return -1; }
-  try {
-    return std::stoi(content);
-  } catch (...) {
-    return -1;
-  }
-}
-
-/**
  * @brief Copy @p size bytes from @p src_ptr
  * (on @p src_device) into a buffer.
  *
@@ -600,7 +571,7 @@ Buffer peer_copy_into_async(Buffer buf,
   // convert_gpu_to_host does. Stream-ordering inside the loop preserves the
   // same-stream invariant the original implementation relied on.
   memory::fixed_size_host_memory_resource* host_pool =
-    memory::find_host_pool(resolve_gpu_numa_node(dst_device));
+    memory::find_host_pool(memory::gpu_numa_node(dst_device));
   // Without working peer DMA, each leg must run with its own device current (the D2H leg
   // fails with cudaErrorInvalidValue otherwise). Both legs stay on target_stream, so they are
   // still ordered.
@@ -610,7 +581,7 @@ Buffer peer_copy_into_async(Buffer buf,
     // standalone test builds that exercise the converter without constructing
     // a memory_reservation_manager. Fall back to a one-shot pinned allocation
     // (slow path — preserves correctness).
-    memory::numa_region_pinned_host_memory_resource mr(resolve_gpu_numa_node(dst_device),
+    memory::numa_region_pinned_host_memory_resource mr(memory::gpu_numa_node(dst_device),
                                                        /*make_portable=*/true);
     void* host_buf = mr.allocate_sync(size_in_bytes);
 

@@ -22,6 +22,7 @@
 #include <cucascade/exec/try.hpp>
 #include <cucascade/io/byte_range.hpp>
 #include <cucascade/io/cache/fs_cache.hpp>
+#include <cucascade/io/details/std_future.hpp>
 #include <cucascade/log/logging.hpp>
 
 #include <rmm/device_buffer.hpp>
@@ -44,29 +45,6 @@ struct io_read_to_gpu_message {
   static constexpr char const* message{"io:read_to_gpu"};
 };
 
-// Deferred call that owns a read: destroying it waits for the read, so a future returned by
-// std::async(std::launch::deferred, joining_future{...}) joins its read when it is dropped.
-template <typename T>
-class joining_future {
- public:
-  explicit joining_future(std::future<T> read) noexcept : _read(std::move(read)) {}
-
-  joining_future(joining_future&&) noexcept            = default;
-  joining_future& operator=(joining_future&&) noexcept = delete;
-  joining_future(joining_future const&)                = delete;
-  joining_future& operator=(joining_future const&)     = delete;
-
-  ~joining_future()
-  {
-    if (_read.valid()) { _read.wait(); }
-  }
-
-  T operator()() { return _read.get(); }
-
- private:
-  std::future<T> _read;
-};
-
 // A host read into a buffer that the returned future owns.  The read is declared after the buffer
 // so that it is joined before the buffer is freed.
 class owning_host_read {
@@ -86,28 +64,6 @@ class owning_host_read {
   std::vector<uint8_t> _buffer;
   std::future<size_t> _read;
 };
-
-// Bridge a semi_future into a std::future that joins the read when dropped. Promise,
-// std::future, and the exact type-erased terminal are all built before
-// producer() may publish IO, so callback installation is a move-only,
-// non-allocating handoff.
-template <typename Producer>
-std::future<size_t> bridge_semi_to_std(Producer&& producer)
-{
-  auto p              = std::make_shared<std::promise<size_t>>();
-  auto fut            = p->get_future();
-  using terminal_type = exec::invocable<void(exec::try_t<size_t>&&) &&>;
-  terminal_type terminal{[p = std::move(p)](exec::try_t<size_t>&& t) mutable {
-    if (t.has_exception()) {
-      p->set_exception(std::move(t).exception());
-    } else {
-      p->set_value(std::move(t).value());
-    }
-  }};
-  auto sf = std::forward<Producer>(producer)();
-  std::move(sf).install_callback(std::move(terminal));
-  return std::async(std::launch::deferred, joining_future<size_t>{std::move(fut)});
-}
 
 }  // namespace
 
@@ -145,11 +101,8 @@ bool datasource::is_device_read_preferred(size_t) const { return _io_ctx->suppor
 
 size_t datasource::host_read(size_t offset, size_t size, uint8_t* dst)
 {
-  if (uses_fs_cache()) {
-    auto* cache = _io_ctx->cache();
-    return cache->host_read(*_io_object, offset, size, dst, &_prefetch_handle);
-  }
-  return std::move(_io_ctx->host_read_async_io(*_io_object, offset, size, dst)).get();
+  return std::move(_io_ctx->host_read_async(*_io_object, offset, size, dst, &_prefetch_handle))
+    .get();
 }
 
 std::unique_ptr<cudf::io::datasource::buffer> datasource::host_read(size_t offset, size_t size)
@@ -162,13 +115,8 @@ std::unique_ptr<cudf::io::datasource::buffer> datasource::host_read(size_t offse
 
 std::future<size_t> datasource::host_read_async(size_t offset, size_t size, uint8_t* dst)
 {
-  return bridge_semi_to_std([&] {
-    if (uses_fs_cache()) {
-      auto* cache = _io_ctx->cache();
-      return cache->host_read_async(*_io_object, offset, size, dst, &_prefetch_handle);
-    }
-    return _io_ctx->host_read_async_io(*_io_object, offset, size, dst);
-  });
+  return bridge_semi_to_std(
+    [&] { return _io_ctx->host_read_async(*_io_object, offset, size, dst, &_prefetch_handle); });
 }
 
 std::future<std::unique_ptr<cudf::io::datasource::buffer>> datasource::host_read_async(
@@ -214,11 +162,7 @@ std::future<size_t> datasource::device_read_async(size_t offset,
 {
   ::cuda::stream_ref stream{stream_arg};
   return bridge_semi_to_std([&] {
-    if (uses_fs_cache()) {
-      auto* cache = _io_ctx->cache();
-      return cache->device_read_async(*_io_object, offset, size, dst, stream, &_prefetch_handle);
-    }
-    return _io_ctx->device_read_async_io(*_io_object, offset, size, dst, stream);
+    return _io_ctx->device_read_async(*_io_object, offset, size, dst, stream, &_prefetch_handle);
   });
 }
 

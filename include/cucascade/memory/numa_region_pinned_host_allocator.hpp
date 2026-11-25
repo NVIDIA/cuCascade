@@ -26,6 +26,15 @@
 namespace cucascade {
 namespace memory {
 
+/**
+ * @brief Best-effort lookup of the NUMA node a GPU's PCI device is attached to.
+ *
+ * @return The node, or -1 if the device id is invalid, the PCI bus id is unknown, or
+ * /sys/bus/pci/devices/<bus>/numa_node is unreadable or -1. Pure topology query: no allocation, no
+ * side effects.
+ */
+[[nodiscard]] int gpu_numa_node(int device_id) noexcept;
+
 class numa_region_pinned_host_memory_resource final {
  public:
   explicit numa_region_pinned_host_memory_resource(int numa_node, bool make_portable = false);
