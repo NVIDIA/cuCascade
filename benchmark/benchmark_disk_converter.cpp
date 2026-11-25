@@ -40,8 +40,10 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -172,13 +174,18 @@ std::vector<memory_space_config> create_benchmark_configs()
   default_disk.mount_paths     = benchmark_disk_dir();
   configs.emplace_back(default_disk);
 
-  // DISK 1: cuFile forced (GDS when available, cuFile compatibility mode otherwise).
-  disk_memory_space_config cufile_disk = default_disk;
-  cufile_disk.disk_id                  = CUFILE_DISK_ID;
-  disk_io_context_options cufile_options;
-  cufile_options.backend = disk_io_backend::cufile;
-  cufile_disk.io_context = make_disk_io_context(cufile_options);
-  configs.emplace_back(cufile_disk);
+  // DISK 1: cuFile forced (GDS when available, cuFile compatibility mode otherwise).  Left out
+  // where no cuFile context can start, so only its benchmarks skip (see disk_space_for).
+  try {
+    disk_memory_space_config cufile_disk = default_disk;
+    cufile_disk.disk_id                  = CUFILE_DISK_ID;
+    disk_io_context_options cufile_options;
+    cufile_options.backend = disk_io_backend::cufile;
+    cufile_disk.io_context = make_disk_io_context(cufile_options);
+    configs.emplace_back(cufile_disk);
+  } catch (std::exception const& e) {
+    std::fprintf(stderr, "DISK %d (cuFile) is unavailable: %s\n", CUFILE_DISK_ID, e.what());
+  }
 
   return configs;
 }
@@ -222,7 +229,8 @@ void DoTeardown([[maybe_unused]] const benchmark::State& state)
 
 /**
  * @brief The DISK space named by the benchmark's third argument (state.range(2)), or null
- *        (benchmark skipped) when its io context cannot write what the benchmark needs.
+ *        (benchmark skipped) when this host has no such space, or its io context cannot write
+ *        what the benchmark needs.
  *
  * @param device Whether the benchmark writes device memory (GPU -> DISK) or host memory.
  */
@@ -230,7 +238,11 @@ const memory_space* disk_space_for(benchmark::State& state, bool device)
 {
   auto const disk_id = static_cast<int>(state.range(2));
   auto* space        = get_shared_memory_manager()->get_memory_space(Tier::DISK, disk_id);
-  auto context       = resolve_disk_io_context(*space);
+  if (space == nullptr) {
+    state.SkipWithMessage("DISK " + std::to_string(disk_id) + " is unavailable on this host");
+    return nullptr;
+  }
+  auto context = resolve_disk_io_context(*space);
   if (device ? !context->supports_device_write() : !context->supports_write()) {
     state.SkipWithMessage("the io context of DISK " + std::to_string(disk_id) + " cannot write " +
                           (device ? "device" : "host") + " memory");
