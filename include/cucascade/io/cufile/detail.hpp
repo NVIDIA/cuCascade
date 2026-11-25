@@ -51,4 +51,9 @@ void release_arenas_for_testing() noexcept;
 /// real outcomes.
 void fail_copy_queries_for_testing(int event_error, int stream_error = 0) noexcept;
 
+/// Make every worker thread a reactor starts from now on take @p status (a @c cudaError_t) as
+/// the outcome of selecting its GPU, as though @c cudaSetDevice had reported an earlier
+/// asynchronous error of another thread.  @c cudaSuccess (0) restores the real outcome.
+void fail_worker_setup_for_testing(int status) noexcept;
+
 }  // namespace cucascade::io::cufile::detail

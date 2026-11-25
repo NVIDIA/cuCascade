@@ -416,6 +416,18 @@ class failing_copy_queries {
   failing_copy_queries& operator=(failing_copy_queries const&) = delete;
 };
 
+/// Every reactor worker started in the scope fails to select its GPU with @p status.
+class failing_worker_setup {
+ public:
+  explicit failing_worker_setup(cudaError_t status)
+  {
+    cucascade::io::cufile::detail::fail_worker_setup_for_testing(status);
+  }
+  ~failing_worker_setup() { cucascade::io::cufile::detail::fail_worker_setup_for_testing(0); }
+  failing_worker_setup(failing_worker_setup const&)            = delete;
+  failing_worker_setup& operator=(failing_worker_setup const&) = delete;
+};
+
 }  // namespace
 
 TEST_CASE("GDS serves a filesystem only when the driver reports its storage class", "[io][cufile]")
@@ -1467,6 +1479,34 @@ TEST_CASE("a cufile reactor that was shut down can be started again", "[io][cufi
     CHECK(destination.download() == expected);
     reactor.shutdown();
   }
+}
+
+TEST_CASE("a cufile worker that cannot select its GPU fails start instead of the process",
+          "[io][cufile][gpu]")
+{
+  if (!cufile_usable()) { SKIP("requires a CUDA device and a cuFile driver"); }
+  auto const expected = pattern(MiB + 77, 17);
+  scratch_file file{expected};
+  cufile_reactor reactor{small_config(), 0};
+  {
+    failing_worker_setup const failing{cudaErrorLaunchFailure};
+    CHECK_THROWS_AS(reactor.start(), cucascade::cuda_error);
+  }
+
+  // The failed start left nothing behind: the reactor starts again and reads.
+  reactor.start();
+  std::shared_ptr<cufile_io_object const> const object =
+    cufile_reactor::create_io_object(file.path);
+  device_bytes destination(expected.size());
+  std::vector<cucascade::io::prepared_io_slice> slices;
+  slices.emplace_back(cucascade::io::range{0, expected.size()},
+                      cucascade::io::device_buffer{destination.data, destination.stream(), 0});
+  auto request = cucascade::io::grouped_io_request::create(object, std::move(slices));
+  auto read    = request->coordinator->get_future();
+  reactor.enqueue(std::move(request));
+  CHECK(std::move(read).get(30s) == expected.size());
+  CHECK(destination.download() == expected);
+  reactor.shutdown();
 }
 
 TEST_CASE("cufile device I/O runs on the reactor of the buffer's GPU",

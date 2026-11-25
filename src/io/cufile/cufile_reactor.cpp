@@ -44,6 +44,7 @@
 #include <deque>
 #include <exception>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
@@ -529,6 +530,9 @@ std::shared_ptr<device_arena> arena_of(int device, config const& cfg)
 /// none.
 std::atomic<int> copy_event_query_failure{cudaSuccess};
 std::atomic<int> copy_stream_query_failure{cudaSuccess};
+/// See detail::fail_worker_setup_for_testing: the status a worker thread takes for selecting its
+/// GPU instead of the real one; cudaSuccess for none.
+std::atomic<int> worker_setup_failure{cudaSuccess};
 
 /// @p real, or the status a test injects instead (see detail::fail_copy_queries_for_testing).
 cudaError_t injected_or(cudaError_t real, std::atomic<int> const& injected) noexcept
@@ -536,6 +540,46 @@ cudaError_t injected_or(cudaError_t real, std::atomic<int> const& injected) noex
   auto const status = injected.load(std::memory_order_relaxed);
   return status != cudaSuccess ? static_cast<cudaError_t>(status) : real;
 }
+
+/// What cufile_reactor::start() waits for: every worker thread selecting the reactor's GPU.
+/// A thread that cannot hands its exception over here and exits, since an exception thrown
+/// out of its entry would terminate the process.  Shared with the threads, so the last one to
+/// report never touches it after start() has let it go.
+class worker_startup {
+ public:
+  explicit worker_startup(std::size_t threads) : _pending(threads) {}
+
+  /// Make @p device current on the calling worker thread and report how that went.
+  /// @return Whether the thread may go on to serve work.
+  bool select_device(int device) noexcept
+  {
+    std::exception_ptr error;
+    try {
+      CUCASCADE_CUDA_TRY(injected_or(cudaSetDevice(device), worker_setup_failure));
+    } catch (...) {
+      error = std::current_exception();
+    }
+    std::lock_guard const lock(_mutex);
+    if (error != nullptr && _error == nullptr) { _error = error; }
+    --_pending;
+    _done.notify_all();
+    return error == nullptr;
+  }
+
+  /// Wait for every thread to report; rethrow the first failure.
+  void wait()
+  {
+    std::unique_lock lock(_mutex);
+    _done.wait(lock, [this] { return _pending == 0; });
+    if (_error != nullptr) { std::rethrow_exception(_error); }
+  }
+
+ private:
+  std::mutex _mutex;
+  std::condition_variable _done;
+  std::size_t _pending;
+  std::exception_ptr _error;
+};
 
 /// Wait for everything queued on @p stream.  cudaSuccess once it has finished, or the terminal
 /// status (see terminal_cuda_status) once the GPU's context is out of service, so nothing queued
@@ -607,6 +651,11 @@ void fail_copy_queries_for_testing(int event_error, int stream_error) noexcept
 {
   copy_event_query_failure.store(event_error, std::memory_order_relaxed);
   copy_stream_query_failure.store(stream_error, std::memory_order_relaxed);
+}
+
+void fail_worker_setup_for_testing(int status) noexcept
+{
+  worker_setup_failure.store(status, std::memory_order_relaxed);
 }
 
 }  // namespace detail
@@ -972,7 +1021,8 @@ void cufile_reactor::start()
       std::lock_guard const lock(_completer->mutex);
       _completer->stopped = false;
     }
-    _completer->thread = std::thread([this] {
+    auto const startup = std::make_shared<worker_startup>(1 + 2 * _config.lanes);
+    _completer->thread = std::thread([this, startup] {
       std::ignore =
         exec::thread_util::set_current_thread_name("cf-g" + std::to_string(_device) + "-cp");
       if (!_cpus.empty() && !exec::thread_util::set_current_thread_affinity(_cpus)) {
@@ -981,8 +1031,7 @@ void cufile_reactor::start()
       // Its polls sleep for microseconds: do not let the kernel stretch them by the default 50 us.
       std::ignore = prctl(PR_SET_TIMERSLACK, 1000UL, 0UL, 0UL, 0UL);
       lane_owner  = this;
-      CUCASCADE_CUDA_TRY(cudaSetDevice(_device));
-      complete_copies();
+      if (startup->select_device(_device)) { complete_copies(); }
     });
 
     for (auto* set : {_readers.get(), _writers.get()}) {
@@ -994,18 +1043,18 @@ void cufile_reactor::start()
       for (std::size_t i = 0; i < set->lanes.size(); ++i) {
         auto name = "cf-g" + std::to_string(_device) + "-" + role + std::to_string(i);
         set->lanes[i]->thread =
-          std::thread([this, set, self = set->lanes[i].get(), name = std::move(name)] {
+          std::thread([this, set, startup, self = set->lanes[i].get(), name = std::move(name)] {
             std::ignore = exec::thread_util::set_current_thread_name(name);
             if (!_cpus.empty() && !exec::thread_util::set_current_thread_affinity(_cpus)) {
               CUCASCADE_LOG_WARN("cufile_reactor {}: cannot pin the lane to its CPUs", name);
             }
             lane_owner = this;
             // Once: every cuFile call, copy and event of the lane is on this GPU.
-            CUCASCADE_CUDA_TRY(cudaSetDevice(_device));
-            run(*set, *self);
+            if (startup->select_device(_device)) { run(*set, *self); }
           });
       }
     }
+    startup->wait();
   } catch (...) {
     shutdown();
     throw;
