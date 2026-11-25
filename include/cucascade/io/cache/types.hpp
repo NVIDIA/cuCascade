@@ -1021,7 +1021,9 @@ struct cached_chunk {
   }
 
   /// Return the priority to 0. Only the thread that holds the chunk in `evicting` calls this,
-  /// before @c mark_empty, so no new buffer (and no refill's raise) can be attached yet.
+  /// before @c mark_empty, so no new buffer (and no refill's raise) can be attached yet. Relaxed
+  /// is enough: @c mark_empty is a release, and a refill's @c mark_queued is an acquire that reads
+  /// it, so this store happens before the refill's raise and cannot overwrite it.
   void clear_eviction_priority() noexcept
   {
     eviction_priority.store(std::uint8_t{0}, std::memory_order_relaxed);
