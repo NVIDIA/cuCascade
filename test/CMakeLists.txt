@@ -30,6 +30,7 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
     cucascade_tests
     # Memory tests
     memory/test_fixed_size_host_memory_resource.cpp
+    memory/test_gpu_numa_node.cpp
     memory/test_numa_affinity.cpp
     memory/test_memory_reservation_manager.cpp
     memory/test_pool_peer_access.cpp
@@ -50,6 +51,7 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
     # Utils
     # Replaces the global operator new for the whole test binary
     utils/allocation_counter.cpp
+    utils/test_worker_group.cpp
     # Main test runner
     unittest.cpp)
   set_target_properties(cucascade_tests PROPERTIES CUDA_STANDARD 20
@@ -155,6 +157,8 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_CUDF)
     cucascade_cudf_tests
     # Utils
     utils/cudf_test_utils.cpp
+    # Replaces the global operator new for the whole test binary
+    utils/allocation_counter.cpp
     # Data tests (cudf-backed representations / converters / profiler)
     data/test_bandwidth_profiler.cpp
     data/test_data_batch.cpp
@@ -162,6 +166,7 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_CUDF)
     data/test_disk_host_converters.cpp
     data/test_gpu_disk_converters.cpp
     data/test_representation_converter.cpp
+    cudf/test_chunk_plan.cpp
     cudf/test_gpu_to_gpu_converter.cpp
     cudf/test_release_table_stream.cpp
     # Main test runner
@@ -186,6 +191,11 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_CUDF)
   target_include_directories(
     cucascade_cudf_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
                                  ${CMAKE_CURRENT_SOURCE_DIR}/utils)
+  # Tests of src-private cudf-layer helpers (chunk_plan.hpp) include them from
+  # src/cudf. Not src/ itself: its cudf/ directory would shadow libcudf's
+  # <cudf/...> headers.
+  target_include_directories(cucascade_cudf_tests
+                             PRIVATE ${PROJECT_SOURCE_DIR}/src/cudf)
 
   # Link dependencies
   target_link_libraries(
