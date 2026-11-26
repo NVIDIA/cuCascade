@@ -24,6 +24,7 @@
 #include <cucascade/io/io_context.hpp>
 #include <cucascade/io/io_request.hpp>
 #include <cucascade/io/types.hpp>
+#include <cucascade/io/uri_parser.hpp>
 #include <cucascade/log/logging.hpp>
 #include <cucascade/memory/topology_index.hpp>
 #include <cucascade/utils/error_utils.hpp>
@@ -113,8 +114,7 @@ using size_terminal = exec::invocable<void(exec::try_t<std::size_t>&&) &&>;
 {
   auto const [lo, hi] = fill_span(required, chunk.offset, chunk_size);
   auto const snapshot = chunk.state.load();
-  return (snapshot.state() == chunk_state::cached || snapshot.state() == chunk_state::in_use) &&
-         covers(snapshot.fill(), chunk.offset, chunk_size, lo, hi);
+  return snapshot.is_readable() && covers(snapshot.fill(), chunk.offset, chunk_size, lo, hi);
 }
 
 [[nodiscard]] bool extents_resident(std::span<cached_chunk* const> chunks,
@@ -658,6 +658,38 @@ std::size_t fs_cache::generation_count(std::string_view object_path) const noexc
   if (it == _generations_by_path.end()) { return 0; }
   return static_cast<std::size_t>(
     std::ranges::count_if(it->second, [](auto const& weak) { return !weak.expired(); }));
+}
+
+std::optional<fs_cache::object_residency> fs_cache::residency(std::string_view object_path) const
+{
+  auto const path = strip_file_scheme(object_path);
+  std::shared_ptr<cache_generation> current;
+  {
+    // Get-or-create appends the generation it creates last and retires every other one under
+    // the exclusive map lock, so only the last entry can be current.
+    std::shared_lock lk(_map_mtx);
+    auto const it = _generations_by_path.find(path);
+    if (it == _generations_by_path.end() || it->second.empty()) { return std::nullopt; }
+    current = it->second.back().lock();
+    if (!current || current->retired.load(std::memory_order_acquire)) { return std::nullopt; }
+  }
+
+  object_residency out{0, current->file_size};
+  std::shared_lock lock(current->mtx);
+  for (auto const* c : current->slots) {
+    if (c == nullptr) { continue; }
+    auto const snapshot = c->state.load();
+    if (!snapshot.is_readable()) { continue; }
+    auto const chunk_bytes = std::min(current->chunk_size, current->file_size - c->offset);
+    auto const fill        = snapshot.fill();
+    if (fill.full) {
+      out.resident_bytes += chunk_bytes;
+    } else if (!fill.is_unset()) {
+      out.resident_bytes +=
+        std::min(static_cast<std::size_t>(fill.pages) * io::IO_BLOCK_SIZE, chunk_bytes);
+    }
+  }
+  return out;
 }
 
 std::size_t fs_cache::retired_generation_count() const noexcept
