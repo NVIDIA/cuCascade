@@ -32,6 +32,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <barrier>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -1955,4 +1956,190 @@ TEST_CASE("read_only_data_batch copy then mutable after all copies released", "[
   auto mut = batch->to_mutable();
   REQUIRE(batch->get_state() == batch_state::mutable_locked);
   REQUIRE(mut.get_batch_id() == 1);
+}
+
+namespace {
+
+enum class clone_path { plain, space, reserved };
+enum class clone_result { success, copy_failure, batch_failure };
+
+struct clone_event {
+  uint64_t id;
+  uint64_t destination;
+  const idata_representation* source;
+  const memory::memory_space* target;
+  std::optional<bool> success;
+};
+
+class clone_probe : public idata_batch_probe {
+ public:
+  explicit clone_probe(std::vector<clone_event>& events) : _events(events) {}
+
+  void clone_started(uint64_t id,
+                     const idata_representation& source,
+                     const memory::memory_space* target,
+                     uint64_t destination) const noexcept override
+  {
+    std::lock_guard lock(_mutex);
+    _events.push_back({id, destination, &source, target, std::nullopt});
+  }
+
+  void clone_completed(uint64_t id, bool success) const noexcept override
+  {
+    std::lock_guard lock(_mutex);
+    _events.push_back({id, 0, nullptr, nullptr, success});
+  }
+
+ private:
+  std::vector<clone_event>& _events;
+  mutable std::mutex _mutex;
+};
+
+class throwing_clone : public mock_data_representation {
+ public:
+  explicit throwing_clone(clone_result result = clone_result::copy_failure)
+    : mock_data_representation(memory::Tier::HOST), _result(result)
+  {
+  }
+
+  [[nodiscard]] std::unique_ptr<idata_representation> clone(::cuda::stream_ref) const override
+  {
+    if (_result == clone_result::copy_failure) { throw std::runtime_error("copy failed"); }
+    return std::make_unique<mock_data_representation>(memory::Tier::HOST);
+  }
+
+ private:
+  clone_result _result;
+};
+
+}  // namespace
+
+TEST_CASE("clone callbacks pair across accessors and outcomes", "[data_batch][clone_probe]")
+{
+  const auto path = GENERATE(clone_path::plain, clone_path::space, clone_path::reserved);
+  const auto result =
+    GENERATE(clone_result::success, clone_result::copy_failure, clone_result::batch_failure);
+  const auto state = GENERATE(batch_state::read_only, batch_state::mutable_locked);
+  CAPTURE(path, result, state);
+
+  constexpr uint64_t source_id      = 1;
+  constexpr uint64_t destination_id = 2;
+  std::vector<clone_event> events;
+  auto source = std::make_unique<throwing_clone>(result);
+  auto* space = &source->get_memory_space();
+  auto batch =
+    data_batch::make(source_id, std::move(source), std::make_unique<clone_probe>(events));
+  auto reservation = space->make_reservation(1);
+  representation_converter_registry registry;
+  registry.register_converter<throwing_clone, mock_data_representation>(
+    [&](const idata_representation&,
+        const memory::memory_space*,
+        ::cuda::stream_ref,
+        memory::reservation*) -> std::unique_ptr<idata_representation> {
+      if (result == clone_result::copy_failure) { throw std::runtime_error("copy failed"); }
+      return std::make_unique<mock_data_representation>(memory::Tier::HOST);
+    });
+
+  auto invoke = [&](auto& accessor) {
+    std::unique_ptr<idata_batch_probe> probe;
+    if (result != clone_result::batch_failure) { probe = std::make_unique<idata_batch_probe>(); }
+    switch (path) {
+      case clone_path::plain:
+        return accessor.clone(
+          destination_id, ::cuda::stream_ref{cudaStream_t{nullptr}}, std::move(probe));
+      case clone_path::space:
+        return accessor.template clone_to<mock_data_representation>(
+          registry,
+          destination_id,
+          space,
+          ::cuda::stream_ref{cudaStream_t{nullptr}},
+          std::move(probe));
+      case clone_path::reserved:
+        return accessor.template clone_to<mock_data_representation>(
+          registry,
+          destination_id,
+          *reservation,
+          ::cuda::stream_ref{cudaStream_t{nullptr}},
+          std::move(probe));
+    }
+    throw std::logic_error("unknown clone path");
+  };
+  auto check = [&](auto& accessor) {
+    const auto* original = accessor.get_data();
+    if (result == clone_result::success) {
+      REQUIRE(invoke(accessor)->get_batch_id() == destination_id);
+    } else if (result == clone_result::copy_failure) {
+      REQUIRE_THROWS_WITH(invoke(accessor), "copy failed");
+    } else {
+      REQUIRE_THROWS_WITH(invoke(accessor), "probe is null in data_batch factory");
+    }
+    REQUIRE(accessor.get_data() == original);
+    REQUIRE(events.size() == 2);
+    REQUIRE(events[0].source == original);
+    REQUIRE(events[0].target == space);
+    REQUIRE(events[0].destination == destination_id);
+    REQUIRE_FALSE(events[0].success.has_value());
+    REQUIRE(events[1].id == events[0].id);
+    REQUIRE(events[1].success == (result == clone_result::success));
+  };
+  if (state == batch_state::read_only) {
+    auto accessor = batch->to_read_only();
+    check(accessor);
+  } else {
+    auto accessor = batch->to_mutable();
+    check(accessor);
+  }
+}
+
+TEST_CASE("overlapping clones have distinct paired IDs", "[data_batch][clone_probe]")
+{
+  constexpr std::size_t clone_count = 4;
+  std::vector<clone_event> events;
+  auto batch =
+    data_batch::make(1, std::make_unique<throwing_clone>(), std::make_unique<clone_probe>(events));
+  std::barrier rendezvous{static_cast<std::ptrdiff_t>(clone_count)};
+  representation_converter_registry registry;
+  registry.register_converter<throwing_clone, mock_data_representation>(
+    [&](const idata_representation&,
+        const memory::memory_space*,
+        ::cuda::stream_ref,
+        memory::reservation*) -> std::unique_ptr<idata_representation> {
+      // Force every start before any completion, without timing assumptions.
+      rendezvous.arrive_and_wait();
+      throw std::runtime_error("copy failed");
+    });
+  std::vector<std::thread> threads;
+  std::atomic<std::size_t> failures{0};
+  for (std::size_t index = 0; index < clone_count; ++index) {
+    threads.emplace_back([&, index] {
+      auto accessor = batch->to_read_only();
+      try {
+        auto clone =
+          accessor.clone_to<mock_data_representation>(registry,
+                                                      index + 2,
+                                                      accessor.get_memory_space(),
+                                                      ::cuda::stream_ref{cudaStream_t{nullptr}});
+      } catch (const std::runtime_error&) {
+        failures.fetch_add(1);
+      }
+    });
+  }
+  for (auto& thread : threads) {
+    thread.join();
+  }
+
+  REQUIRE(failures == clone_count);
+  REQUIRE(events.size() == clone_count * 2);
+  std::map<uint64_t, std::size_t> starts;
+  std::map<uint64_t, std::size_t> ends;
+  for (const auto& event : events) {
+    if (event.success.has_value()) {
+      REQUIRE_FALSE(*event.success);
+      ++ends[event.id];
+      continue;
+    }
+    ++starts[event.id];
+  }
+  REQUIRE(starts.size() == clone_count);
+  REQUIRE(starts == ends);
 }
