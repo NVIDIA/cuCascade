@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace cucascade::memory {
@@ -30,7 +31,7 @@ struct gpu_runtime_attributes {
  * @brief GPU information.
  */
 struct gpu_topology_info {
-  unsigned int id{0};                        ///< GPU device ID.
+  unsigned int id{0};                        ///< Ordinal in `gpus`; NVML index in `all_gpus`.
   std::string name;                          ///< GPU device name.
   std::string pci_bus_id;                    ///< PCI bus ID.
   std::string uuid;                          ///< GPU UUID.
@@ -80,6 +81,55 @@ struct storage_device_info {
   std::string name;                                   ///< Device name (e.g., "nvme0n1").
   int numa_node{-1};                                  ///< NUMA node ID (-1 if unknown).
   std::string pci_bus_id;                             ///< PCI bus ID.
+};
+
+/**
+ * @brief Network file system types that topology discovery recognizes.
+ *
+ * Only network (or network-backed FUSE) file systems are listed; mounts of any other type
+ * are not reported. Values mirror the type names in `/proc/self/mountinfo` (`nfs4`,
+ * `fuse.sshfs`, ...); see `to_string(NetworkFsType)`.
+ */
+enum class NetworkFsType {
+  NFS,             // NFS v2/v3 ("nfs")
+  NFS4,            // NFS v4 ("nfs4")
+  CIFS,            // SMB/CIFS ("cifs")
+  SMB3,            // SMB3 ("smb3")
+  SMBFS,           // Legacy SMB ("smbfs")
+  CEPH,            // CephFS ("ceph")
+  LUSTRE,          // Lustre ("lustre")
+  GPFS,            // IBM Spectrum Scale / GPFS ("gpfs")
+  BEEGFS,          // BeeGFS ("beegfs")
+  GLUSTERFS,       // GlusterFS native ("glusterfs")
+  AFS,             // Andrew File System ("afs")
+  FUSE_GLUSTERFS,  // GlusterFS via FUSE ("fuse.glusterfs")
+  FUSE_SSHFS,      // SSHFS ("fuse.sshfs")
+  FUSE_S3FS        // S3 via FUSE ("fuse.s3fs")
+};
+
+/**
+ * @brief Get the `/proc/self/mountinfo` name of a network file system type.
+ *
+ * @param type File system type.
+ * @return Name such as "nfs4" or "fuse.sshfs"; "unknown" for a value outside the enum.
+ */
+[[nodiscard]] std::string_view to_string(NetworkFsType type);
+
+/**
+ * @brief A mounted network file system.
+ *
+ * Describes one entry of `/proc/self/mountinfo` whose file system type is a
+ * `NetworkFsType`. Mounts of local file systems are not reported.
+ *
+ * @note Detection is passive: only the kernel's mount table is read, so an
+ *       unreachable server cannot block discovery. Nothing says the remote end is
+ *       currently reachable.
+ */
+struct network_fs_mount_info {
+  std::string mount_point;  ///< Where the file system is mounted (e.g., "/mnt/data").
+  NetworkFsType fs_type = NetworkFsType::NFS;  ///< File system type (set by discovery).
+  std::string source;                          ///< Remote source (e.g., "server:/export").
+  std::string options;  ///< Per-superblock options (e.g., "rw,vers=4.2,proto=rdma").
 };
 
 /**
@@ -140,18 +190,33 @@ struct kernel_tls_info {
 [[nodiscard]] kernel_tls_info discover_kernel_tls(discovery_roots const& roots = {});
 
 /**
+ * @brief Discover the network file systems mounted in the current mount namespace.
+ *
+ * Reads `/proc/self/mountinfo` and reports every mount whose file system type is a
+ * `NetworkFsType`, in mount table order. Octal escapes in the mount point and source (e.g. `\040`
+ * for a space) are decoded. Malformed rows are skipped.
+ *
+ * @param roots Where procfs is mounted; tests point it at a fake tree.
+ * @return The network mounts; empty if there are none or the mount table is unreadable.
+ */
+[[nodiscard]] std::vector<network_fs_mount_info> discover_network_mounts(
+  discovery_roots const& roots = {});
+
+/**
  * @brief System topology information.
  */
 struct system_topology_info {
-  std::string hostname;                              ///< System hostname.
-  unsigned int num_gpus;                             ///< Total number of GPUs.
-  int num_numa_nodes;                                ///< Total number of NUMA nodes.
-  int num_network_devices;                           ///< Total number of network devices.
-  std::vector<gpu_topology_info> gpus;               ///< GPU topology information.
-  std::vector<network_device_info> network_devices;  ///< Network device information.
-  std::vector<storage_device_info> storage_devices;  ///< Storage device information.
-  std::vector<numa_topology_info> numa_nodes;        ///< NUMA node information, sorted by id.
-  kernel_tls_info kernel_tls;                        ///< Kernel TLS (kTLS) state.
+  std::string hostname;                               ///< System hostname.
+  unsigned int num_gpus;                              ///< Total number of GPUs.
+  int num_numa_nodes;                                 ///< Total number of NUMA nodes.
+  int num_network_devices;                            ///< Total number of network devices.
+  std::vector<gpu_topology_info> all_gpus;            ///< All GPUs / MIG instances (unfiltered).
+  std::vector<gpu_topology_info> gpus;                ///< GPUs visible per CUDA_VISIBLE_DEVICES.
+  std::vector<network_device_info> network_devices;   ///< Network device information.
+  std::vector<storage_device_info> storage_devices;   ///< Storage device information.
+  std::vector<network_fs_mount_info> network_mounts;  ///< Mounted network file systems.
+  std::vector<numa_topology_info> numa_nodes;         ///< NUMA node information, sorted by id.
+  kernel_tls_info kernel_tls;                         ///< Kernel TLS (kTLS) state.
 
   /**
    * @brief Find a NUMA node by ID.

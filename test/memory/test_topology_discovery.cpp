@@ -120,6 +120,30 @@ TEST_CASE("Topology Discovery", "[hw_topology]")
     }
   }
 
+  // all_gpus lists every GPU on the host, so it is a superset of the visible ones.
+  REQUIRE(topology.all_gpus.size() >= topology.gpus.size());
+  for (std::size_t i = 0; i < topology.all_gpus.size(); ++i) {
+    auto const& gpu = topology.all_gpus[i];
+    INFO("all_gpus[" << i << "] " << gpu.name << " @ " << gpu.pci_bus_id);
+    REQUIRE(gpu.id == static_cast<unsigned int>(i));  // NVML enumeration index
+    REQUIRE(!gpu.name.empty());
+    REQUIRE(!gpu.pci_bus_id.empty());
+    REQUIRE(!gpu.uuid.empty());
+    REQUIRE(gpu.numa_node >= -1);
+  }
+
+  // Each visible GPU is numbered by its position and is the same device as an all_gpus entry.
+  for (std::size_t i = 0; i < topology.gpus.size(); ++i) {
+    auto const& gpu = topology.gpus[i];
+    INFO("gpus[" << i << "] " << gpu.name << " @ " << gpu.pci_bus_id);
+    REQUIRE(gpu.id == static_cast<unsigned int>(i));  // device ordinal
+    auto const match = std::ranges::find(topology.all_gpus, gpu.uuid, &gpu_topology_info::uuid);
+    REQUIRE(match != topology.all_gpus.end());
+    REQUIRE(match->name == gpu.name);
+    REQUIRE(match->pci_bus_id == gpu.pci_bus_id);
+    REQUIRE(match->numa_node == gpu.numa_node);
+  }
+
   // Verify network device information consistency
   REQUIRE(topology.network_devices.size() == static_cast<size_t>(topology.num_network_devices));
 
@@ -285,6 +309,82 @@ TEST_CASE("Topology Discovery maps GPUs to NUMA nodes with known capacity", "[hw
     auto const capacity = topology.get_numa_memory_capacity(gpu.numa_node);
     REQUIRE(capacity.has_value());
     REQUIRE(*capacity > 0);
+  }
+}
+
+namespace {
+std::vector<std::string> uuids_of(std::vector<gpu_topology_info> const& gpus)
+{
+  std::vector<std::string> uuids;
+  for (auto const& gpu : gpus) {
+    uuids.push_back(gpu.uuid);
+  }
+  return uuids;
+}
+}  // namespace
+
+TEST_CASE("Topology Discovery keeps every GPU in all_gpus when CUDA_VISIBLE_DEVICES narrows gpus",
+          "[hw_topology]")
+{
+  topology_discovery baseline;
+  REQUIRE(baseline.discover());
+  auto const all_uuids = uuids_of(baseline.get_topology().all_gpus);
+  if (all_uuids.empty()) {
+    SUCCEED("Skipped: requires at least one GPU");
+    return;
+  }
+
+  SECTION("a single UUID selects one GPU and renumbers it as ordinal 0")
+  {
+    ScopedEnvVar env("CUDA_VISIBLE_DEVICES", all_uuids.back());
+
+    topology_discovery discovery;
+    REQUIRE(discovery.discover());
+    auto const& topology = discovery.get_topology();
+
+    REQUIRE(topology.num_gpus == 1);
+    REQUIRE(topology.gpus.size() == 1);
+    CHECK(topology.gpus.front().uuid == all_uuids.back());
+    CHECK(topology.gpus.front().id == 0);
+
+    // The filter must not shrink or renumber all_gpus.
+    REQUIRE(uuids_of(topology.all_gpus) == all_uuids);
+    for (std::size_t i = 0; i < topology.all_gpus.size(); ++i) {
+      CHECK(topology.all_gpus[i].id == static_cast<unsigned int>(i));
+    }
+  }
+
+  SECTION("gpus follows CUDA_VISIBLE_DEVICES order while all_gpus keeps NVML order")
+  {
+    if (all_uuids.size() < 2) {
+      SUCCEED("Skipped: requires at least two GPUs");
+      return;
+    }
+    ScopedEnvVar env("CUDA_VISIBLE_DEVICES", all_uuids.back() + "," + all_uuids.front());
+
+    topology_discovery discovery;
+    REQUIRE(discovery.discover());
+    auto const& topology = discovery.get_topology();
+
+    REQUIRE(topology.gpus.size() == 2);
+    CHECK(topology.gpus[0].uuid == all_uuids.back());
+    CHECK(topology.gpus[0].id == 0);
+    CHECK(topology.gpus[1].uuid == all_uuids.front());
+    CHECK(topology.gpus[1].id == 1);
+    REQUIRE(uuids_of(topology.all_gpus) == all_uuids);
+  }
+
+  SECTION("an empty CUDA_VISIBLE_DEVICES hides every GPU but not all_gpus")
+  {
+    ScopedEnvVar env("CUDA_VISIBLE_DEVICES", "");
+
+    topology_discovery discovery;
+    REQUIRE(discovery.discover());
+    auto const& topology = discovery.get_topology();
+
+    CHECK(topology.num_gpus == 0);
+    CHECK(topology.gpus.empty());
+    REQUIRE(uuids_of(topology.all_gpus) == all_uuids);
   }
 }
 
@@ -492,6 +592,7 @@ class fake_procfs {
   {
     write("proc/sys/net/ipv4/tcp_available_ulp", content);
   }
+  void mountinfo(std::string const& content) const { write("proc/self/mountinfo", content); }
 
  private:
   void write(std::string const& rel, std::string const& content) const
@@ -637,4 +738,173 @@ TEST_CASE("kTLS: discover() reports this host's kTLS state", "[hw_topology][ktls
   INFO("loaded=" << ktls.loaded << " built_in=" << ktls.built_in
                  << " /proc/net/tls_stat=" << has_tls_stat);
   REQUIRE(ktls.loaded == has_tls_stat);
+}
+
+namespace {
+constexpr char const* local_mounts =
+  "22 28 0:21 / /sys rw,nosuid,nodev,noexec,relatime shared:7 - sysfs sysfs rw\n"
+  "28 1 259:2 / / rw,relatime shared:1 - ext4 /dev/nvme0n1p2 rw,errors=remount-ro\n"
+  "31 28 0:27 / /run rw,nosuid,nodev shared:5 - tmpfs tmpfs rw,size=1636016k,mode=755\n"
+  "40 28 0:33 / /var/lib/docker/overlay2/x/merged rw,relatime - overlay overlay "
+  "rw,lowerdir=/a,upperdir=/b,workdir=/c\n"
+  "45 28 0:38 / /run/user/1000/doc rw,nosuid,nodev,relatime shared:90 - fuse.portal portal "
+  "rw,user_id=1000,group_id=1000\n";
+}  // namespace
+
+TEST_CASE("Network mounts: network file systems are reported with their fields",
+          "[hw_topology][network_mounts]")
+{
+  fake_procfs host;
+  host.mountinfo(
+    std::string{local_mounts} +
+    "50 28 0:42 / /mnt/data rw,relatime shared:25 - nfs4 server.example.com:/export/data "
+    "rw,vers=4.2,proto=rdma,port=20049,clientaddr=10.0.0.2,addr=10.0.0.1\n"
+    "55 28 0:43 / /mnt/lustre rw,flock - lustre 10.0.0.5@o2ib:/lfs rw,flock\n"
+    "60 28 0:44 / /mnt/share rw,relatime - cifs //fileserver/share rw,vers=3.1.1,sec=ntlmssp\n");
+
+  auto const mounts = discover_network_mounts(host.roots());
+  REQUIRE(mounts.size() == 3);
+
+  CHECK(mounts[0].mount_point == "/mnt/data");
+  CHECK(mounts[0].fs_type == NetworkFsType::NFS4);
+  CHECK(mounts[0].source == "server.example.com:/export/data");
+  CHECK(mounts[0].options == "rw,vers=4.2,proto=rdma,port=20049,clientaddr=10.0.0.2,addr=10.0.0.1");
+
+  CHECK(mounts[1].mount_point == "/mnt/lustre");
+  CHECK(mounts[1].fs_type == NetworkFsType::LUSTRE);
+  CHECK(mounts[1].source == "10.0.0.5@o2ib:/lfs");
+  CHECK(mounts[1].options == "rw,flock");
+
+  CHECK(mounts[2].mount_point == "/mnt/share");
+  CHECK(mounts[2].fs_type == NetworkFsType::CIFS);
+  CHECK(mounts[2].source == "//fileserver/share");
+}
+
+TEST_CASE("Network mounts: to_string names match the mountinfo type names",
+          "[hw_topology][network_mounts]")
+{
+  CHECK(to_string(NetworkFsType::NFS) == "nfs");
+  CHECK(to_string(NetworkFsType::NFS4) == "nfs4");
+  CHECK(to_string(NetworkFsType::LUSTRE) == "lustre");
+  CHECK(to_string(NetworkFsType::FUSE_SSHFS) == "fuse.sshfs");
+  CHECK(to_string(static_cast<NetworkFsType>(-1)) == "unknown");
+
+  // Every type round-trips: a mountinfo row naming it is reported as that type.
+  for (auto const type : {NetworkFsType::NFS,
+                          NetworkFsType::NFS4,
+                          NetworkFsType::CIFS,
+                          NetworkFsType::SMB3,
+                          NetworkFsType::SMBFS,
+                          NetworkFsType::CEPH,
+                          NetworkFsType::LUSTRE,
+                          NetworkFsType::GPFS,
+                          NetworkFsType::BEEGFS,
+                          NetworkFsType::GLUSTERFS,
+                          NetworkFsType::AFS,
+                          NetworkFsType::FUSE_GLUSTERFS,
+                          NetworkFsType::FUSE_SSHFS,
+                          NetworkFsType::FUSE_S3FS}) {
+    INFO("type " << to_string(type));
+    fake_procfs host;
+    host.mountinfo("10 1 0:50 / /mnt/x rw - " + std::string{to_string(type)} + " src rw\n");
+    auto const mounts = discover_network_mounts(host.roots());
+    REQUIRE(mounts.size() == 1);
+    CHECK(mounts[0].fs_type == type);
+  }
+}
+
+TEST_CASE("Network mounts: local file systems are not reported", "[hw_topology][network_mounts]")
+{
+  fake_procfs host;
+  host.mountinfo(local_mounts);
+  REQUIRE(discover_network_mounts(host.roots()).empty());
+}
+
+TEST_CASE("Network mounts: only allow-listed FUSE types count", "[hw_topology][network_mounts]")
+{
+  fake_procfs host;
+  host.mountinfo(
+    "10 1 0:50 / /mnt/a rw - fuse.sshfs user@host:/dir rw,user_id=0\n"
+    "11 1 0:51 / /mnt/b rw - fuse.s3fs bucket rw\n"
+    "12 1 0:52 / /mnt/c rw - fuse.portal portal rw\n"
+    "13 1 0:53 / /mnt/d rw - fuse something rw\n");
+
+  auto const mounts = discover_network_mounts(host.roots());
+  REQUIRE(mounts.size() == 2);
+  CHECK(mounts[0].fs_type == NetworkFsType::FUSE_SSHFS);
+  CHECK(mounts[1].fs_type == NetworkFsType::FUSE_S3FS);
+}
+
+TEST_CASE("Network mounts: octal escapes in paths are decoded", "[hw_topology][network_mounts]")
+{
+  fake_procfs host;
+  host.mountinfo(
+    "10 1 0:50 / /mnt/my\\040data\\134x rw - nfs server:/export/with\\040space rw,vers=3\n");
+
+  auto const mounts = discover_network_mounts(host.roots());
+  REQUIRE(mounts.size() == 1);
+  CHECK(mounts[0].mount_point == "/mnt/my data\\x");
+  CHECK(mounts[0].source == "server:/export/with space");
+}
+
+TEST_CASE("Network mounts: optional fields and missing super options are handled",
+          "[hw_topology][network_mounts]")
+{
+  fake_procfs host;
+  host.mountinfo(
+    // Several optional fields before the separator.
+    "10 1 0:50 / /mnt/a rw shared:1 master:2 propagate_from:3 - nfs s1:/a rw\n"
+    // No optional fields and no super options.
+    "11 1 0:51 / /mnt/b rw - nfs s2:/b\n");
+
+  auto const mounts = discover_network_mounts(host.roots());
+  REQUIRE(mounts.size() == 2);
+  CHECK(mounts[0].mount_point == "/mnt/a");
+  CHECK(mounts[0].options == "rw");
+  CHECK(mounts[1].mount_point == "/mnt/b");
+  CHECK(mounts[1].source == "s2:/b");
+  CHECK(mounts[1].options.empty());
+}
+
+TEST_CASE("Network mounts: malformed rows are skipped", "[hw_topology][network_mounts]")
+{
+  fake_procfs host;
+  host.mountinfo(
+    "\n"
+    "garbage\n"
+    "10 1 0:50 / /mnt/a rw\n"                  // too short, no separator
+    "11 1 0:51 / /mnt/b rw - nfs\n"            // separator but no source
+    "12 1 0:52 / /mnt/c rw nfs s:/c rw\n"      // separator missing
+    "13 1 0:53 / /mnt/ok rw - nfs s:/ok rw\n"  // the only valid row
+  );
+
+  auto const mounts = discover_network_mounts(host.roots());
+  REQUIRE(mounts.size() == 1);
+  CHECK(mounts[0].mount_point == "/mnt/ok");
+}
+
+TEST_CASE("Network mounts: an unreadable mount table reports nothing",
+          "[hw_topology][network_mounts]")
+{
+  fake_procfs host;  // no proc/self/mountinfo
+  REQUIRE(discover_network_mounts(host.roots()).empty());
+}
+
+TEST_CASE("Network mounts: discover() reports this host's network mounts",
+          "[hw_topology][network_mounts]")
+{
+  topology_discovery discovery;
+  REQUIRE(discovery.discover());
+  auto const& mounts = discovery.get_topology().network_mounts;
+  auto const direct  = discover_network_mounts();
+
+  REQUIRE(mounts.size() == direct.size());
+  for (std::size_t i = 0; i < mounts.size(); ++i) {
+    INFO("network mount " << mounts[i].mount_point << " (" << to_string(mounts[i].fs_type) << ")");
+    CHECK(mounts[i].mount_point == direct[i].mount_point);
+    CHECK(mounts[i].fs_type == direct[i].fs_type);
+    CHECK(mounts[i].source == direct[i].source);
+    CHECK(!mounts[i].mount_point.empty());
+    CHECK(!mounts[i].source.empty());
+  }
 }
