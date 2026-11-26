@@ -521,6 +521,10 @@ SCENARIO("Reservation Overflow Policy", "[memory_space][.overflow_policy]")
 
 SCENARIO("Reservation On Multi Gpu System", "[memory_space][.multi-device]")
 {
+  int device_count = 0;
+  REQUIRE(cudaGetDeviceCount(&device_count) == cudaSuccess);
+  if (device_count < 2) { SKIP("requires at least two CUDA devices"); }
+
   auto manager = createDualGpuMemoryManager();
 
   auto gpu_device_0 = manager->get_memory_space(Tier::GPU, 0);
