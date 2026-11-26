@@ -386,6 +386,21 @@ class chunk_state {
     }
     [[nodiscard]] constexpr chunk_fill fill() const noexcept { return decode(_w); }
 
+    /// The chunk owns a staging buffer: it reached @c allocated and has not been
+    /// reclaimed since.  Its bytes may not have arrived yet.
+    [[nodiscard]] constexpr bool has_buffer() const noexcept
+    {
+      auto const s = state();
+      return s >= allocated && s != evicting;
+    }
+
+    /// A read can be served from the chunk's buffer, within its populated @ref fill.
+    [[nodiscard]] constexpr bool is_readable() const noexcept
+    {
+      auto const s = state();
+      return s == cached || s == in_use;
+    }
+
     /// The chunk owns a staging buffer and no reader is holding it — i.e. it is
     /// a candidate for @ref mark_evicting.  Says nothing about subscribers; the
     /// evictor gates on those separately so its last-resort pass can ignore them.
@@ -674,11 +689,7 @@ class chunk_state {
                       (w & FULL_BIT) != 0};
   }
 
-  static constexpr bool readable(std::uint64_t w) noexcept
-  {
-    auto const st = static_cast<value>(w & STATE_MASK);
-    return st == cached || st == in_use;
-  }
+  static constexpr bool readable(std::uint64_t w) noexcept { return snapshot(w).is_readable(); }
 
   /// Outcome of one @ref pin_once attempt.
   enum class pin_attempt : std::uint8_t {

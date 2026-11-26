@@ -38,6 +38,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <span>
 #include <stop_token>
@@ -85,10 +86,8 @@ enum class reclaim_mode : std::uint8_t {
 /// load per chunk, so the sweep is cheap enough not to need a summary counter.
 [[nodiscard]] inline bool all_chunks_have_buffers(const std::vector<cached_chunk*>& chunks) noexcept
 {
-  return std::ranges::all_of(chunks, [](const cached_chunk* c) {
-    auto const s = c->state.get_state();
-    return s >= chunk_state::allocated && s != chunk_state::evicting;
-  });
+  return std::ranges::all_of(chunks,
+                             [](const cached_chunk* c) { return c->state.load().has_buffer(); });
 }
 
 /// One version of a cached object; defined in fs_cache.cpp.
@@ -536,16 +535,24 @@ class fs_cache {
 
   /// How much of one object the cache holds.
   struct object_residency {
-    std::size_t resident_bytes = 0;  ///< bytes of chunks that own a staging buffer
-    std::size_t object_bytes   = 0;  ///< the object's size; 0 when the cache has not seen it
+    /// Bytes a read could be served from the cache: the populated extent of
+    /// each @c cached or @c in_use chunk.  Chunks still waiting for their IO,
+    /// or whose load failed, count nothing.
+    std::size_t resident_bytes = 0;
+    std::size_t object_bytes   = 0;  ///< the object's size when it was last opened
   };
 
-  /// What the cache holds of the object at @p object_path in its current
-  /// generation. Takes a path rather than an @c io_object so it can be asked
-  /// before the file is opened. Read-only: subscribes, pins and reorders
-  /// nothing. Chunks count whole, so this is an estimate meant for choosing
-  /// what to read first.
-  [[nodiscard]] object_residency residency(std::string_view object_path) const;
+  /// What the cache holds of the object at @p object_path in its last opened
+  /// generation, or @c std::nullopt when the path has no current generation.
+  /// Takes a path rather than an @c io_object so it can be asked before the
+  /// file is opened; a @c file: URI is stripped as @c ioctx::open_io_object
+  /// strips it.  Read-only: subscribes, pins and reorders nothing.  A snapshot
+  /// meant for choosing what to read first.
+  ///
+  /// The bytes are reused only if the next open has the same identity.  If the
+  /// object changed, or a REST object has no strong ETag, that open creates a
+  /// new generation and none of them are read (see the "cache identity" tests).
+  [[nodiscard]] std::optional<object_residency> residency(std::string_view object_path) const;
 
   /// Alive generations that are no longer in the map, over all paths.  Zero
   /// means every retired generation has been reclaimed.

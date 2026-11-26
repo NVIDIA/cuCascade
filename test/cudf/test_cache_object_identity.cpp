@@ -1041,6 +1041,123 @@ TEST_CASE("cache identity delivers a held fill's failure through the datasource"
 }
 
 // ===========================================================================
+// Residency: what a read could find cached, by path
+// ===========================================================================
+
+namespace {
+
+/// Issue @p source's prepared prefetch and complete its one backend request.
+void fill_prepared(held_context& context, datasource& source)
+{
+  REQUIRE(source.prefetch_async([](prefetch_result) noexcept {}) ==
+          cucascade::io::prefetch_refusal::issued);
+  held_request fill;
+  fill.request = context.backend().take();
+  REQUIRE(fill.request != nullptr);
+  fill.complete(0x5a);
+}
+
+}  // namespace
+
+TEST_CASE("cache residency counts the bytes a read can hit", "[cache][cache_identity][residency]")
+{
+  auto memory  = identity_memory();
+  auto context = std::make_shared<held_context>();
+  context->initialize_cache(*memory, identity_cache_config(), nullptr);
+  REQUIRE(context->cache() != nullptr);
+  auto& cache = *context->cache();
+
+  CHECK_FALSE(cache.residency("s3://controlled/never-opened.bin").has_value());
+
+  // Two chunks, the second only 1000 bytes long.
+  std::string const path   = "s3://controlled/residency.bin";
+  std::size_t const object = chunk_bytes + 1000;
+  auto source = std::make_unique<datasource>(context, held_object(path, "\"one\"", object));
+
+  // Staging buffers are assigned but no bytes have arrived: nothing to hit yet.
+  advise(*source, object);
+  auto held = cache.residency(path);
+  REQUIRE(held.has_value());
+  CHECK(held->resident_bytes == 0);
+  CHECK(held->object_bytes == object);
+
+  // The short tail chunk counts its own length, not a whole chunk.
+  fill_prepared(*context, *source);
+  held = cache.residency(path);
+  REQUIRE(held.has_value());
+  CHECK(held->resident_bytes == object);
+
+  // Reclaimed chunks hold nothing, but the generation is still the current one.
+  REQUIRE(cache.reclaim(cucascade::io::cache::reclaim_mode::forced) > 0);
+  held = cache.residency(path);
+  REQUIRE(held.has_value());
+  CHECK(held->resident_bytes == 0);
+  CHECK(held->object_bytes == object);
+
+  source.reset();
+  context->shutdown_cache();
+}
+
+TEST_CASE("cache residency counts only the populated extent of a partly filled chunk",
+          "[cache][cache_identity][residency]")
+{
+  auto memory  = identity_memory();
+  auto context = std::make_shared<held_context>();
+  context->initialize_cache(*memory, identity_cache_config(), nullptr);
+  REQUIRE(context->cache() != nullptr);
+  auto& cache            = *context->cache();
+  std::string const path = "s3://controlled/footer-only.bin";
+  auto source            = std::make_unique<datasource>(context, held_object(path, "\"one\""));
+
+  // Only the last page is read, as a footer probe does.
+  constexpr std::size_t page = cucascade::io::IO_BLOCK_SIZE;
+  advise_range(*source, chunk_bytes - page, page);
+  REQUIRE(source->prepare_prefetch(false) == cucascade::io::prepare_result::prepared);
+  fill_prepared(*context, *source);
+  auto const held = cache.residency(path);
+  REQUIRE(held.has_value());
+  CHECK(held->resident_bytes == page);
+  CHECK(held->object_bytes == chunk_bytes);
+
+  source.reset();
+  context->shutdown_cache();
+}
+
+TEST_CASE("cache residency describes a replacement while the old generation is held",
+          "[cache][cache_identity][residency]")
+{
+  auto memory  = identity_memory();
+  auto context = std::make_shared<held_context>();
+  context->initialize_cache(*memory, identity_cache_config(), nullptr);
+  REQUIRE(context->cache() != nullptr);
+  auto& cache            = *context->cache();
+  std::string const path = "s3://controlled/generation.bin";
+
+  auto first = std::make_unique<datasource>(context, held_object(path, "\"one\""));
+  advise(*first, chunk_bytes);
+  fill_prepared(*context, *first);
+  REQUIRE(cache.residency(path).value().resident_bytes == chunk_bytes);
+
+  // The new version is current as soon as it is opened, before any of its bytes
+  // arrive; the retired one's resident chunk does not count for it.
+  auto second = std::make_unique<datasource>(context, held_object(path, "\"two\""));
+  advise(*second, chunk_bytes);
+  require_generations(cache, path, 2, 1);
+  auto held = cache.residency(path);
+  REQUIRE(held.has_value());
+  CHECK(held->resident_bytes == 0);
+
+  fill_prepared(*context, *second);
+  held = cache.residency(path);
+  REQUIRE(held.has_value());
+  CHECK(held->resident_bytes == chunk_bytes);
+
+  first.reset();
+  second.reset();
+  context->shutdown_cache();
+}
+
+// ===========================================================================
 // Summary snapshots
 // ===========================================================================
 
@@ -1364,4 +1481,22 @@ TEST_CASE("local opens share a generation until the file is replaced",
   CHECK(
     cucascade::test::wait_for_cache([&] { return cache.generation_count(fixture.path) == 1; }, 5s));
   CHECK(cache.retired_generation_count() == 0);
+}
+
+TEST_CASE("cache residency of a local file is found through its file URI",
+          "[cache][cache_identity][uring][residency]")
+{
+  local_cache_fixture fixture;
+  auto& cache  = *fixture.context->cache();
+  auto reader  = fixture.cached_reader();
+  auto by_path = cache.residency(fixture.path);
+  REQUIRE(by_path.has_value());
+  CHECK(by_path->resident_bytes == fixture.bytes);
+  for (auto const& uri : {"file://" + fixture.path, "file:" + fixture.path}) {
+    INFO(uri);
+    auto const by_uri = cache.residency(uri);
+    REQUIRE(by_uri.has_value());
+    CHECK(by_uri->resident_bytes == by_path->resident_bytes);
+    CHECK(by_uri->object_bytes == by_path->object_bytes);
+  }
 }
