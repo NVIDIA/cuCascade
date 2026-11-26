@@ -32,6 +32,7 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
     memory/test_fixed_size_host_memory_resource.cpp
     memory/test_numa_affinity.cpp
     memory/test_memory_reservation_manager.cpp
+    memory/test_pinned_host_pool_memory_resource.cpp
     memory/test_pool_peer_access.cpp
     memory/test_pool_peer_access_regression.cpp
     memory/test_reservation_aware_resource_adaptor.cpp
@@ -82,6 +83,13 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
 
   # Register tests with CTest
   add_test(NAME cucascade_tests COMMAND cucascade_tests)
+
+  # CUDA initialization failure must surface as an exception, which needs a
+  # process that sees no GPU.
+  add_test(NAME cucascade_pinned_host_pool_without_devices
+           COMMAND cucascade_tests "[pinned_host_pool_no_device]")
+  set_tests_properties(cucascade_pinned_host_pool_without_devices
+                       PROPERTIES ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1")
 endif()
 
 if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)

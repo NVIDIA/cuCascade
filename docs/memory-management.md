@@ -20,6 +20,14 @@ A deep dive into cuCascade's three-tier memory system, reservation model, and ti
   - [Block-Based Allocation](#block-based-allocation)
   - [Pool Expansion](#pool-expansion)
   - [Multi-Block Allocations](#multi-block-allocations)
+- [Pinned Host Pool](#pinned-host-pool)
+  - [Backing and Configuration](#backing-and-configuration)
+  - [Byte Limit](#byte-limit)
+  - [Allocation Rules](#allocation-rules)
+  - [Stream-Ordering and Host-Access Contract](#stream-ordering-and-host-access-contract)
+  - [Errors](#errors)
+  - [Lifetime](#lifetime)
+  - [Guarantees](#guarantees)
 - [Disk Memory Management](#disk-memory-management)
 - [Downgrade and Upgrade Triggers](#downgrade-and-upgrade-triggers)
 - [Notification System](#notification-system)
@@ -357,6 +365,88 @@ for (size_t i = 0; i < alloc->size(); i++) {
 
 ---
 
+## Pinned Host Pool
+
+**File**: `include/cucascade/memory/pinned_host_pool_memory_resource.hpp`
+
+`pinned_host_pool_memory_resource` is a pinned, stream-ordered host memory resource that serves contiguous allocations up to a configured request limit. It is built to be installed as cudf's pinned host memory provider. It is part of the cudf-free core and is not yet used by `memory_space`.
+
+### Backing and Configuration
+
+The memory comes from one CUDA HostNuma memory pool (`cudaMemPool_t`), held through CCCL's `cuda::shared_pinned_memory_pool`. The CUDA driver manages page placement and reuse. Every visible GPU is given access to the pool, and the host may access it directly. On GB10 with driver 580, Compute Sanitizer was observed to report `CUDA API Error: HOST/HOST_NUMA pools are always read-write accessible on the HOST` once per pool, from the `cudaMemPoolSetAccess` call inside CCCL's pool constructor. The call returned success and grants the device access needed for operations such as `cudaMemsetAsync`.
+
+| `pinned_host_pool_config` field | Type | Rule |
+|---|---|---|
+| `numa_node` | `int` | Required, 0 or more. Machines without NUMA use node 0. |
+| `max_pool_bytes` | `std::size_t` | Required, not 0. Sets the per-request limit and the CUDA pool size (see [Byte Limit](#byte-limit)). |
+
+Both fields default to invalid values, so a field left unset throws instead of silently choosing a node or a limit.
+
+`pinned_host_pool_memory_resource` is a copyable handle that inherits `cuda::mr::shared_resource` over `detail::pinned_host_pool_memory_resource_impl`. Copies share one pool and compare equal; handles over different pools compare unequal; the pool is destroyed with the last handle. It declares the `cuda::mr::device_accessible` and `cuda::mr::host_accessible` properties, so it converts to `cuda::mr::any_resource` and `rmm::host_device_async_resource_ref`. Allocation, deallocation and the counters are safe to call from many threads at once, on one handle or across copies. As with `std::shared_ptr`, one handle object must not be assigned to while another thread uses it.
+
+```cpp
+using namespace cucascade::memory;
+
+pinned_host_pool_memory_resource pool{pinned_host_pool_config{.numa_node = 0, .max_pool_bytes = 4ull << 30}};
+void* p = pool.allocate(stream, 1 << 20, 256);  // stream-ordered on `stream`
+pool.deallocate(stream, p, 1 << 20, 256);
+```
+
+### Byte Limit
+
+After validating alignment, `allocate` and `allocate_sync` reject a single request larger than `max_pool_bytes` with `rmm::out_of_memory` before calling CUDA. The resource also passes this value to CUDA as the pool's maximum size. The driver has been observed to round the size up when growing the pool, so `reserved_bytes()` may exceed the configured value. Callers that require a hard cap on total backing memory need to account for this driver behavior.
+
+### Allocation Rules
+
+- `allocate(stream, bytes, alignment)` and `deallocate(stream, ptr, bytes, alignment)` run on the caller's stream.
+- `allocate_sync(bytes, alignment)` and `deallocate_sync(ptr, bytes, alignment)` run on a private non-blocking stream on device 0 and synchronize it before returning. CCCL's own synchronous calls are never used, because they run on a hidden process-wide stream.
+- `alignment` must be a power of two from 1 to 256. Allocation throws `cucascade::logic_error` for invalid alignment. Returned pointers are at least 256-byte aligned.
+- With valid alignment, allocating 0 bytes returns `nullptr` and deallocating `nullptr` or 0 bytes is a no-op. Both shortcuts skip the pool operation.
+- `deallocate` and `deallocate_sync` are `noexcept`. An invalid alignment there is a debug assertion and is otherwise ignored.
+- Calls that reach CUDA on the legacy default stream (`cudaStream_t{}`) or `cudaStreamPerThread` require a current CUDA context on the calling thread. For example, initialize the context with `cudaSetDevice` or `cudaFree(0)`. An explicitly created stream carries its own context.
+- `reserved_bytes()` (memory held from the operating system, in use or idle) and `used_bytes()` (memory handed to callers) read the pool's attributes. Synchronize the relevant streams before reading the counters to measure the pool after queued work completes. The driver may reserve more than an allocation asks for. `max_pool_bytes()` returns the configured limit.
+
+### Stream-Ordering and Host-Access Contract
+
+`allocate` and `deallocate` follow CUDA stream ordering without adding synchronization. CUDA may insert stream dependencies when reusing memory.
+
+- After `allocate(stream, ...)`, GPU work on `stream` may use the memory at once. Before the host touches the memory, synchronize `stream` or wait for an event recorded on `stream` after enqueuing the allocation.
+- `allocate_sync` returns memory the host can use immediately.
+- Before calling `deallocate_sync`, wait for the allocation and all GPU and host uses of the pointer to complete.
+- A stream-ordered call may be paired with a synchronous call, in either order, when the rules above hold.
+- Memory may be allocated on stream S, used on stream T and freed on stream U. The caller orders T's use after the allocation on S and the free on U after the allocation and every use, for example with events.
+
+### Errors
+
+| Where | Condition | Throws |
+|---|---|---|
+| Construction | Invalid `pinned_host_pool_config` (checked before any CUDA call) | `cucascade::logic_error` |
+| Construction | CUDA initialization failure (for example no visible GPU), no HostNuma pool support, nonexistent NUMA node, failed private stream creation | `cucascade::cuda_error` with the CUDA status and the node |
+| `allocate`, `allocate_sync` | Invalid alignment | `cucascade::logic_error` |
+| `allocate`, `allocate_sync` | Request larger than `max_pool_bytes` (checked before the driver call) | `rmm::out_of_memory` |
+| `allocate`, `allocate_sync` | CUDA status `cudaErrorMemoryAllocation` (the byte limit or host memory is exhausted) | `rmm::out_of_memory` |
+| `allocate`, `allocate_sync` | Any other CUDA failure, such as a default-stream call from a thread without a current context | `rmm::bad_alloc` |
+| `reserved_bytes`, `used_bytes` | Driver query failure | `cucascade::cuda_error` |
+| `deallocate`, `deallocate_sync` | CUDA fails to enqueue the free | No exception. CCCL can assert when its assertions are enabled. |
+| `deallocate_sync` | CUDA stream synchronization fails | No exception. cuCascade logs an error and asserts in debug builds. |
+
+The exception type is chosen from the CUDA status code, never from the message. No CCCL exception type reaches callers. An out-of-memory error leaves the pool usable for later requests. Missing HostNuma support and a nonexistent node are not told apart by type, and there is no fallback to another allocator.
+
+### Lifetime
+
+- Submit a free for every allocation before destroying the last handle. Frees may still be queued on a stream. CUDA defers reclaiming the pool until all outstanding allocations have been freed.
+- Do not keep handles in static storage, and do not destroy a handle after the CUDA runtime has shut down.
+
+### Guarantees
+
+- **Promised:** page-locked; host-accessible; accessible from each configured device at the same address; allocated by CUDA from a stream-ordered pool.
+- **Requested, not guaranteed:** placement on `numa_node`.
+- **Never promised:** registered with `cudaHostRegister`; managed; access from unconfigured devices; any particular `cudaPointerGetAttributes` type; zero-filled memory; IPC export.
+
+Every visible GPU is a configured device.
+
+---
+
 ## Disk Memory Management
 
 **File**: `include/cucascade/memory/disk_access_limiter.hpp`
@@ -459,6 +549,8 @@ Default pool size: **16 streams** per memory space.
 | `include/cucascade/memory/memory_reservation.hpp` | `reservation`, `reserved_arena`, limit policies |
 | `include/cucascade/memory/reservation_aware_resource_adaptor.hpp` | GPU allocator with per-stream tracking |
 | `include/cucascade/memory/fixed_size_host_memory_resource.hpp` | Block-based pinned host allocator |
+| `include/cucascade/memory/pinned_host_pool_memory_resource.hpp` | `pinned_host_pool_config` and the HostNuma pinned pool handle |
+| `include/cucascade/memory/detail/pinned_host_pool_memory_resource_impl.hpp` | Shared state behind the pinned host pool handle |
 | `include/cucascade/memory/disk_access_limiter.hpp` | Disk tier reservation tracker |
 | `include/cucascade/memory/notification_channel.hpp` | Cross-reservation signaling |
 | `include/cucascade/memory/stream_pool.hpp` | CUDA stream pool with RAII borrowing |
