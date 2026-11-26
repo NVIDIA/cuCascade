@@ -402,12 +402,14 @@ summary job run only for copied PRs and merge groups. See
 | **Lint** | `linux-amd64-cpu4` (CPU only) | Runs the project pre-commit hooks |
 | **Build** | `linux-amd64-cpu4` (CPU only) | `pixi run build` with sccache; uploads artifacts for PRs and merge groups |
 | **Test** | `linux-amd64-gpu-t4-latest-1` (T4 GPU) | Downloads build, runs `pixi run test` |
+| **Multi-GPU qualification** | `linux-amd64-gpu-t4-latest-2` | Merge groups only; CUDA 13 stable tests with no skips |
 | **Check** | `ubuntu-slim` | Required summary of lint, build, and test results |
 
 Copied PRs build and test CUDA 12 with stable RAPIDS and CUDA 13 with nightly RAPIDS.
 Merge groups build and test all four configurations; `main` builds all four.
-For copied PRs and merge groups, tests start after every build succeeds. The GPU runners expose one device;
-multi-GPU tests need a separate run with suitable hardware and explicit test selection.
+For copied PRs and merge groups, tests start after every build succeeds. The regular
+test matrix uses one GPU; merge groups also run the two-GPU qualification job. That
+job is initially outside the required `check`; see [the qualification guide](ci.md#multi-gpu-qualification).
 
 ---
 

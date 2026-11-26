@@ -312,34 +312,31 @@ TEST_CASE("gpu_table_representation memory tier", "[gpu_data_representation]")
 
 TEST_CASE("gpu_table_representation device_id", "[gpu_data_representation]")
 {
-  SECTION("Device 0")
-  {
-    auto gpu_space = make_mock_memory_space(memory::Tier::GPU, 0);
-    auto table     = create_simple_cudf_table(100, gpu_space->get_default_allocator());
-    gpu_table_representation repr(std::make_unique<cudf::table>(std::move(table)),
-                                  *gpu_space,
-                                  ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
+  auto gpu_space = make_mock_memory_space(memory::Tier::GPU, 0);
+  auto table     = create_simple_cudf_table(100, gpu_space->get_default_allocator());
+  gpu_table_representation repr(std::make_unique<cudf::table>(std::move(table)),
+                                *gpu_space,
+                                ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
 
-    REQUIRE(repr.get_device_id() == 0);
+  REQUIRE(repr.get_device_id() == 0);
+}
+
+TEST_CASE("gpu_table_representation device_id on another GPU",
+          "[gpu_data_representation][multi-device]")
+{
+  int device_count = 0;
+  if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count < 2) {
+    SKIP("requires at least two CUDA devices");
   }
 
-  SECTION("Device 1")
-  {
-    int device_count = 0;
-    if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count < 2) {
-      SUCCEED("Single GPU or CUDA not available; skipping device 1 section");
-      return;
-    }
+  rmm::cuda_set_device_raii const pin_device{rmm::cuda_device_id{1}};
+  auto gpu_space = make_mock_memory_space(memory::Tier::GPU, 1);
+  auto table     = create_simple_cudf_table(100, gpu_space->get_default_allocator());
+  gpu_table_representation repr(std::make_unique<cudf::table>(std::move(table)),
+                                *gpu_space,
+                                ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
 
-    rmm::cuda_set_device_raii const pin_device{rmm::cuda_device_id{1}};
-    auto gpu_space = make_mock_memory_space(memory::Tier::GPU, 1);
-    auto table     = create_simple_cudf_table(100, gpu_space->get_default_allocator());
-    gpu_table_representation repr(std::make_unique<cudf::table>(std::move(table)),
-                                  *gpu_space,
-                                  ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
-
-    REQUIRE(repr.get_device_id() == 1);
-  }
+  REQUIRE(repr.get_device_id() == 1);
 }
 
 TEST_CASE("gpu->host->gpu roundtrip preserves cudf table contents", "[gpu_data_representation]")
