@@ -142,8 +142,9 @@ struct bandwidth_profile {
  * `memory_reservation_manager`; callers are expected to run it at init time when the
  * target memory spaces are otherwise idle.
  *
- * Each DISK `memory_space` owns its own I/O backend, so the profile reflects whichever
- * backend each disk space was constructed with — no separate backend parameter is needed.
+ * Each DISK `memory_space` carries its own io context (`memory_space::get_io_context()`), so the
+ * profile reflects whichever context each disk space uses — no separate backend parameter is
+ * needed.
  * At least one GPU space must be present: it is used to materialize the canonical source
  * cudf table that seeds every pairwise transfer.
  *

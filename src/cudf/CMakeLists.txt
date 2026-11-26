@@ -20,7 +20,15 @@ target_sources(
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/gpu_data_representation.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/host_data_representation.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/bandwidth_profiler.cpp
-          ${CMAKE_CURRENT_SOURCE_DIR}/representation_converter_builtins.cpp)
+          ${CMAKE_CURRENT_SOURCE_DIR}/disk_io.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/disk_io_context.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/representation_converter_builtins.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/builtin_row_range_readers.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/row_range_copy_kernels.cu
+          ${CMAKE_CURRENT_SOURCE_DIR}/row_range_fit.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/row_range_reader_gpu.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/row_range_reader_host.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/row_range_reader_disk.cpp)
 
 # The cudf::io::datasource bridge over the cudf-free io core — only built when
 # the io library is enabled (the io core itself carries no cudf dependency).

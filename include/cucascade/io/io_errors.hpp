@@ -20,6 +20,7 @@
 
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <utility>
 
 namespace cucascade::io {
@@ -92,6 +93,26 @@ class object_changed_error : public std::runtime_error {
   std::string _object_path;
   std::string _expected_tag;
   std::string _observed_tag;
+};
+
+/**
+ * @brief The backend does not implement this operation yet.
+ *
+ * Reported by every write and flush entry point of a backend that serves
+ * reads only (the REST context and reactor), and by
+ * the @c ioctx write front ends when the backend cannot write at all.  A
+ * @c std::system_error with @c std::errc::not_supported, so callers that catch
+ * @c std::system_error and compare its code keep working; the message names
+ * the backend and operation and says "not yet implemented".
+ */
+class not_implemented_error : public std::system_error {
+ public:
+  /// @p what names the backend and the operation, e.g. "rest: host_write".
+  explicit not_implemented_error(std::string const& what)
+    : std::system_error(std::make_error_code(std::errc::not_supported),
+                        what + ": not yet implemented")
+  {
+  }
 };
 
 }  // namespace cucascade::io
