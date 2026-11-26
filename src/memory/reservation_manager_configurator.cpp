@@ -233,7 +233,9 @@ std::vector<memory_space_config> reservation_manager_configurator::build(
   };
 
   // Absolute capacities are either per-space or split evenly across spaces; a fraction is
-  // always relative to the capacity of the NUMA region backing the space.
+  // always relative to the memory that is available (free plus reclaimable page cache), at
+  // the time the topology was discovered, in the NUMA region backing the space. Sizing from
+  // the region's total capacity would hand out memory that other processes already hold.
   auto numa_region_capacity_of = [&](const numa_region_info& info) -> std::size_t {
     if (_numa_region_capacity.holds_fraction()) {
       if (info.is_device_memory) {
@@ -242,12 +244,12 @@ std::vector<memory_space_config> reservation_manager_configurator::build(
                                  " is device memory, not host memory; size this space with "
                                  "set_per_numa_region_capacity() instead");
       }
-      if (!info.numa_capacity.has_value()) {
+      if (!info.numa_available_memory.has_value()) {
         throw std::runtime_error(
-          "NUMA region capacity fraction requested but the memory capacity of NUMA node " +
+          "NUMA region capacity fraction requested but the available memory of NUMA node " +
           std::to_string(info.numa_id) + " is unknown");
       }
-      return _numa_region_capacity.get_capacity(*info.numa_capacity);
+      return _numa_region_capacity.get_capacity(*info.numa_available_memory);
     }
     auto const bytes = _numa_region_capacity.get_size();
     return (_is_capacity_per_space || numa_region_infos.size() <= 1)
@@ -349,20 +351,22 @@ reservation_manager_configurator::extract_numa_region_ids(
   std::vector<numa_region_info> numa_region_infos;
   std::set<int> numa_region_ids;
   for (const auto& gpu : gpus) {
-    auto const* node            = topology.find_numa_node(gpu.numa_id);
-    auto const numa_capacity    = topology.get_numa_memory_capacity(gpu.numa_id);
-    bool const is_device_memory = node != nullptr && node->is_device_memory;
+    auto const* node                 = topology.find_numa_node(gpu.numa_id);
+    auto const numa_available_memory = topology.get_numa_available_memory(gpu.numa_id);
+    bool const is_device_memory      = node != nullptr && node->is_device_memory;
     if (std::holds_alternative<bind_host_id_to_gpu_id>(_host_id_policy)) {
-      numa_region_infos.emplace_back(numa_region_info{.space_id         = gpu.space_id,
-                                                      .numa_id          = gpu.numa_id,
-                                                      .numa_capacity    = numa_capacity,
-                                                      .is_device_memory = is_device_memory});
+      numa_region_infos.emplace_back(
+        numa_region_info{.space_id              = gpu.space_id,
+                         .numa_id               = gpu.numa_id,
+                         .numa_available_memory = numa_available_memory,
+                         .is_device_memory      = is_device_memory});
     } else if (std::holds_alternative<bind_host_id_to_numa_id>(_host_id_policy)) {
       if (!numa_region_ids.contains(gpu.numa_id)) {
-        numa_region_infos.emplace_back(numa_region_info{.space_id         = gpu.numa_id,
-                                                        .numa_id          = gpu.numa_id,
-                                                        .numa_capacity    = numa_capacity,
-                                                        .is_device_memory = is_device_memory});
+        numa_region_infos.emplace_back(
+          numa_region_info{.space_id              = gpu.numa_id,
+                           .numa_id               = gpu.numa_id,
+                           .numa_available_memory = numa_available_memory,
+                           .is_device_memory      = is_device_memory});
         numa_region_ids.insert(gpu.numa_id);
       }
     }

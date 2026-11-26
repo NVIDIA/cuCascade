@@ -37,6 +37,9 @@ using namespace cucascade::memory;
 namespace {
 
 constexpr std::size_t synthetic_numa_capacity = 64ull << 30;  // 64 GiB
+// Deliberately not a round fraction of the capacity, so a result derived from the total
+// capacity can never be mistaken for one derived from available memory.
+constexpr std::size_t synthetic_numa_available = 40ull << 30;  // 40 GiB
 
 /// Collect the host space configs produced by the builder.
 std::vector<host_memory_space_config> host_configs(std::vector<memory_space_config> const& configs)
@@ -54,10 +57,12 @@ std::vector<host_memory_space_config> host_configs(std::vector<memory_space_conf
  * @brief Build a topology with a single real GPU and a synthetic NUMA node.
  *
  * The GPU entry must come from real discovery because the configurator queries the
- * device for its memory capacity; the NUMA capacity is overridden so the expected
- * values are independent of the machine running the test.
+ * device for its memory capacity; the NUMA capacity and available memory are overridden so the
+ * expected values are independent of the machine running the test.
  */
-bool make_single_gpu_topology(system_topology_info& topology, std::size_t numa_capacity)
+bool make_single_gpu_topology(system_topology_info& topology,
+                              std::size_t numa_capacity,
+                              std::size_t numa_available = synthetic_numa_available)
 {
   topology_discovery discovery;
   if (!discovery.discover()) { return false; }
@@ -69,7 +74,8 @@ bool make_single_gpu_topology(system_topology_info& topology, std::size_t numa_c
   topology.num_gpus       = 1;
   topology.numa_nodes     = {numa_topology_info{.id               = topology.gpus.front().numa_node,
                                                 .memory_capacity  = numa_capacity,
-                                                .free_memory      = numa_capacity / 2,
+                                                .free_memory      = numa_available / 2,
+                                                .available_memory = numa_available,
                                                 .has_cpus         = true,
                                                 .is_device_memory = false}};
   topology.num_numa_nodes = 1;
@@ -78,7 +84,8 @@ bool make_single_gpu_topology(system_topology_info& topology, std::size_t numa_c
 
 }  // namespace
 
-TEST_CASE("Configurator sets host capacity as a fraction of NUMA capacity", "[configurator]")
+TEST_CASE("Configurator sets host capacity as a fraction of NUMA available memory",
+          "[configurator]")
 {
   system_topology_info topology;
   if (!make_single_gpu_topology(topology, synthetic_numa_capacity)) {
@@ -94,7 +101,7 @@ TEST_CASE("Configurator sets host capacity as a fraction of NUMA capacity", "[co
   auto const hosts = host_configs(builder.build(topology));
 
   REQUIRE(hosts.size() == 1);
-  REQUIRE(hosts.front().memory_capacity == synthetic_numa_capacity / 4);
+  REQUIRE(hosts.front().memory_capacity == synthetic_numa_available / 4);
 }
 
 TEST_CASE("Configurator sets host capacity in absolute bytes", "[configurator]")
@@ -137,7 +144,7 @@ TEST_CASE("Configurator host capacity fraction overrides a previous absolute set
   auto const hosts = host_configs(builder.build(topology));
 
   REQUIRE(hosts.size() == 1);
-  REQUIRE(hosts.front().memory_capacity == synthetic_numa_capacity / 2);
+  REQUIRE(hosts.front().memory_capacity == synthetic_numa_available / 2);
 }
 
 TEST_CASE("Configurator reservation limit follows the fraction-derived host capacity",
@@ -160,7 +167,7 @@ TEST_CASE("Configurator reservation limit follows the fraction-derived host capa
   auto const hosts = host_configs(builder.build(topology));
 
   REQUIRE(hosts.size() == 1);
-  REQUIRE(hosts.front().memory_capacity == synthetic_numa_capacity / 2);
+  REQUIRE(hosts.front().memory_capacity == synthetic_numa_available / 2);
   REQUIRE(hosts.front().reservation_limit() == reservation_bytes);
 }
 
@@ -263,7 +270,27 @@ TEST_CASE("Configurator throws when NUMA capacity is unknown and a fraction is r
   REQUIRE_THROWS_AS(builder.build(topology), std::runtime_error);
 }
 
-TEST_CASE("Configurator resolves host capacity from discovered NUMA capacity", "[configurator]")
+TEST_CASE("Configurator throws when NUMA available memory is unknown and a fraction is requested",
+          "[configurator]")
+{
+  system_topology_info topology;
+  // The capacity is known but the kernel reported no free memory for the node, so none is
+  // available.
+  if (!make_single_gpu_topology(topology, synthetic_numa_capacity, 0)) {
+    SUCCEED("Skipped: requires at least one GPU");
+    return;
+  }
+
+  reservation_manager_configurator builder;
+  builder.set_gpu_ids({static_cast<int>(topology.gpus.front().id)});
+  builder.use_numa_id_as_host_id();
+  builder.set_usage_limit_ratio_per_numa_region(0.5);
+
+  REQUIRE_THROWS_AS(builder.build(topology), std::runtime_error);
+}
+
+TEST_CASE("Configurator resolves host capacity from discovered NUMA available memory",
+          "[configurator]")
 {
   topology_discovery discovery;
   REQUIRE(discovery.discover());
@@ -274,11 +301,11 @@ TEST_CASE("Configurator resolves host capacity from discovered NUMA capacity", "
     return;
   }
 
-  auto const numa_id       = topology.gpus.front().numa_node;
-  auto const numa_capacity = topology.get_numa_memory_capacity(numa_id);
-  auto const* numa_node    = topology.find_numa_node(numa_id);
-  if (!numa_capacity.has_value() || (numa_node != nullptr && numa_node->is_device_memory)) {
-    SUCCEED("Skipped: no host NUMA capacity exposed for the GPU's node");
+  auto const numa_id        = topology.gpus.front().numa_node;
+  auto const numa_available = topology.get_numa_available_memory(numa_id);
+  auto const* numa_node     = topology.find_numa_node(numa_id);
+  if (!numa_available.has_value() || (numa_node != nullptr && numa_node->is_device_memory)) {
+    SUCCEED("Skipped: no host NUMA available memory exposed for the GPU's node");
     return;
   }
 
@@ -292,7 +319,7 @@ TEST_CASE("Configurator resolves host capacity from discovered NUMA capacity", "
   REQUIRE(hosts.size() == 1);
   REQUIRE(hosts.front().memory_capacity > 0);
   REQUIRE(hosts.front().memory_capacity ==
-          static_cast<std::size_t>(static_cast<double>(*numa_capacity) * 0.1));
+          static_cast<std::size_t>(static_cast<double>(*numa_available) * 0.1));
 }
 
 // GPU HBM surfaces as a CPU-less NUMA node on DGX Station and Grace-Hopper. Sizing a host
