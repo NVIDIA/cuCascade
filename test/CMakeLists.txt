@@ -32,6 +32,7 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
     memory/test_fixed_size_host_memory_resource.cpp
     memory/test_numa_affinity.cpp
     memory/test_memory_reservation_manager.cpp
+    memory/test_notification_channel.cpp
     memory/test_pool_peer_access.cpp
     memory/test_pool_peer_access_regression.cpp
     memory/test_reservation_aware_resource_adaptor.cpp

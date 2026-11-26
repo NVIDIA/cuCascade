@@ -17,6 +17,8 @@
 
 #include <cucascade/memory/notification_channel.hpp>
 
+#include <algorithm>
+
 namespace cucascade {
 namespace memory {
 
@@ -41,22 +43,72 @@ void notification_channel::acquire_notifier()
 }
 
 //===----------------------------------------------------------------------===//
+// notification_channel::scoped_waiter
+//===----------------------------------------------------------------------===//
+
+notification_channel::scoped_waiter::scoped_waiter(notification_channel& channel)
+  : _channel(channel.shared_from_this())
+{
+  std::lock_guard lock(_channel->_mutex);
+  _ticket = _channel->_next_ticket++;
+  _channel->_wait_queue.push_back(_ticket);
+}
+
+notification_channel::scoped_waiter::~scoped_waiter()
+{
+  auto& ch = *_channel;
+  {
+    std::lock_guard lock(ch._mutex);
+    auto it = std::find(ch._wait_queue.begin(), ch._wait_queue.end(), _ticket);
+    if (it != ch._wait_queue.end()) { ch._wait_queue.erase(it); }
+    if (ch._wait_queue.empty()) { return; }
+    // Pass the baton: this waiter usually leaves because its reservation was just granted, so
+    // the space's state changed and the new head must re-check it — a release that arrived
+    // during our retry was coalesced into the single notified flag we may have consumed. A
+    // fabricated notification costs the new head one cheap failed retry at worst; NOT waking it
+    // costs a stall until the next release.
+    ch._has_been_notified = true;
+  }
+  ch._cv.notify_all();
+}
+
+bool notification_channel::scoped_waiter::is_head() const
+{
+  std::lock_guard lock(_channel->_mutex);
+  return !_channel->_wait_queue.empty() && _channel->_wait_queue.front() == _ticket;
+}
+
+notification_channel::wait_status notification_channel::scoped_waiter::wait()
+{
+  auto& ch = *_channel;
+  std::unique_lock lock(ch._mutex);
+  bool notified = false;
+  ch._cv.wait(lock, [&] {
+    // IDLE / SHUTDOWN break every waiter out regardless of position (nothing further can be
+    // posted). Only the HEAD may consume a notification: consuming it from the middle of the
+    // queue is precisely the wake-up race the FIFO exists to remove.
+    if (!ch._is_running || ch._n_active_notifiers == 0) { return true; }
+    if (!ch._wait_queue.empty() && ch._wait_queue.front() == _ticket) {
+      notified = std::exchange(ch._has_been_notified, false);
+      return notified;
+    }
+    return false;
+  });
+  return !ch._is_running ? wait_status::SHUTDOWN
+         : (notified)    ? wait_status::NOTIFIED
+                         : wait_status::IDLE;
+}
+
+//===----------------------------------------------------------------------===//
 // notification_channel
 //===----------------------------------------------------------------------===//
 
 notification_channel::~notification_channel() { shutdown(); }
 
-notification_channel::wait_status notification_channel::wait()
+bool notification_channel::has_waiters() const
 {
-  std::unique_lock lock(_mutex);
-  bool notified = false;
-  _cv.wait(lock, [&, self = shared_from_this()] {
-    notified = std::exchange(_has_been_notified, false);
-    return notified || (_n_active_notifiers == 0) || not _is_running;
-  });
-  return !_is_running ? wait_status::SHUTDOWN
-         : (notified) ? wait_status::NOTIFIED
-                      : wait_status::IDLE;
+  std::lock_guard lock(_mutex);
+  return !_wait_queue.empty();
 }
 
 std::unique_ptr<notification_channel::event_notifier> notification_channel::get_notifier()
@@ -68,14 +120,19 @@ void notification_channel::shutdown()
 {
   std::lock_guard lock(_mutex);
   _is_running = false;
-  _cv.notify_one();
+  // Every parked waiter must observe the shutdown, not just one.
+  _cv.notify_all();
 }
 
 void notification_channel::notify()
 {
   std::lock_guard lock(_mutex);
   _has_been_notified = true;
-  _cv.notify_one();
+  // notify_all so the HEAD waiter definitely wakes: with one shared CV a notify_one can land on
+  // a non-head waiter, which re-checks its position and goes back to sleep while the head never
+  // learns memory was released. Waiter counts per space are small, so the extra wake-ups are
+  // noise.
+  _cv.notify_all();
 }
 
 void notification_channel::release_notifier()
