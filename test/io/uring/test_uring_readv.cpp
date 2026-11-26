@@ -29,7 +29,11 @@
 
 #include <catch2/catch_all.hpp>
 #include <fcntl.h>
+#include <linux/filter.h>
+#include <linux/seccomp.h>
 #include <poll.h>
+#include <sys/prctl.h>
+#include <sys/syscall.h>
 #include <sys/uio.h>
 #include <unistd.h>
 
@@ -671,6 +675,63 @@ TEST_CASE("io_uring staging failure names the reactor and the requested bytes", 
     reactor.start(),
     Catch::Matchers::ContainsSubstring(
       "uring_reactor: cannot reserve 134217728 bytes of pinned staging (1 x 134217728)"));
+}
+
+TEST_CASE("io_uring init failures explain the likely cause", "[io][uring]")
+{
+  using Catch::Matchers::ContainsSubstring;
+  auto const eperm = uring_reactor::init_error_hint(EPERM);
+  CHECK_THAT(eperm, ContainsSubstring("Operation not permitted"));
+  CHECK_THAT(eperm, ContainsSubstring("seccomp"));
+  CHECK_THAT(eperm, ContainsSubstring("kernel.io_uring_disabled"));
+  CHECK_THAT(uring_reactor::init_error_hint(ENOSYS),
+             ContainsSubstring("does not provide io_uring"));
+  CHECK_THAT(uring_reactor::init_error_hint(ENOMEM), ContainsSubstring("RLIMIT_MEMLOCK"));
+  CHECK_THAT(uring_reactor::init_error_hint(EIO), ContainsSubstring("does not use io_uring"));
+}
+
+TEST_CASE("io_uring blocked by seccomp fails start() with an actionable error", "[io][uring]")
+{
+  constexpr std::size_t block_size = 1UL << 20;
+  cucascade::memory::numa_region_pinned_host_memory_resource upstream{0};
+  cucascade::memory::fixed_size_host_memory_resource mr{
+    0, upstream, 128UL << 20, 128UL << 20, block_size, 4, 0};
+  auto ctx = std::make_shared<uring_reactor::reactor_context>(cucascade::io::uring::config{}, &mr);
+
+  // Seccomp filters without TSYNC bind only the calling thread and threads it spawns, so this
+  // confines the denial to the reactor started below, like a container's default profile.
+  bool filtered = false;
+  std::string error;
+  std::size_t allocated_after_failure = 1;
+  std::thread{[&] {
+    std::array<sock_filter, 4> filter{{
+      BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(seccomp_data, nr)),
+      BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_io_uring_setup, 0, 1),
+      BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM),
+      BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+    }};
+    sock_fprog prog{static_cast<unsigned short>(filter.size()), filter.data()};
+    filtered = prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == 0 &&
+               prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog) == 0;
+    if (!filtered) return;
+    try {
+      uring_reactor reactor{ctx, ""};
+      try {
+        reactor.start();
+      } catch (std::exception const& e) {
+        error = e.what();
+        // Sampled while the reactor is alive, so only start() can have released it.
+        allocated_after_failure = mr.get_total_allocated_bytes();
+      }
+    } catch (...) {
+      error = "unexpected exception";
+    }
+  }}.join();
+
+  if (!filtered) SKIP("cannot install a seccomp filter here");
+  CHECK_THAT(error, Catch::Matchers::ContainsSubstring("Operation not permitted"));
+  CHECK_THAT(error, Catch::Matchers::ContainsSubstring("seccomp"));
+  CHECK(allocated_after_failure == 0);
 }
 
 TEST_CASE("io_uring cancels rejected work outside the enqueue lock", "[io][uring]")

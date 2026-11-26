@@ -48,6 +48,7 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <future>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -125,10 +126,7 @@ using unique_ring_ptr = std::unique_ptr<io_uring, ring_deleter>;
 
   auto fallback = std::make_unique<io_uring>();
   auto const rc = io_uring_queue_init(depth, fallback.get(), 0);
-  if (rc < 0) {
-    throw std::system_error(std::error_code{-rc, std::generic_category()},
-                            "uring_reactor: io_uring_queue_init");
-  }
+  if (rc < 0) { throw std::runtime_error(uring_reactor::init_error_hint(-rc)); }
   return unique_ring_ptr{fallback.release()};
 }
 
@@ -471,6 +469,40 @@ uring_reactor::uring_reactor(std::shared_ptr<reactor_context> ctx, std::string_v
 
 uring_reactor::~uring_reactor() { shutdown(); }
 
+std::string uring_reactor::init_error_hint(int errc)
+{
+  std::string hint =
+    "uring_reactor: io_uring_queue_init failed (" + std::string{strerror(errc)} + ")";
+  switch (errc) {
+    case EPERM:
+    case EACCES:
+      hint +=
+        ". io_uring is likely blocked: a seccomp profile denies it (Docker >= 25's default "
+        "profile and containerd's RuntimeDefault profile, which Kubernetes uses with "
+        "seccompProfile RuntimeDefault, do) or the kernel.io_uring_disabled sysctl forbids it. "
+        "Allow the io_uring_setup, io_uring_enter and io_uring_register syscalls in the "
+        "container's seccomp profile (e.g. docker run --security-opt seccomp=<profile.json>), "
+        "or set kernel.io_uring_disabled=0 on the host.";
+      break;
+    case ENOSYS:
+      hint +=
+        ". The kernel does not provide io_uring (pre-5.1 kernel, CONFIG_IO_URING disabled, or a "
+        "sandbox such as gVisor), or a seccomp profile rejects it with ENOSYS. Run on a kernel "
+        "with io_uring, or allow the io_uring_setup, io_uring_enter and io_uring_register "
+        "syscalls in the seccomp profile.";
+      break;
+    case ENOMEM:
+      hint +=
+        ". The kernel could not allocate the ring. On kernels before 5.12 rings count against "
+        "RLIMIT_MEMLOCK, so a low locked-memory limit is a common cause; raise it, e.g. ulimit "
+        "-l unlimited or docker run --ulimit memlock=-1.";
+      break;
+    default: hint += "."; break;
+  }
+  hint += " Alternatively, read local files through a backend that does not use io_uring.";
+  return hint;
+}
+
 uring_reactor::gauges uring_reactor::take_gauges() noexcept
 {
   gauges out;
@@ -543,13 +575,21 @@ void uring_reactor::start()
     throw std::runtime_error("uring_reactor: failed to allocate all staging slots");
   }
 
+  // Holding the enqueue lock until the worker reports ring setup keeps requests out
+  // until the reactor can serve them; a setup failure is rethrown here, not per-read.
   std::lock_guard lock(_enqueue_mutex);
   try {
+    std::promise<void> ready;
+    auto ready_future = ready.get_future();
     _accepting.store(true, std::memory_order_release);
-    _worker = std::jthread([this](std::stop_token stop_token) { worker_loop(stop_token); },
-                           _stop_source.get_token());
+    _worker =
+      std::jthread([this, ready = std::move(ready)](
+                     std::stop_token stop_token) mutable { worker_loop(stop_token, ready); },
+                   _stop_source.get_token());
+    ready_future.get();
   } catch (...) {
     _accepting.store(false, std::memory_order_release);
+    if (_worker.joinable()) _worker.join();
     _bounce_storage.reset();
     throw;
   }
@@ -720,9 +760,10 @@ std::vector<byte_range> uring_reactor::align_and_coalesce(
   }
 }
 
-void uring_reactor::worker_loop(std::stop_token const& stop_token)
+void uring_reactor::worker_loop(std::stop_token const& stop_token, std::promise<void>& ready)
 {
-  auto cancel_queued = [&](grouped_coordinator::error_type const& error) noexcept {
+  bool ready_signaled = false;
+  auto cancel_queued  = [&](grouped_coordinator::error_type const& error) noexcept {
     std::unique_ptr<grouped_io_request> request;
     while (_requests.try_dequeue(request)) {
       if (request == nullptr) continue;
@@ -1158,6 +1199,10 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
       cancel_request(active, error);
     };
 
+    // Setup is done; from here on, failures settle requests instead of failing start().
+    ready.set_value();
+    ready_signaled = true;
+
     std::exception_ptr fatal_error;
     try {
       while (!stop_token.stop_requested()) {
@@ -1383,6 +1428,11 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
     }
   } catch (...) {
     auto const error = std::current_exception();
+    // start() still holds the enqueue lock and nothing was queued; hand it the error.
+    if (!ready_signaled) {
+      ready.set_exception(error);
+      return;
+    }
     {
       std::lock_guard lock(_enqueue_mutex);
       _accepting.store(false, std::memory_order_release);
