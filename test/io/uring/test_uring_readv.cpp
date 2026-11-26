@@ -158,7 +158,7 @@ class pattern_file {
 
 /**
  * A started reactor whose staging is 64 one-MiB slots (the slot cap), reading
- * with @p slices_per_pass and @p low_service_interval.
+ * with @p slices_per_pass and @p low_service_interval, or with a whole @p cfg.
  */
 class spp_reactor {
  public:
@@ -168,10 +168,13 @@ class spp_reactor {
   explicit spp_reactor(
     std::size_t slices_per_pass,
     std::size_t low_service_interval = cucascade::io::uring::config{}.low_service_interval)
+    : spp_reactor(config_for(slices_per_pass, low_service_interval))
+  {
+  }
+
+  explicit spp_reactor(cucascade::io::uring::config const& cfg)
     : _mr{0, _upstream, capacity, capacity, block_size, 64, 0},
-      _reactor{std::make_shared<uring_reactor::reactor_context>(
-                 config_for(slices_per_pass, low_service_interval), &_mr),
-               ""}
+      _reactor{std::make_shared<uring_reactor::reactor_context>(cfg, &_mr), ""}
   {
     _reactor.start();
   }
@@ -759,6 +762,50 @@ TEST_CASE("io_uring slices_per_pass sets how deep a single request queues",
   CHECK(max_inflight(8) >= 8);
   // No cap: the first pass fills the 64 free slots.
   CHECK(max_inflight(0) >= 32);
+}
+
+TEST_CASE("io_uring max_inflight_small_reads caps small reads, not large ones",
+          "[io][uring][small_read_cap]")
+{
+  // Small and large slices alternate.  slices_per_pass 0 lets the first pass expand every
+  // slice, so without the cap every small read is in flight at once.
+  constexpr std::size_t n_pairs = 16;
+  constexpr std::size_t small   = 16UL << 10;
+  constexpr std::size_t large   = 256UL << 10;
+  constexpr std::size_t stride  = small + large;
+  constexpr std::size_t total   = n_pairs * stride;
+  pattern_file const file{total};
+  std::vector<range> ranges;
+  for (std::size_t i = 0; i < n_pairs; ++i) {
+    ranges.push_back(range{i * stride, small});
+    ranges.push_back(range{i * stride + small, large});
+  }
+
+  auto read_all = [&](std::size_t max_inflight_small_reads) {
+    cucascade::io::uring::config cfg{};
+    cfg.slices_per_pass          = 0;
+    cfg.max_inflight_small_reads = max_inflight_small_reads;
+    cfg.small_read_bytes         = 64UL << 10;
+    // Destination first: it must outlive the reactor (see the slices_per_pass test).
+    aligned_bytes destination{total};
+    spp_reactor reactor{cfg};
+    auto future = enqueue_ranges(reactor.get(), file.open(), ranges, destination.get());
+    CHECK(std::move(future).get(std::chrono::seconds(30)) == total);
+    std::size_t mismatched = 0;
+    for (std::size_t i = 0; i < total; ++i) {
+      if (destination.get()[i] != pattern_byte(i)) ++mismatched;
+    }
+    CHECK(mismatched == 0);
+    return reactor.get().take_gauges();
+  };
+
+  auto const uncapped = read_all(0);
+  CHECK(uncapped.max_small_inflight_ops >= 2);
+
+  auto const capped = read_all(1);
+  CHECK(capped.max_small_inflight_ops == 1);
+  // A large read went out alongside the one small read in flight.
+  CHECK(capped.max_inflight_ops >= 2);
 }
 
 TEST_CASE("io_uring slices_per_pass holds while a read outlasts the worker's poll interval",
