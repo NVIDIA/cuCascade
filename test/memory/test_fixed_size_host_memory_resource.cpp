@@ -35,20 +35,26 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cerrno>
 #include <climits>
 #include <cstddef>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <memory>
 #include <mutex>
 #include <new>
 #include <set>
 #include <span>
+#include <sstream>
+#include <string>
 #include <thread>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 using namespace cucascade::memory;
@@ -332,6 +338,43 @@ TEST_CASE("NUMA pinned allocation on an unknown node uses the default policy", "
   auto const policy = page_policy::of(p);
 
   REQUIRE(policy.mode == MPOL_DEFAULT);
+}
+
+TEST_CASE("NUMA pinned regions never share a VMA", "[fixed_size_host]")
+{
+  // Back-to-back anonymous mappings with equal flags merge into one VMA unless something
+  // separates them.
+  numa_region_pinned_host_memory_resource upstream(0);
+  constexpr std::size_t regions = 16;
+  std::vector<void*> allocations;
+  auto release = cucascade::utils::on_scope_exit([&]() noexcept {
+    for (void* p : allocations) {
+      upstream.deallocate_sync(p, block_size);
+    }
+  });
+  for (std::size_t i = 0; i < regions; ++i) {
+    allocations.push_back(upstream.allocate_sync(block_size));
+  }
+
+  std::ifstream maps("/proc/self/maps");
+  REQUIRE(maps.is_open());
+  std::vector<std::pair<std::uintptr_t, std::uintptr_t>> vmas;
+  for (std::string line; std::getline(maps, line);) {
+    std::uintptr_t begin = 0;
+    std::uintptr_t end   = 0;
+    char dash            = 0;
+    std::istringstream in(line);
+    in >> std::hex >> begin >> dash >> end;
+    vmas.emplace_back(begin, end);
+  }
+  for (void* p : allocations) {
+    auto const begin = reinterpret_cast<std::uintptr_t>(p);
+    auto const vma   = std::ranges::find_if(
+      vmas, [begin](auto const& v) { return v.first <= begin && begin < v.second; });
+    REQUIRE(vma != vmas.end());
+    CHECK(vma->first == begin);
+    CHECK(vma->second == begin + block_size);
+  }
 }
 
 TEST_CASE("Returning every block after several pool expansions does not allocate",
