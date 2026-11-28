@@ -152,8 +152,8 @@ class cufile_reactor {
                           std::size_t arena_offset) = 0;
   };
 
-  /// A reactor for GPU @p device whose threads are pinned to @p cpus (the CPUs
-  /// of the GPU's NUMA node; empty leaves them unpinned).
+  /// A reactor for GPU @p device whose threads are pinned to those of @p cpus (the
+  /// CPUs of the GPU's NUMA node) they inherit; none, or empty, leaves them unpinned.
   /// @throws std::invalid_argument for no lanes, or a lane size that is not a
   ///         positive multiple of the write granule.
   cufile_reactor(config cfg, int device, std::vector<int> cpus = {});

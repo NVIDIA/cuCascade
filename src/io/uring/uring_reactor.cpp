@@ -1067,9 +1067,10 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token, std::promise<
 
   try {
     // A reactor dedicated to one GPU (see reactor_placement): the worker stays on the
-    // GPU's NUMA node and on its device for every copy and event it makes.
+    // GPU's NUMA node (within the CPUs it inherited) and on its device for every copy and
+    // event it makes.
     if (!_placement.cpus.empty() &&
-        !cucascade::exec::thread_util::set_current_thread_affinity(_placement.cpus)) {
+        !cucascade::exec::thread_util::narrow_current_thread_affinity(_placement.cpus)) {
       CUCASCADE_LOG_WARN("uring_reactor {}: cannot pin the worker to its CPUs", _tname);
     }
     if (_placement.device >= 0) { CUCASCADE_CUDA_TRY(cudaSetDevice(_placement.device)); }

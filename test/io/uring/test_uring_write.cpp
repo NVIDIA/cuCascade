@@ -18,6 +18,7 @@
 #include "io/detail/local_descriptor.hpp"
 #include "utils/child_test_runner.hpp"
 
+#include <cucascade/exec/thread_util.hpp>
 #include <cucascade/io/config.hpp>
 #include <cucascade/io/datasource_factory.hpp>
 #include <cucascade/io/io_context.hpp>
@@ -1554,6 +1555,33 @@ TEST_CASE("uring per-GPU pool separates the reads and the writes of a GPU", "[io
   CHECK(requests_started(ctx) == counts{2, 3});
   CHECK(host_copy_of(device_out, size) == device_data);
   ctx.shutdown();
+}
+
+TEST_CASE("uring per-GPU workers stay within the affinity they inherit", "[io][uring][per_gpu]")
+{
+  auto const inherited = cucascade::exec::thread_util::get_current_thread_affinity();
+  if (inherited.size() < 2) { SKIP("requires two CPUs"); }
+  int const mine  = inherited[0];
+  int const other = inherited[1];
+  staging_resource staging;
+  // The affinity of the worker a group with @p node_cpus starts from a thread bound to `mine`.
+  auto const worker_affinity = [&](std::vector<int> node_cpus) {
+    uring_ioctx ctx{
+      std::vector<uring_ioctx::device_group>{{0, std::move(node_cpus), staging.context()}}};
+    {
+      cucascade::exec::thread_util::scoped_thread_affinity const bound{std::vector<int>{mine}};
+      ctx.start();
+    }
+    auto cpus = affinity_of_thread("ur-g0-r0_worker");
+    ctx.shutdown();
+    return cpus;
+  };
+
+  // A process bound to fewer CPUs than the GPU's NUMA node (taskset, numactl, several processes
+  // per node) keeps its workers within that binding ...
+  CHECK(worker_affinity({mine, other}) == std::vector<int>{mine});
+  // ... and leaves them unpinned when the node has none of its CPUs.
+  CHECK(worker_affinity({other}) == std::vector<int>{mine});
 }
 
 TEST_CASE("uring per-GPU pool rejects groups it cannot serve", "[io][uring][per_gpu]")

@@ -1025,7 +1025,7 @@ void cufile_reactor::start()
     _completer->thread = std::thread([this, startup] {
       std::ignore =
         exec::thread_util::set_current_thread_name("cf-g" + std::to_string(_device) + "-cp");
-      if (!_cpus.empty() && !exec::thread_util::set_current_thread_affinity(_cpus)) {
+      if (!_cpus.empty() && !exec::thread_util::narrow_current_thread_affinity(_cpus)) {
         CUCASCADE_LOG_WARN("cufile_reactor: cannot pin the completion thread to its CPUs");
       }
       // Its polls sleep for microseconds: do not let the kernel stretch them by the default 50 us.
@@ -1045,7 +1045,7 @@ void cufile_reactor::start()
         set->lanes[i]->thread =
           std::thread([this, set, startup, self = set->lanes[i].get(), name = std::move(name)] {
             std::ignore = exec::thread_util::set_current_thread_name(name);
-            if (!_cpus.empty() && !exec::thread_util::set_current_thread_affinity(_cpus)) {
+            if (!_cpus.empty() && !exec::thread_util::narrow_current_thread_affinity(_cpus)) {
               CUCASCADE_LOG_WARN("cufile_reactor {}: cannot pin the lane to its CPUs", name);
             }
             lane_owner = this;

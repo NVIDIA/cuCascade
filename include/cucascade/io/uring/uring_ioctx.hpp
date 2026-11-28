@@ -47,8 +47,8 @@ class uring_ioctx : public templated_ioctx<uring_reactor> {
   /// The reactors of one GPU in a per-GPU pool.
   struct device_group {
     int device{-1};  ///< CUDA device id
-    /// CPUs of the GPU's NUMA node, which the workers are pinned to; empty leaves
-    /// them unpinned.
+    /// CPUs of the GPU's NUMA node: the workers are pinned to those of them they
+    /// inherit; none, or empty, leaves them unpinned.
     std::vector<int> cpus;
     /// Config and the staging resource of the GPU's NUMA node (must outlive this
     /// ioctx).  Every group's resource must have the same block size.

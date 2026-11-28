@@ -24,6 +24,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <array>
 #include <cerrno>
 #include <cstring>
@@ -182,6 +183,23 @@ std::vector<int> get_thread_affinity(pthread_t handle) noexcept
 std::vector<int> get_current_thread_affinity() noexcept
 {
   return get_thread_affinity(::pthread_self());
+}
+
+bool narrow_current_thread_affinity(std::span<int const> cpu_ids) noexcept
+{
+  auto const inherited = get_current_thread_affinity();
+  std::vector<int> allowed;
+  try {
+    allowed.reserve(cpu_ids.size());
+  } catch (...) {
+    return true;  // nothing changed: the thread keeps what it inherited
+  }
+  for (int const cpu : cpu_ids) {
+    if (std::find(inherited.begin(), inherited.end(), cpu) != inherited.end()) {
+      allowed.push_back(cpu);
+    }
+  }
+  return allowed.empty() || set_current_thread_affinity(allowed);
 }
 
 scoped_thread_affinity::scoped_thread_affinity(std::span<int const> cpus)

@@ -75,7 +75,8 @@ namespace cucascade::io::cufile {
 class cufile_ioctx final : public templated_ioctx<cufile_reactor> {
  public:
   /// A reactor for every GPU of @c cfg.devices (every visible GPU when empty),
-  /// its threads pinned to the CPUs of the GPU's NUMA node when that is known.
+  /// its threads pinned to the CPUs of the GPU's NUMA node (those they inherit) when that is
+  /// known.
   /// @throws std::invalid_argument for no GPUs, or a @p cfg the reactor rejects.
   explicit cufile_ioctx(config const& cfg);
 

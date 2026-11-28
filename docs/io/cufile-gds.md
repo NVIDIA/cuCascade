@@ -61,8 +61,9 @@ least-backlogged reactors.
 A **lane** is a thread that blocks in one synchronous cuFile call at a time, so
 the lane count (`lanes`, default 32) is the I/O depth of the GPU. Reads and
 writes have their own lanes and queues, so reads never wait behind writes. The
-lanes are pinned to the CPUs of the GPU's NUMA node when discovery knows it,
-and each makes its GPU current once, when it starts.
+lanes are pinned to the CPUs of the GPU's NUMA node when discovery knows it
+(those the process may run on: a `taskset` or `numactl` binding is kept), and
+each makes its GPU current once, when it starts.
 
 For every segment it serves, a lane takes one **slot** of the arena:
 `lane_bytes` (default 8 MiB) of device memory registered with
