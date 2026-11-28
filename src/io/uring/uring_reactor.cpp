@@ -19,6 +19,7 @@
 #include "io/detail/local_descriptor.hpp"
 
 #include <cucascade/cuda/event.hpp>
+#include <cucascade/error.hpp>
 #include <cucascade/exec/thread_util.hpp>
 #include <cucascade/io/cache/types.hpp>
 #include <cucascade/io/details/slot_pool.hpp>
@@ -69,6 +70,17 @@ namespace {
 
 /// Test seam (see uring/types.hpp).
 std::atomic<bool> fail_copy_event_record{false};
+/// See detail::fail_copy_queries_for_testing: the status every query of a copy's event, and of
+/// the stream it runs on, takes instead of the real one; cudaSuccess for none.
+std::atomic<int> copy_event_query_failure{cudaSuccess};
+std::atomic<int> copy_stream_query_failure{cudaSuccess};
+
+/// @p real, or the status a test injects instead (see detail::fail_copy_queries_for_testing).
+[[nodiscard]] cudaError_t injected_or(cudaError_t real, std::atomic<int> const& injected) noexcept
+{
+  auto const status = injected.load(std::memory_order_relaxed);
+  return status != cudaSuccess ? static_cast<cudaError_t>(status) : real;
+}
 
 /// Record @p event on @p stream after a copy was enqueued there; tests can make
 /// the record fail (@ref detail::set_copy_event_record_failure_for_testing).
@@ -1245,6 +1257,37 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token, std::promise<
       reset_slot(slot);
     };
 
+    // Where the copy of @p slot stands: cudaSuccess once it is done, cudaErrorNotReady while it
+    // may still run, else the status that put the GPU's context out of service.
+    // cudaEventQuery also reports errors of earlier asynchronous work, so an error of the event
+    // does not say the copy is done, nor that it failed: the stream it runs on is asked instead.
+    auto copy_status = [&](io_slot& slot) noexcept -> cudaError_t {
+      auto status = injected_or(slot.copy_event->query_raw_status(), copy_event_query_failure);
+      if (status == cudaSuccess || status == cudaErrorNotReady) return status;
+      rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{slot.event_device}};
+      status = injected_or(cudaStreamQuery(slot.op->request.device_copy->d_buffer.stream.get()),
+                           copy_stream_query_failure);
+      if (status == cudaSuccess || status == cudaErrorNotReady ||
+          cucascade::terminal_cuda_status(status)) {
+        return status;
+      }
+      // Not shown done, and the context is not shown out of service: the copy may still read or
+      // write the slot's staging and the caller's buffer, so both stay its own.  Keep watching.
+      std::ignore = cudaGetLastError();
+      return cudaErrorNotReady;
+    };
+
+    // copy_status of @p slot once the copy settled, waiting for it.
+    auto wait_copy = [&](io_slot& slot) noexcept -> cudaError_t {
+      std::ignore = slot.copy_event->synchronize_no_throw();
+      auto status = copy_status(slot);
+      while (status == cudaErrorNotReady) {
+        std::this_thread::sleep_for(POLL_INTERVAL);
+        status = copy_status(slot);
+      }
+      return status;
+    };
+
     auto start_device_copy = [&](io_slot& slot) noexcept {
       auto& copy = *slot.op->request.device_copy;
       int device = copy.device_id >= 0 ? copy.device_id : copy.d_buffer.device_id;
@@ -1299,7 +1342,7 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token, std::promise<
         // entry that was already settled elsewhere instead of completing a foreign op.
         assert(slot.state == slot_state::copying && slot.op != nullptr);
         if (slot.state != slot_state::copying || slot.op == nullptr) continue;
-        auto const status = slot.copy_event->query_raw_status();
+        auto const status = copy_status(slot);
         if (status == cudaErrorNotReady) {
           *output++ = *it;
           continue;
@@ -1534,7 +1577,7 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token, std::promise<
         auto& slot = slots[static_cast<std::size_t>(*it)];
         assert(slot.state == slot_state::staging && slot.op != nullptr);
         if (slot.state != slot_state::staging || slot.op == nullptr) continue;
-        auto const status = slot.copy_event->query_raw_status();
+        auto const status = copy_status(slot);
         if (status == cudaErrorNotReady) {
           *output++ = *it;
           continue;
@@ -1989,7 +2032,7 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token, std::promise<
     // before the blocks are released, then fail them.
     for (auto const index : staging) {
       auto& slot  = slots[static_cast<std::size_t>(index)];
-      std::ignore = slot.copy_event->synchronize_no_throw();
+      std::ignore = wait_copy(slot);
       leave_staging(slot);
       settle_slot_error(slot, terminal_error);
     }
@@ -1997,7 +2040,7 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token, std::promise<
 
     for (auto const index : copying) {
       auto& slot        = slots[static_cast<std::size_t>(index)];
-      auto const status = slot.copy_event->synchronize_no_throw();
+      auto const status = wait_copy(slot);
       if (status == cudaSuccess) {
         slot.op->request.finish_success();
         reset_slot(slot);
@@ -2031,6 +2074,12 @@ namespace detail {
 void set_copy_event_record_failure_for_testing(bool enabled) noexcept
 {
   fail_copy_event_record.store(enabled, std::memory_order_relaxed);
+}
+
+void fail_copy_queries_for_testing(int event_error, int stream_error) noexcept
+{
+  copy_event_query_failure.store(event_error, std::memory_order_relaxed);
+  copy_stream_query_failure.store(stream_error, std::memory_order_relaxed);
 }
 
 }  // namespace detail

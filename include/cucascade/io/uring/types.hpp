@@ -146,5 +146,11 @@ inline void fill_remaining_iovecs(std::span<iovec const> source,
 /// Process-wide; tests only.
 void set_copy_event_record_failure_for_testing(bool enabled) noexcept;
 
+/// Make every uring reactor take @p event_error for each query of a staged copy's event, and
+/// @p stream_error (unless cudaSuccess) for each query of the stream the copy runs on, instead
+/// of the real status, so tests can check how such an error settles the copy.  0 for both
+/// restores the real queries.  Process-wide; tests only.
+void fail_copy_queries_for_testing(int event_error, int stream_error = 0) noexcept;
+
 }  // namespace detail
 }  // namespace cucascade::io::uring

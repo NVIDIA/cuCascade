@@ -722,6 +722,32 @@ TEST_CASE("uring device writes order after the caller's default streams", "[io][
   REQUIRE(cudaStreamSynchronize(caller_stream) == cudaSuccess);
 }
 
+TEST_CASE("uring device writes whose staging copy event reports an error wait for its stream",
+          "[io][uring][write]")
+{
+  // cudaEventQuery also reports errors of earlier asynchronous work, so an error of the D2H
+  // copy's event does not say the copy stopped: the write waits for the caller's stream to show
+  // it done, then writes what the copy staged, instead of failing with the staging block (and
+  // the caller's source) still in the copy's use.
+  write_context ctx;
+  scratch_path path;
+  auto object                 = ctx->open_io_object_for_write(path.str());
+  constexpr std::size_t bytes = 4 * MiB + 5;
+  device_bytes device{std::vector<std::uint8_t>(bytes, 0x11)};
+  cuda_stream stream;
+  REQUIRE(cudaMemsetAsync(device.get(), 0xAB, bytes, stream.get()) == cudaSuccess);
+  {
+    cucascade::io::uring::detail::fail_copy_queries_for_testing(cudaErrorLaunchFailure);
+    struct restore {
+      ~restore() { cucascade::io::uring::detail::fail_copy_queries_for_testing(0); }
+    } const restored;
+    CHECK(ctx->device_write_async(*object, 0, bytes, device.get(), stream.ref()).get() == bytes);
+  }
+  auto const contents = path.contents();
+  REQUIRE(contents.size() == bytes);
+  CHECK(std::all_of(contents.begin(), contents.end(), [](std::uint8_t b) { return b == 0xAB; }));
+}
+
 TEST_CASE("uring vectored writes place every segment", "[io][uring][write]")
 {
   auto const split = GENERATE(std::size_t{0}, MiB, 32 * MiB);

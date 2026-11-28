@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+#include <cucascade/error.hpp>
 #include <cucascade/io/cache/types.hpp>
 #include <cucascade/io/io_request.hpp>
 #include <cucascade/io/types.hpp>
@@ -1765,6 +1766,19 @@ class copy_event_record_failure {
   copy_event_record_failure& operator=(copy_event_record_failure const&) = delete;
 };
 
+/// Every query of a staged copy's event reports @p event_error, and every query of its stream
+/// @p stream_error (none: cudaSuccess), for the guard's life.
+class failing_copy_queries {
+ public:
+  explicit failing_copy_queries(cudaError_t event_error, cudaError_t stream_error = cudaSuccess)
+  {
+    cucascade::io::uring::detail::fail_copy_queries_for_testing(event_error, stream_error);
+  }
+  ~failing_copy_queries() { cucascade::io::uring::detail::fail_copy_queries_for_testing(0); }
+  failing_copy_queries(failing_copy_queries const&)            = delete;
+  failing_copy_queries& operator=(failing_copy_queries const&) = delete;
+};
+
 /// Hold @p stream on the host for @p duration (a host function that sleeps).
 void hold_stream(cudaStream_t stream, std::chrono::milliseconds duration)
 {
@@ -1840,6 +1854,118 @@ TEST_CASE("io_uring device reads that fail after enqueuing a copy settle only on
   REQUIRE(cudaStreamSynchronize(stream) == cudaSuccess);
   REQUIRE(cudaFree(destination) == cudaSuccess);
   REQUIRE(cudaStreamDestroy(stream) == cudaSuccess);
+  ioctx.shutdown();
+}
+
+TEST_CASE("io_uring device reads whose copy event reports an error wait for the copy's stream",
+          "[io][uring][gpu]")
+{
+  int devices = 0;
+  if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) {
+    std::ignore = cudaGetLastError();
+    SKIP("requires a CUDA device");
+  }
+  // cudaEventQuery also reports errors of earlier asynchronous work: the H2D copy, queued behind
+  // a hold on the caller's stream, has not run when its event reports one.  The read settles
+  // only once the stream shows the copy done, so the destination holds the file's bytes (and
+  // the staging block is not reused while the copy reads it).
+  constexpr std::size_t size = 4UL << 20;
+  pattern_file const file{size};
+  ioctx_staging staging{1};
+  uring_ioctx ioctx{1, staging.context()};
+  ioctx.start();
+  auto const object = file.open();
+
+  cudaStream_t stream{};
+  REQUIRE(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) == cudaSuccess);
+  void* destination = nullptr;
+  REQUIRE(cudaMalloc(&destination, size) == cudaSuccess);
+  REQUIRE(cudaMemsetAsync(destination, 0xAB, size, stream) == cudaSuccess);
+  REQUIRE(cudaStreamSynchronize(stream) == cudaSuccess);
+
+  {
+    hold_stream(stream, std::chrono::milliseconds{300});
+    failing_copy_queries const failing{cudaErrorLaunchFailure};
+    CHECK(ioctx
+            .device_read_async_io(
+              *object, 0, size, static_cast<std::uint8_t*>(destination), ::cuda::stream_ref{stream})
+            .get(std::chrono::seconds(30)) == size);
+  }
+  auto const bytes  = device_bytes_elsewhere(destination, size);
+  std::size_t wrong = 0;
+  for (std::size_t i = 0; i < size; ++i) {
+    wrong += bytes[i] != pattern_byte(i) ? 1 : 0;
+  }
+  CHECK(wrong == 0);
+
+  REQUIRE(cudaStreamSynchronize(stream) == cudaSuccess);
+  REQUIRE(cudaFree(destination) == cudaSuccess);
+  REQUIRE(cudaStreamDestroy(stream) == cudaSuccess);
+  ioctx.shutdown();
+}
+
+TEST_CASE("io_uring device reads stay pending while the copy's stream reports a non-fatal error",
+          "[io][uring][gpu]")
+{
+  int devices = 0;
+  if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) {
+    std::ignore = cudaGetLastError();
+    SKIP("requires a CUDA device");
+  }
+  // An error the CUDA runtime does not document as terminal may be earlier work's: the copy may
+  // still write the destination, so the read does not resolve until it is shown done.
+  auto const stream_error = GENERATE(cudaErrorMemoryAllocation, cudaErrorInvalidValue);
+  CAPTURE(stream_error);
+  constexpr std::size_t size = 1UL << 20;
+  pattern_file const file{size};
+  ioctx_staging staging{1};
+  uring_ioctx ioctx{1, staging.context()};
+  ioctx.start();
+  auto const object = file.open();
+  device_scratch dst{size};
+  auto const stream = ::cuda::stream_ref{cudaStream_t{nullptr}};
+
+  auto read = [&] {
+    failing_copy_queries const failing{cudaErrorLaunchFailure, stream_error};
+    auto pending = ioctx.device_read_async_io(*object, 0, size, dst.get(), stream);
+    std::this_thread::sleep_for(std::chrono::milliseconds{300});
+    CHECK_FALSE(pending.is_ready());
+    return pending;
+  }();
+  CHECK(std::move(read).get(std::chrono::seconds(30)) == size);
+  // The slot came back.
+  CHECK(
+    ioctx.device_read_async_io(*object, 0, size, dst.get(), stream).get(std::chrono::seconds(30)) ==
+    size);
+  ioctx.shutdown();
+}
+
+TEST_CASE("io_uring device reads fail with the status that put the copy's context out of service",
+          "[io][uring][gpu]")
+{
+  int devices = 0;
+  if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) {
+    std::ignore = cudaGetLastError();
+    SKIP("requires a CUDA device");
+  }
+  constexpr std::size_t size = 1UL << 20;
+  pattern_file const file{size};
+  ioctx_staging staging{1};
+  uring_ioctx ioctx{1, staging.context()};
+  ioctx.start();
+  auto const object = file.open();
+  device_scratch dst{size};
+  auto const stream = ::cuda::stream_ref{cudaStream_t{nullptr}};
+  {
+    failing_copy_queries const failing{cudaErrorLaunchFailure, cudaErrorIllegalAddress};
+    try {
+      std::ignore = ioctx.device_read_async_io(*object, 0, size, dst.get(), stream)
+                      .get(std::chrono::seconds(30));
+      FAIL("the read resolved although its context is out of service");
+    } catch (cucascade::cuda_status_error const& error) {
+      CHECK(error.error_code() == cudaErrorIllegalAddress);
+    }
+  }
   ioctx.shutdown();
 }
 
