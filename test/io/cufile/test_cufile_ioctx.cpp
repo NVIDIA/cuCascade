@@ -978,6 +978,30 @@ TEST_CASE("an arena grown for two reactors has the larger of their slot counts",
   CHECK(buffer_registrations == 65 + 96);
 }
 
+TEST_CASE("arena_bytes_to_reserve tells what reserving an arena would allocate",
+          "[io][cufile][gpu]")
+{
+  if (!cufile_usable()) { SKIP("requires a CUDA device and a cuFile driver"); }
+  fresh_arenas fresh;
+  substituted_api api;
+  namespace cufile = cucascade::io::cufile;
+  auto const small = small_config();  // 4 read + 2 write slots of 1 MiB
+  // No arena yet: one of the shape asked for.  Asking allocates nothing.
+  CHECK(cufile::arena_bytes_to_reserve(0, small) == small.arena_bytes());
+  CHECK(buffer_registrations == 0);
+  cufile::reserve_arena(0, small);
+  // Shapes the arena covers cost nothing.
+  CHECK(cufile::arena_bytes_to_reserve(0, small) == 0);
+  auto shallow                = small;
+  shallow.read_slots_per_lane = 1;
+  CHECK(cufile::arena_bytes_to_reserve(0, shallow) == 0);
+  // One it does not: the whole arena covering both (each count and size the larger of the two).
+  auto wide       = small;
+  wide.lanes      = 1;
+  wide.lane_bytes = 2 * MiB;  // 2 read + 1 write slots of 2 MiB
+  CHECK(cufile::arena_bytes_to_reserve(0, wide) == (4 + 2) * 2 * MiB);
+}
+
 TEST_CASE("a grown arena registers what its released predecessor had pinned", "[io][cufile][gpu]")
 {
   if (!cufile_usable()) { SKIP("requires a CUDA device and a cuFile driver"); }

@@ -638,6 +638,23 @@ class sync_transport final : public cufile_reactor::transport {
 
 void reserve_arena(int device, config const& cfg) { std::ignore = arena_of(device, cfg); }
 
+std::size_t arena_bytes_to_reserve(int device, config const& cfg)
+{
+  check_shape(cfg);
+  auto& store = arenas();
+  std::lock_guard const lock(store.mutex);
+  auto const found  = store.arenas.find(device);
+  auto const* arena = found == store.arenas.end() ? nullptr : found->second.get();
+  if (arena != nullptr && arena->covers(cfg)) { return 0; }
+  auto const bytes = (arena == nullptr ? arena_shape::of(cfg) : arena->grown_for(cfg)).bytes();
+  if (!bytes) {
+    throw std::invalid_argument("cufile_reactor: an arena covering GPU " + std::to_string(device) +
+                                "'s current one and the requested one is larger than the address "
+                                "space");
+  }
+  return *bytes;
+}
+
 namespace detail {
 
 void release_arenas_for_testing() noexcept

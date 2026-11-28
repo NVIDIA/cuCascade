@@ -57,6 +57,15 @@ class device_arena;
 void reserve_arena(int device, config const& cfg);
 
 /**
+ * @brief The device bytes @ref reserve_arena(@p device, @p cfg) would allocate now.
+ *
+ * 0 when the arena @p device has covers @p cfg; else the bytes of the arena it would
+ * get (one covering both), allocated while its current one is still held.
+ * @throws std::invalid_argument for a @p cfg no arena can be built from.
+ */
+[[nodiscard]] std::size_t arena_bytes_to_reserve(int device, config const& cfg);
+
+/**
  * @brief A local file opened for cuFile: the descriptors of a
  *        @c uring::local_io_object plus a cuFile handle registered on them.
  *
