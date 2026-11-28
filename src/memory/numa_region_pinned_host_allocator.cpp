@@ -56,17 +56,29 @@ int prefault(void* ptr, std::size_t bytes)
 }
 
 /// Owns an anonymous private mapping whose pages are bound to one NUMA node.
+///
+/// An inaccessible guard page follows the mapping so that it never shares a VMA with an adjacent
+/// region: O_DIRECT reads into separately registered regions that the kernel merged into one VMA
+/// corrupted data and hung GPU copies (Xid 72) on 6.17 64K-page kernels.
 class node_mapping {
  public:
   /// Maps @p bytes on @p node. Throws rmm::bad_alloc if the mapping fails. The binding is best
   /// effort: the pages follow the default policy if the node is unknown or not allowed.
   node_mapping(std::size_t bytes, int node)
-    : _ptr(mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0)),
+    : _ptr(mmap(
+        nullptr, mapped_bytes(bytes), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0)),
       _bytes(bytes)
   {
     if (_ptr == MAP_FAILED) {
       _ptr = nullptr;
       throw rmm::bad_alloc(std::strerror(errno));
+    }
+    if (mprotect(static_cast<char*>(_ptr) + mapped_bytes(bytes) - page_size(),
+                 page_size(),
+                 PROT_NONE) != 0) {
+      int const guard_error = errno;
+      unmap(std::exchange(_ptr, nullptr), bytes);
+      throw rmm::bad_alloc(std::strerror(guard_error));
     }
     if (node < 0 || node >= max_nodes) { return; }
     std::array<unsigned long, max_nodes / detail::kernel_bitmask::bits_per_word> nodes{};
@@ -95,11 +107,27 @@ class node_mapping {
   [[nodiscard]] void* get() const noexcept { return _ptr; }
   [[nodiscard]] void* release() noexcept { return std::exchange(_ptr, nullptr); }
 
-  static void unmap(void* ptr, std::size_t bytes) noexcept { std::ignore = munmap(ptr, bytes); }
+  /// Unmaps a region of @p bytes and its guard page.
+  static void unmap(void* ptr, std::size_t bytes) noexcept
+  {
+    std::ignore = munmap(ptr, mapped_bytes(bytes));
+  }
 
  private:
   // The kernel supports at most 2^10 nodes (CONFIG_NODES_SHIFT).
   static constexpr int max_nodes = 1 << 10;
+
+  static std::size_t page_size() noexcept
+  {
+    static auto const page = static_cast<std::size_t>(sysconf(_SC_PAGESIZE));
+    return page;
+  }
+
+  /// The region rounded up to whole pages, plus the guard page.
+  static std::size_t mapped_bytes(std::size_t bytes) noexcept
+  {
+    return (bytes + page_size() - 1) / page_size() * page_size() + page_size();
+  }
 
   void* _ptr;
   std::size_t _bytes;
