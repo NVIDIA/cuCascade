@@ -23,6 +23,7 @@
 #include <cucascade/memory/topology_discovery.hpp>
 
 #include <list>
+#include <memory>
 #include <optional>
 #include <span>
 #include <unordered_map>
@@ -160,11 +161,19 @@ class reservation_manager_configurator {
 
   // --- disk settings ---
 
-  /// \brief set the function that takes in the numa node id and create cpu memory resource
-  /// @param mr_fn Function to create CPU memory resource.
+  /// \brief add a DISK memory space backed by files under a mount point
+  /// @param uuid Disk memory space id.
+  /// @param capacity Capacity of the disk memory space in bytes.
+  /// @param mounting_point Directory the space's files are created in.
+  /// @param io_context io context serving the space's files (must be started and support
+  ///        writes); null adopts a process-shared default on first use.
+  /// @param allow_gds Whether that default may be the cuFile (GPUDirect Storage) context, which
+  ///        is adopted only when the mounting point supports GDS; false always adopts uring.
   builder_reference& set_disk_mounting_point(int uuid,
                                              std::size_t capacity,
-                                             std::string mounting_point);
+                                             std::string mounting_point,
+                                             std::shared_ptr<io::ioctx> io_context = nullptr,
+                                             bool allow_gds                        = true);
 
   /// \brief build the memory space configurations based on the provided system topology
   /// @param topology System topology information.
@@ -254,7 +263,7 @@ class reservation_manager_configurator {
   mutable DeviceMemoryResourceFactoryFn _cpu_mr_fn{};
   std::optional<bool> _host_memory_portability;
 
-  std::vector<std::tuple<int, std::size_t, std::string>> _disk_mounting_points{};
+  std::vector<disk_memory_space_config> _disk_mounting_points{};
 };
 
 }  // namespace memory

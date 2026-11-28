@@ -33,9 +33,9 @@ thread_local std::size_t fault_until = 0;  ///< ... up to (not including) this o
 
 }  // namespace
 
-// Replacements for the global allocation functions (the unaligned forms; the array and
-// nothrow forms forward to these).  Same malloc/free behaviour as the defaults, plus the count
-// and the armed fault.
+// Replace the complete unaligned family. ASan interposes nothrow/array forms
+// independently, so relying on libstdc++ forwarding mixes ASan-new with our free.
+// All these entry points must use the same malloc/free allocation family.
 void* operator new(std::size_t size)
 {
   if (counting) {
@@ -52,6 +52,24 @@ void* operator new(std::size_t size)
 void operator delete(void* p) noexcept { std::free(p); }
 
 void operator delete(void* p, std::size_t) noexcept { std::free(p); }
+
+void* operator new(std::size_t size, std::nothrow_t const&) noexcept
+{
+  try {
+    return ::operator new(size);
+  } catch (...) {
+    return nullptr;
+  }
+}
+void operator delete(void* p, std::nothrow_t const&) noexcept { ::operator delete(p); }
+void* operator new[](std::size_t size) { return ::operator new(size); }
+void* operator new[](std::size_t size, std::nothrow_t const& tag) noexcept
+{
+  return ::operator new(size, tag);
+}
+void operator delete[](void* p) noexcept { ::operator delete(p); }
+void operator delete[](void* p, std::size_t) noexcept { ::operator delete(p); }
+void operator delete[](void* p, std::nothrow_t const&) noexcept { ::operator delete(p); }
 
 namespace cucascade::test {
 

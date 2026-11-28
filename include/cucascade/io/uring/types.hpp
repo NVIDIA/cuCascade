@@ -23,6 +23,7 @@
 #include <sys/uio.h>
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
@@ -40,6 +41,9 @@ inline constexpr std::size_t max_dynamic_io_size = 16UL << 20;
  * The generic portion owns the object, coordinator, copy request and cache
  * completion. The uring portion records the selected fd and how many of the
  * reactor's pinned blocks must be claimed before the SQE can be published.
+ *
+ * A staged write fills its blocks before the SQE: by a D2H copy from
+ * @c request.device_copy, or (host bounce) by a memcpy from @ref host_source.
  */
 struct uring_io_op {
   io_op_request request;
@@ -47,9 +51,13 @@ struct uring_io_op {
   std::size_t file_size{0};
   std::size_t staging_blocks{0};
   bool use_odirect{false};
+  /// Host bytes of a staged host write, at @c request.io_rng.offset; null otherwise.
+  std::uint8_t const* host_source{nullptr};
 
   [[nodiscard]] bool needs_staging() const noexcept { return staging_blocks != 0; }
   [[nodiscard]] bool is_vectored() const noexcept { return request.iovecs.size() > 1; }
+  [[nodiscard]] bool is_write() const noexcept { return request.kind == io_op_kind::write; }
+  [[nodiscard]] bool is_flush() const noexcept { return request.kind == io_op_kind::flush; }
 };
 
 namespace detail {
@@ -95,6 +103,26 @@ namespace detail {
   return total == io_range.size;
 }
 
+/**
+ * @brief Split a write range at @p granule boundaries.
+ *
+ * @return {head, body, tail}: @c head is the part before the first granule
+ *         boundary inside @p rng, @c body the granule-aligned middle, @c tail
+ *         the part after the last boundary.  Empty pieces have size 0; a range
+ *         inside a single granule is all head.  Concatenated in order they are
+ *         exactly @p rng.
+ */
+[[nodiscard]] inline std::array<range, 3> split_write_range(range rng, std::size_t granule) noexcept
+{
+  auto const begin = rng.offset;
+  auto const end   = rng.end();
+  if (granule == 0 || rng.empty()) return {rng, range{end, 0}, range{end, 0}};
+  auto const first = begin % granule == 0 ? begin : begin - begin % granule + granule;
+  auto const last  = end - end % granule;
+  if (first >= end || last <= first) { return {rng, range{end, 0}, range{end, 0}}; }
+  return {range{begin, first - begin}, range{first, last - first}, range{last, end - last}};
+}
+
 /** Rebuild an iovec list after @p skip bytes have already completed. */
 inline void fill_remaining_iovecs(std::span<iovec const> source,
                                   std::size_t skip,
@@ -111,6 +139,20 @@ inline void fill_remaining_iovecs(std::span<iovec const> source,
     skip = 0;
   }
 }
+
+/// Make every uring reactor report a failed CUDA event record after enqueuing
+/// the H2D copy of a staged device read or the D2H copy of a staged device
+/// write, so tests can check the request does not settle (and release its
+/// staging) while that copy may still run.
+/// Process-wide; tests only.
+void set_copy_event_record_failure_for_testing(bool enabled) noexcept;
+
+/// Make every uring reactor take @p event_error for each query of a staged copy's event, and
+/// @p stream_error (unless cudaSuccess) for each query of the stream the copy runs on (and at
+/// once for each wait on it after the copy failed to start), instead of the real status, so
+/// tests can check how such an error settles the copy.  0 for both
+/// restores the real queries.  Process-wide; tests only.
+void fail_copy_queries_for_testing(int event_error, int stream_error = 0) noexcept;
 
 }  // namespace detail
 }  // namespace cucascade::io::uring

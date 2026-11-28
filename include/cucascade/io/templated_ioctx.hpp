@@ -24,8 +24,6 @@
 #include <cucascade/io/types.hpp>
 #include <cucascade/log/logging.hpp>
 
-#include <rmm/cuda_device.hpp>
-
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -38,9 +36,12 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <system_error>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -59,6 +60,26 @@ namespace detail {
   }
   return id;
 }
+
+/**
+ * @brief Resolve default streams on the submitting thread before any slice
+ *        reaches a reactor. Device ids must be resolved.
+ *
+ * Pin null handles to @c cudaStreamLegacy, independent of how any translation
+ * unit was compiled. A PTDS caller's null stream is covered too: per-thread
+ * default streams are blocking streams, so legacy work orders after them.
+ * This over-orders behind the device's other blocking streams; PTDS callers
+ * should pass @c cudaStreamPerThread or an explicit stream for tight ordering.
+ * In a non-PTDS build this costs nothing and preserves null-stream semantics.
+ *
+ * Replace @c cudaStreamPerThread with a stand-in ordered after the submitting
+ * thread's per-thread default stream (one per device): that handle names the
+ * per-thread stream of whichever thread uses it, so a reactor worker given it
+ * would order the transfer after its own (empty) stream instead of the
+ * caller's.  The stand-in is a lease on a stream of a per-device pool, back in
+ * the pool when the last slice holding it goes; nothing is created per call.
+ */
+void resolve_default_streams(std::vector<prepared_io_slice>& slices);
 
 }  // namespace detail
 
@@ -98,9 +119,95 @@ concept io_reactor_c = requires(R reactor,
   } -> std::same_as<std::vector<byte_range>>;
 };
 
+/**
+ * @brief Optional write contract of a reactor.  A reactor that does not model
+ *        it serves reads only, and
+ *        @c templated_ioctx reports @c not_implemented_error (a
+ *        @c std::system_error with @c std::errc::not_supported) for writes.
+ *
+ * Synchronous members (caller thread, may block, throw on error):
+ *  - @c create_io_object_for_write(path, options): open @p path read+write per
+ *    @c options.mode / @c permissions (best-effort @c size_hint), returning an
+ *    object whose @c writable() is true and whose size is the size at open.
+ *  - @c host_write(object, offset, size, src): write every byte (retrying
+ *    EINTR and short writes) or throw; @c note_written(offset + size) on
+ *    success; returns @p size.
+ *  - @c flush(object): make every write completed before the call durable
+ *    (@c fdatasync); throw on error.
+ *
+ * Asynchronous work arrives through the same @c enqueue as reads.  A request is
+ * homogeneous: all slices @c io_op_kind::read (unchanged), all
+ * @c io_op_kind::write, or exactly one @c io_op_kind::flush slice.
+ *  - Write slice: @c rng.size > 0, never clamped (may lie past @c size());
+ *    exactly one source, a contiguous host buffer (only read) XOR a device
+ *    buffer with a resolved @c device_id; @c on_complete is null; slices of a
+ *    request never overlap.  The source stays valid until the request's
+ *    coordinator resolves.
+ *  - Flush slice: empty range, no buffers, a coordinator of 0 bytes.
+ *
+ * Obligations: one credit per slice; @c add_tasks(N - 1) before publishing N
+ * physical ops for a slice; every op settles exactly one credit through
+ * @c io_op_request::finish_success / @c finish_error with @c kind = write and
+ * @c io_rng = the exact file range written (finish_success then raises the
+ * object's size); short writes are resubmitted, a 0-byte completion is EIO.
+ * A device source is read in stream order after the work queued on
+ * @c d_buffer.stream before the call (enqueue the D2H copy on that stream,
+ * wait for an event recorded on it, or synchronize it first), with every
+ * argument block / staging buffer kept alive until the stream passed it.
+ * Ops of a request whose coordinator stopped (@c should_continue() false) are
+ * cancelled with @c operation_canceled, and a request never resolves while one
+ * of its ops can still touch the source or the file.  A flush slice is an
+ * @c fdatasync of the object.  Shutdown and fatal errors are handled as for
+ * reads.  A reactor may declare @c static constexpr bool supports_device_write
+ * = false to accept host sources only.
+ */
+template <class R>
+concept io_write_reactor_c = io_reactor_c<R> && requires(R reactor,
+                                                         typename R::io_object_type const& object,
+                                                         std::size_t offset,
+                                                         std::size_t size,
+                                                         std::uint8_t const* source,
+                                                         std::string path,
+                                                         write_open_options options) {
+  {
+    R::create_io_object_for_write(std::move(path), options)
+  } -> std::same_as<std::unique_ptr<typename R::io_object_type>>;
+  { reactor.host_write(object, offset, size, source) } -> std::same_as<std::size_t>;
+  { R::flush(object) } -> std::same_as<void>;
+};
+
 template <class R>
 concept reactor_declares_bulk_io_preference = requires {
   { R::prefers_bulk_io } -> std::convertible_to<bool>;
+};
+
+template <class R>
+concept reactor_declares_device_write_support = requires {
+  { R::supports_device_write } -> std::convertible_to<bool>;
+};
+
+/// A reactor whose @c on_worker_thread() tells whether the calling thread is its worker.  A
+/// reactor with a worker thread should model it, so that @c templated_ioctx can be destroyed on
+/// that thread (see @c ~templated_ioctx).
+template <class R>
+concept reactor_reports_worker_thread = requires(R const& reactor) {
+  { reactor.on_worker_thread() } noexcept -> std::same_as<bool>;
+};
+
+/// Write capabilities of a reactor.  Kept apart from @ref reactor_traits so a
+/// reactor's existing full specialization of that template stays complete.
+template <class R>
+struct reactor_write_traits {
+  static constexpr bool supports_write        = io_write_reactor_c<R>;
+  static constexpr bool supports_device_write = [] {
+    if constexpr (!io_write_reactor_c<R>) {
+      return false;
+    } else if constexpr (reactor_declares_device_write_support<R>) {
+      return static_cast<bool>(R::supports_device_write);
+    } else {
+      return true;
+    }
+  }();
 };
 
 template <class R>
@@ -122,12 +229,21 @@ struct reactor_traits {
 template <io_reactor_c Reactor>
 class templated_ioctx : public ioctx {
  public:
-  using reactor_type        = Reactor;
-  using io_object_type      = typename Reactor::io_object_type;
-  using reactor_config_type = typename Reactor::reactor_config_type;
-  using reactor_traits_t    = reactor_traits<Reactor>;
+  using reactor_type           = Reactor;
+  using io_object_type         = typename Reactor::io_object_type;
+  using reactor_config_type    = typename Reactor::reactor_config_type;
+  using reactor_traits_t       = reactor_traits<Reactor>;
+  using reactor_write_traits_t = reactor_write_traits<Reactor>;
 
-  enum class io_op_type { host, host_async, device_async, host_vector_async };
+  enum class io_op_type {
+    host,
+    host_async,
+    device_async,
+    host_vector_async,
+    host_write,
+    write_vector_async,
+    flush_async
+  };
 
   explicit templated_ioctx(std::vector<std::unique_ptr<Reactor>> reactors)
     : _reactors(std::move(reactors))
@@ -147,9 +263,25 @@ class templated_ioctx : public ioctx {
     if (!_reactors.empty()) _config = _reactors.front()->get_config();
   }
 
+  /**
+   * @brief Shut the reactors down and destroy them.
+   *
+   * A continuation running inline on one of the reactors' workers may drop the last reference
+   * to the context.  That worker cannot join itself and, once the continuation returns, keeps
+   * running in its reactor, so the reactors (when they model @ref reactor_reports_worker_thread)
+   * are then handed to a detached thread that joins their workers and destroys them: they
+   * briefly outlive the context, and whatever they borrow (e.g. a host memory resource of their
+   * reactor context) must outlive them.
+   */
   ~templated_ioctx() override
   {
     this->pre_destroy();
+    if (destroyed_on_own_worker()) {
+      std::thread([reactors = std::move(_reactors)]() mutable {
+        shutdown_reactors(reactors);
+      }).detach();
+      return;
+    }
     shutdown();
   }
 
@@ -164,15 +296,8 @@ class templated_ioctx : public ioctx {
 
   void shutdown() noexcept override
   {
-    for (auto& reactor : _reactors) {
-      try {
-        reactor->shutdown();
-      } catch (std::exception const& error) {
-        CUCASCADE_LOG_ERROR("templated_ioctx: reactor shutdown failed: {}", error.what());
-      } catch (...) {
-        CUCASCADE_LOG_ERROR("templated_ioctx: reactor shutdown failed: unknown error");
-      }
-    }
+    shutdown_reactors(_reactors);
+    _started = false;  // so that start() starts the reactors again
   }
 
   [[nodiscard]] bool supports(std::string_view path) const noexcept final
@@ -235,7 +360,7 @@ class templated_ioctx : public ioctx {
   }
 
   /**
-   * @brief Select the least-backlogged reactors a read is split across.
+   * @brief Select the least-backlogged reactors a request is split across.
    *
    * At most @ref dispatch_fanout reactors: the reactor config's @c fan_out when it has one
    * (REST), else 2.  Rotation breaks load ties and keeps synchronous reads from sticking to
@@ -321,6 +446,7 @@ class templated_ioctx : public ioctx {
       slices.reserve(input_slices.size());
       std::size_t total_bytes = 0;
       int device_id           = -1;
+      int current_device      = -1;
 
       for (auto& slice : input_slices) {
         // A dropped slice reads nothing, so its completion always reports failure: reporting
@@ -350,98 +476,27 @@ class templated_ioctx : public ioctx {
 
         if (slice.has_device_request()) {
           has_device_slice = true;
-          if (device_id < 0) device_id = detail::current_cuda_device();
-          if (slice.d_buffer.device_id < 0) slice.d_buffer.device_id = device_id;
+          // A slice whose GPU the backend already resolved (from the destination)
+          // keeps it; others take the calling thread's device.  The request is
+          // routed by its first device slice's GPU, not by the caller's device.
+          if (slice.d_buffer.device_id < 0) {
+            if (current_device < 0) current_device = detail::current_cuda_device();
+            slice.d_buffer.device_id = current_device;
+          }
+          if (device_id < 0) device_id = slice.d_buffer.device_id;
         }
         slices.push_back(std::move(slice));
       }
 
       if (slices.empty()) return exec::make_semi_future<std::size_t>(0);
 
-      // One call site issues one priority, so the first slice speaks for the
-      // request; stamp the resolved value on every slice so each queue entry
-      // built below carries it.
-      auto const priority = request_priority(slices);
-      for (auto& slice : slices) {
-        slice.priority = priority;
-      }
-
-      auto reactors = next_reactor(typed, slices.size(), io_op_type::host_vector_async, device_id);
-      auto coordinator = std::make_shared<grouped_coordinator>(total_bytes, slices.size());
-      auto future      = coordinator->get_future();
-
-      if (reactors.empty()) {
-        auto error = std::make_exception_ptr(
-          std::runtime_error("mixed_readv_async_io: no available reactors"));
-        for (auto& slice : slices) {
-          if (slice.on_complete != nullptr) {
-            (*slice.on_complete)(slice.h_buffer.fragments(), false);
-          }
-          coordinator->report_error(error);
-        }
-        return future;
-      }
-
-      try {
-        auto const partition_count = std::min(reactors.size(), slices.size());
-        std::vector<std::vector<prepared_io_slice>> partitions(partition_count);
-        std::vector<std::size_t> partition_bytes(partition_count, 0);
-
-        // Keep the originals until every queue entry has been allocated. If an
-        // allocation fails, their callbacks can still release all claimed cache
-        // chunks and every coordinator credit can be settled.
-        for (auto const& slice : slices) {
-          auto const smallest = static_cast<std::size_t>(
-            std::min_element(partition_bytes.begin(), partition_bytes.end()) -
-            partition_bytes.begin());
-          partition_bytes[smallest] += slice.size();
-          partitions[smallest].push_back(slice);
-        }
-
-        // A backend that does not prefer bulk I/O gets a host-only range read as
-        // several queue entries of at most range_batch_slices() slices each, not
-        // one entry holding every slice.  Coordinator credits are per slice, so
-        // the split does not change how the read settles.
-        auto const batch = !reactor_traits_t::prefers_bulk_io && !has_device_slice
-                             ? range_batch_slices()
-                             : std::size_t{0};
-
-        std::vector<std::pair<Reactor*, std::unique_ptr<grouped_io_request>>> requests;
-        requests.reserve(partition_count);
-        for (std::size_t i = 0; i < partition_count; ++i) {
-          auto& partition = partitions[i];
-          if (batch == 0 || partition.size() <= batch) {
-            requests.emplace_back(
-              reactors[i], grouped_io_request::create(owner, std::move(partition), coordinator));
-            continue;
-          }
-          for (std::size_t first = 0; first < partition.size(); first += batch) {
-            auto const last = std::min(partition.size(), first + batch);
-            std::vector<prepared_io_slice> part(
-              std::make_move_iterator(partition.begin() + static_cast<std::ptrdiff_t>(first)),
-              std::make_move_iterator(partition.begin() + static_cast<std::ptrdiff_t>(last)));
-            requests.emplace_back(reactors[i],
-                                  grouped_io_request::create(owner, std::move(part), coordinator));
-          }
-        }
-
-        // enqueue is noexcept by reactor contract, so once publication starts
-        // ownership cannot be stranded between reactors.
-        for (auto& [reactor, request] : requests) {
-          reactor->enqueue(std::move(request));
-        }
-        return future;
-      } catch (...) {
-        auto const error = std::current_exception();
-        if (has_device_slice) on_device_dispatch_failure();
-        for (auto& slice : slices) {
-          if (slice.on_complete != nullptr) {
-            (*slice.on_complete)(slice.h_buffer.fragments(), false);
-          }
-          coordinator->report_error(error);
-        }
-        return future;
-      }
+      return dispatch_slices(typed,
+                             owner,
+                             slices,
+                             total_bytes,
+                             has_device_slice,
+                             device_id,
+                             io_op_type::host_vector_async);
     } catch (...) {
       auto const error = std::current_exception();
       if (has_device_slice) on_device_dispatch_failure();
@@ -459,7 +514,328 @@ class templated_ioctx : public ioctx {
     }
   }
 
+  // -- Writes (only for reactors modelling io_write_reactor_c) -----------------
+
+  /// Overridable so a derived context can gate writes at run time.
+  [[nodiscard]] bool supports_write() const noexcept override
+  {
+    return reactor_write_traits_t::supports_write;
+  }
+
+  [[nodiscard]] bool supports_device_write() const noexcept override
+  {
+    return reactor_write_traits_t::supports_device_write;
+  }
+
+  /// Largest write slice dispatched as one queue entry; a larger one is cut at
+  /// granule-aligned file offsets so its bytes spread over the selected reactors
+  /// (see mixed_writev_async_io).  Read from the reactor config's
+  /// @c write_split_bytes when it has one; 0 (or no such member) = no split.
+  [[nodiscard]] std::size_t write_split_bytes() const noexcept
+  {
+    if constexpr (requires { _config.write_split_bytes; }) {
+      return static_cast<std::size_t>(_config.write_split_bytes);
+    } else {
+      return 0;
+    }
+  }
+
+  std::size_t host_write_io(io_object const& object,
+                            std::size_t offset,
+                            std::size_t size,
+                            std::uint8_t const* source) override
+  {
+    if constexpr (!reactor_write_traits_t::supports_write) {
+      return ioctx::host_write_io(object, offset, size, source);
+    } else {
+      auto const& typed = as_writable(object);
+      if (size == 0) return 0;
+      auto reactors = next_reactor(typed, 1, io_op_type::host_write);
+      if (reactors.empty()) throw std::runtime_error("host_write_io: no available reactors");
+      return reactors.front()->host_write(typed, offset, size, source);
+    }
+  }
+
+  /**
+   * @brief Dispatch write slices to the reactors.
+   *
+   * Empty slices are dropped and the rest validated (@c validate_write_slices);
+   * nothing is clamped to EOF.  Device slices get their device id resolved.  A
+   * slice larger than @ref write_split_bytes is cut into sub-slices at
+   * multiples of that size (rounded down to the write granule), each with its
+   * own coordinator credit, before the slices are spread over the selected
+   * reactors exactly like a read.
+   */
+  exec::semi_future<std::size_t> mixed_writev_async_io(
+    io_object const& object, std::vector<prepared_io_slice>&& input_slices) noexcept override
+  {
+    if constexpr (!reactor_write_traits_t::supports_write) {
+      return ioctx::mixed_writev_async_io(object, std::move(input_slices));
+    } else {
+      bool has_device_slice = false;
+      try {
+        auto const& typed = as_writable(object);
+        auto owner        = object.shared_from_this();
+
+        std::erase_if(input_slices, [](prepared_io_slice const& slice) {
+          return slice.is_write() && slice.rng.size == 0;
+        });
+        if (input_slices.empty()) return exec::make_semi_future<std::size_t>(0);
+        auto const total_bytes = validate_write_slices(input_slices);
+
+        int device_id      = -1;  // routes the request: GPU of its first device slice
+        int current_device = -1;
+        for (auto& slice : input_slices) {
+          if (!slice.has_device_request()) continue;
+          if constexpr (!reactor_write_traits_t::supports_device_write) {
+            throw std::system_error(std::make_error_code(std::errc::not_supported),
+                                    "mixed_writev_async_io: backend cannot write device memory");
+          }
+          has_device_slice = true;
+          if (slice.d_buffer.device_id < 0) {
+            if (current_device < 0) current_device = detail::current_cuda_device();
+            slice.d_buffer.device_id = current_device;
+          }
+          if (device_id < 0) device_id = slice.d_buffer.device_id;
+        }
+
+        auto slices = split_write_slices(std::move(input_slices), write_split_bytes());
+        return dispatch_slices(typed,
+                               owner,
+                               slices,
+                               total_bytes,
+                               has_device_slice,
+                               device_id,
+                               io_op_type::write_vector_async);
+      } catch (...) {
+        auto const error = std::current_exception();
+        if (has_device_slice) on_device_dispatch_failure();
+        return exec::make_semi_future<std::size_t>(error);
+      }
+    }
+  }
+
+  void flush_io(io_object const& object) override
+  {
+    if constexpr (!reactor_write_traits_t::supports_write) {
+      ioctx::flush_io(object);
+    } else {
+      Reactor::flush(as_writable(object));
+    }
+  }
+
+  /// One flush slice, queued on the least-backlogged reactor.
+  exec::semi_future<void> flush_async_io(io_object const& object,
+                                         io_priority priority) noexcept override
+  {
+    if constexpr (!reactor_write_traits_t::supports_write) {
+      return ioctx::flush_async_io(object, priority);
+    } else {
+      try {
+        auto const& typed = as_writable(object);
+        auto owner        = object.shared_from_this();
+        std::vector<prepared_io_slice> slices;
+        slices.push_back(make_flush_slice(resolve_priority(priority, io_priority::high)));
+        auto future = dispatch_slices(typed, owner, slices, 0, false, -1, io_op_type::flush_async);
+        return std::move(future).defer_value([](std::size_t) {});
+      } catch (...) {
+        return exec::make_semi_future<void>(exec::try_t<void>(std::current_exception()));
+      }
+    }
+  }
+
  protected:
+  /**
+   * @brief Publish prepared slices to the reactors as grouped requests.
+   *
+   * Shared by reads and writes: stamps one priority on every slice, selects
+   * reactors with @ref next_reactor, creates the request's coordinator (one
+   * credit per slice), spreads the slices over the reactors by bytes, cuts a
+   * host-only request into entries of at most @ref range_batch_slices slices
+   * when the backend does not prefer bulk I/O, and enqueues.  @p slices must be
+   * non-empty.  Throws only before the coordinator exists (the caller then
+   * settles @p slices, which are left intact); after that every failure is
+   * settled through the returned future.
+   */
+  exec::semi_future<std::size_t> dispatch_slices(io_object_type const& typed,
+                                                 std::shared_ptr<io_object const> const& owner,
+                                                 std::vector<prepared_io_slice>& slices,
+                                                 std::size_t total_bytes,
+                                                 bool has_device_slice,
+                                                 int device_id,
+                                                 io_op_type operation)
+  {
+    // A device slice on the per-thread default stream must be ordered against
+    // THIS thread's stream before a reactor worker sees it.
+    if (has_device_slice) { detail::resolve_default_streams(slices); }
+
+    // One call site issues one priority, so the first slice speaks for the
+    // request; stamp the resolved value on every slice so each queue entry
+    // built below carries it.
+    auto const priority = request_priority(slices);
+    for (auto& slice : slices) {
+      slice.priority = priority;
+    }
+
+    // Slices of different classes (see slice_class) are routed separately, all under the
+    // request's one coordinator.  A request of one class -- every request of a backend that
+    // does not classify -- is routed as a whole, exactly as before.
+    std::vector<std::pair<std::size_t, std::size_t>> spans;  // [first, last) per class
+    {
+      auto const first_class = slice_class(typed, slices.front());
+      bool mixed             = false;
+      for (std::size_t i = 1; i < slices.size() && !mixed; ++i) {
+        mixed = slice_class(typed, slices[i]) != first_class;
+      }
+      if (!mixed) {
+        spans.emplace_back(0, slices.size());
+      } else {
+        std::vector<std::size_t> classes(slices.size());
+        std::vector<std::size_t> order(slices.size());
+        for (std::size_t i = 0; i < slices.size(); ++i) {
+          classes[i] = slice_class(typed, slices[i]);
+          order[i]   = i;
+        }
+        std::stable_sort(order.begin(), order.end(), [&classes](std::size_t a, std::size_t b) {
+          return classes[a] < classes[b];
+        });
+        std::vector<prepared_io_slice> sorted;
+        sorted.reserve(slices.size());
+        spans.reserve(slices.size());
+        for (std::size_t i = 0; i < order.size(); ++i) {
+          if (i == 0 || classes[order[i]] != classes[order[i - 1]]) spans.emplace_back(i, i);
+          spans.back().second = i + 1;
+        }
+        // Nothing below throws: the slices move only once every allocation succeeded.
+        for (auto const index : order) {
+          sorted.push_back(std::move(slices[index]));
+        }
+        slices = std::move(sorted);
+      }
+    }
+    std::vector<std::vector<Reactor*>> routes;
+    routes.reserve(spans.size());
+    for (auto const& [first, last] : spans) {
+      std::span<prepared_io_slice const> const members{slices.data() + first, last - first};
+      auto class_device = device_id;
+      if (spans.size() > 1) {
+        // A class routes by its own first device slice's GPU (none: a host-only class).
+        class_device = -1;
+        for (auto const& slice : members) {
+          if (slice.has_device_request()) {
+            class_device = slice.d_buffer.device_id;
+            break;
+          }
+        }
+      }
+      routes.push_back(select_reactors(typed, members, operation, class_device));
+    }
+    auto coordinator = std::make_shared<grouped_coordinator>(total_bytes, slices.size());
+    auto future      = coordinator->get_future();
+
+    if (std::any_of(routes.begin(), routes.end(), [](auto const& r) { return r.empty(); })) {
+      auto error = std::make_exception_ptr(
+        std::runtime_error(operation == io_op_type::host_vector_async
+                             ? "mixed_readv_async_io: no available reactors"
+                             : "mixed_writev_async_io: no available reactors"));
+      for (auto& slice : slices) {
+        if (slice.on_complete != nullptr) {
+          (*slice.on_complete)(slice.h_buffer.fragments(), false);
+        }
+        coordinator->report_error(error);
+      }
+      return future;
+    }
+
+    try {
+      // A backend that does not prefer bulk I/O gets a host-only range read as
+      // several queue entries of at most range_batch_slices() slices each, not
+      // one entry holding every slice.  Coordinator credits are per slice, so
+      // the split does not change how the read settles.
+      auto const batch = !reactor_traits_t::prefers_bulk_io && !has_device_slice
+                           ? range_batch_slices()
+                           : std::size_t{0};
+
+      std::vector<std::pair<Reactor*, std::unique_ptr<grouped_io_request>>> requests;
+      for (std::size_t route = 0; route < routes.size(); ++route) {
+        auto const& reactors       = routes[route];
+        auto const [first, last]   = spans[route];
+        auto const partition_count = std::min(reactors.size(), last - first);
+        std::vector<std::vector<prepared_io_slice>> partitions(partition_count);
+        std::vector<std::size_t> partition_bytes(partition_count, 0);
+
+        // Keep the originals until every queue entry has been allocated. If an
+        // allocation fails, their callbacks can still release all claimed cache
+        // chunks and every coordinator credit can be settled.
+        for (std::size_t i = first; i < last; ++i) {
+          auto const& slice   = slices[i];
+          auto const smallest = static_cast<std::size_t>(
+            std::min_element(partition_bytes.begin(), partition_bytes.end()) -
+            partition_bytes.begin());
+          partition_bytes[smallest] += slice.size();
+          partitions[smallest].push_back(slice);
+        }
+
+        requests.reserve(requests.size() + partition_count);
+        for (std::size_t i = 0; i < partition_count; ++i) {
+          auto& partition = partitions[i];
+          if (batch == 0 || partition.size() <= batch) {
+            requests.emplace_back(
+              reactors[i], grouped_io_request::create(owner, std::move(partition), coordinator));
+            continue;
+          }
+          for (std::size_t part_first = 0; part_first < partition.size(); part_first += batch) {
+            auto const part_last = std::min(partition.size(), part_first + batch);
+            std::vector<prepared_io_slice> part(
+              std::make_move_iterator(partition.begin() + static_cast<std::ptrdiff_t>(part_first)),
+              std::make_move_iterator(partition.begin() + static_cast<std::ptrdiff_t>(part_last)));
+            requests.emplace_back(reactors[i],
+                                  grouped_io_request::create(owner, std::move(part), coordinator));
+          }
+        }
+      }
+
+      // enqueue is noexcept by reactor contract, so once publication starts
+      // ownership cannot be stranded between reactors.
+      for (auto& [reactor, request] : requests) {
+        reactor->enqueue(std::move(request));
+      }
+      return future;
+    } catch (...) {
+      auto const error = std::current_exception();
+      if (has_device_slice) on_device_dispatch_failure();
+      for (auto& slice : slices) {
+        if (slice.on_complete != nullptr) {
+          (*slice.on_complete)(slice.h_buffer.fragments(), false);
+        }
+        coordinator->report_error(error);
+      }
+      return future;
+    }
+  }
+
+  /**
+   * @brief Routing class of @p slice: slices of one request with different classes are
+   *        routed (@ref select_reactors) separately, under the request's one coordinator.
+   *
+   * The default puts every slice in class 0, so a request is routed as a whole.
+   */
+  [[nodiscard]] virtual std::size_t slice_class(
+    [[maybe_unused]] io_object_type const& object,
+    [[maybe_unused]] prepared_io_slice const& slice) const
+  {
+    return 0;
+  }
+
+  /// Slice-aware policy; by default preserve the existing reactor fan-out.
+  virtual std::vector<Reactor*> select_reactors(io_object_type const& object,
+                                                std::span<prepared_io_slice const> slices,
+                                                io_op_type operation,
+                                                int device_id)
+  {
+    return next_reactor(object, slices.size(), operation, device_id);
+  }
+
   /// Resolve the queue tier for a request whose slices are @p slices.  An
   /// explicit priority on the first slice wins (a cache prefetch stamps
   /// @c low).  @c automatic always resolves to @c high, whatever the call
@@ -495,17 +871,108 @@ class templated_ioctx : public ioctx {
     return std::shared_ptr<io_object>(Reactor::create_io_object(std::move(path)));
   }
 
+  std::shared_ptr<io_object> create_io_object_for_write(std::string path,
+                                                        write_open_options options) override
+  {
+    if constexpr (!reactor_write_traits_t::supports_write) {
+      return ioctx::create_io_object_for_write(std::move(path), options);
+    } else {
+      return std::shared_ptr<io_object>(
+        Reactor::create_io_object_for_write(std::move(path), options));
+    }
+  }
+
+  /**
+   * @brief Cut every write slice larger than @p split_bytes into sub-slices.
+   *
+   * Cut points are file offsets that are multiples of @p split_bytes rounded
+   * down to the write granule, so an O_DIRECT-aligned slice stays aligned piece
+   * by piece.  Each piece keeps the slice's source (advanced to its offset),
+   * stream, device and priority.  @p split_bytes == 0 returns the input.
+   */
+  [[nodiscard]] static std::vector<prepared_io_slice> split_write_slices(
+    std::vector<prepared_io_slice>&& slices, std::size_t split_bytes)
+  {
+    if (split_bytes == 0) return std::move(slices);
+    auto const granule = write_granule();
+    auto const piece   = std::max(granule, split_bytes - split_bytes % granule);
+
+    std::vector<prepared_io_slice> result;
+    result.reserve(slices.size());
+    for (auto& slice : slices) {
+      if (slice.size() <= piece) {
+        result.push_back(std::move(slice));
+        continue;
+      }
+      auto const begin = slice.offset();
+      auto const end   = slice.rng.end();
+      auto cursor      = begin;
+      while (cursor < end) {
+        auto const boundary = cursor - cursor % piece + piece;
+        auto const stop     = std::min(end, boundary);
+        auto part           = slice;
+        part.rng            = range{cursor, stop - cursor};
+        auto const delta    = cursor - begin;
+        if (part.has_device_request()) {
+          part.d_buffer.data += delta;
+        } else {
+          part.h_buffer.buffer = std::get<std::uint8_t*>(slice.h_buffer.buffer) + delta;
+        }
+        result.push_back(std::move(part));
+        cursor = stop;
+      }
+    }
+    return result;
+  }
+
   reactor_config_type _config{};
   std::vector<std::unique_ptr<Reactor>> _reactors;
   std::atomic<std::size_t> _next{0};
   bool _started{false};
 
  private:
+  /// Whether the calling thread is the worker of one of the reactors.
+  [[nodiscard]] bool destroyed_on_own_worker() const noexcept
+  {
+    if constexpr (reactor_reports_worker_thread<Reactor>) {
+      return std::any_of(_reactors.begin(), _reactors.end(), [](auto const& reactor) {
+        return reactor->on_worker_thread();
+      });
+    } else {
+      return false;
+    }
+  }
+
+  static void shutdown_reactors(std::vector<std::unique_ptr<Reactor>>& reactors) noexcept
+  {
+    for (auto& reactor : reactors) {
+      try {
+        reactor->shutdown();
+      } catch (std::exception const& error) {
+        CUCASCADE_LOG_ERROR("templated_ioctx: reactor shutdown failed: {}", error.what());
+      } catch (...) {
+        CUCASCADE_LOG_ERROR("templated_ioctx: reactor shutdown failed: unknown error");
+      }
+    }
+  }
+
   static io_object_type const& as_typed(io_object const& object)
   {
     auto const* typed = dynamic_cast<io_object_type const*>(&object);
     if (typed == nullptr) throw std::invalid_argument("I/O object belongs to another backend");
     return *typed;
+  }
+
+  /// @ref as_typed, plus @c bad_file_descriptor for an object opened read-only.
+  static io_object_type const& as_writable(io_object const& object)
+  {
+    auto const& typed = as_typed(object);
+    if (!typed.writable()) {
+      throw std::system_error(
+        std::make_error_code(std::errc::bad_file_descriptor),
+        "templated_ioctx: '" + typed.object_path() + "' was not opened for writing");
+    }
+    return typed;
   }
 };
 

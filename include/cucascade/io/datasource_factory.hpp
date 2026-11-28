@@ -42,7 +42,7 @@ namespace cucascade::io {
  * @brief Thread-safe registry of @c ioctx backends, resolved by full path.
  *
  * The engine constructs a registry at startup and registers one entry per
- * backend (uring / restful), each carrying a path-capability checker.
+ * backend (uring / restful / cufile), each carrying a path-capability checker.
  * At datasource-creation time @c lookup_path runs the checkers against a full
  * path (the checkers parse the URI / stat the filesystem themselves) and picks
  * the backend.  There is no catch-all: a path no backend claims resolves to
@@ -62,6 +62,10 @@ class io_context_registry {
   ///                            resource for the uring / rest reactors).  Must
   ///                            outlive the registry — the factory closures hold
   ///                            it by reference.
+  /// @throws std::invalid_argument when @c config.backend is
+  ///         @c io_backend::cufile in a build without the cuFile backend
+  ///         (@c CUCASCADE_HAS_CUFILE undefined): an explicit cuFile request is
+  ///         never served by another backend.
   io_context_registry(config_type config,
                       cucascade::memory::memory_reservation_manager& reservation_manager);
   ~io_context_registry() = default;
@@ -116,8 +120,12 @@ class io_context_registry {
                      factory_type factory);
 
   /// Resolve the backend for a full @p path (not a bare scheme — the checkers
-  /// parse the URI / stat the filesystem themselves).  std::nullopt when no
-  /// backend claims @p path (there is no catch-all backend).
+  /// parse the URI / stat the filesystem themselves).  Both uring and cufile
+  /// claim local regular files, so the cufile backend is skipped unless
+  /// `backend = io_backend::cufile`, in which case it wins local files over
+  /// uring (`s3://` still resolves to REST).  Routing never probes or
+  /// initializes cuFile.  std::nullopt when no backend claims @p path (there
+  /// is no catch-all backend).
   std::optional<io_context_type> lookup_path(std::string_view path) const noexcept;
 
   std::shared_ptr<ioctx> make_ioctx(io_context_type type) const noexcept;
@@ -136,6 +144,10 @@ class io_context_registry {
   };
   const config_type _config;
   cucascade::memory::memory_reservation_manager& _reservation_manager;
+  /// Set when @c backend=cufile: the cuFile / GDS reactor then serves local
+  /// files instead of uring.  @c s3:// objects still go to REST -- the cuFile
+  /// backend is local-disk only.
+  bool _prefer_cufile{false};
   mutable std::shared_mutex _mtx;
   std::unordered_map<io_context_type, entry> _entries;
   /// Set by the first @c lookup_path; @c replace_ioctx refuses afterwards
@@ -155,11 +167,23 @@ class io_context_registry {
 // unconfigured credentials, …) is logged and reported as a null ioctx rather
 // than thrown, matching @c io_context_registry::make_ioctx.
 
-/// io_uring local-disk backend.  Builds a @c uring_reactor::reactor_context from
-/// @c config.uring and @c config.uring_n_reactors. Pinned staging uses the
-/// HOST-tier resource block size; physical grouping is chosen by the worker.
+/// io_uring local-disk backend.  When @p reservation_manager has GPU spaces:
+/// `max(1, config.uring_n_reactors / #GPUs)` read @c uring_reactor s and one
+/// write reactor (started by the first write) per GPU, pinned to the GPU's
+/// NUMA node and staging from that node's HOST-tier resource.  Otherwise
+/// @c config.uring_n_reactors reactors sharing one
+/// @c uring_reactor::reactor_context.  Pinned staging uses the HOST-tier
+/// resource block size; physical grouping is chosen by the worker.
 io_context_registry::factory_type make_uring_ioctx_factory(
   cucascade::memory::memory_reservation_manager& reservation_manager);
+
+#ifdef CUCASCADE_HAS_CUFILE
+/// cuFile / GPUDirect Storage local-disk backend.  Builds a @c cufile_ioctx --
+/// a reactor per GPU -- from @c config.cufile.  Takes no reservation manager:
+/// the reactors stage through their own registered device memory.  Declared
+/// only in a build that found @c cufile.h.
+io_context_registry::factory_type make_cufile_ioctx_factory();
+#endif
 
 /// RESTful object-store (s3://) backend.  Builds a SigV4 authorizer from
 /// @c config.object_store and a @c rest_reactor::reactor_context from

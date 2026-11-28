@@ -16,23 +16,111 @@
  * limitations under the License.
  */
 
+#include <cucascade/cuda/event.hpp>
 #include <cucascade/error.hpp>
 #include <cucascade/io/cache/config.hpp>
 #include <cucascade/io/cache/fs_cache.hpp>
 #include <cucascade/io/io_context.hpp>
+#include <cucascade/io/io_errors.hpp>
+#include <cucascade/io/templated_ioctx.hpp>
 #include <cucascade/io/types.hpp>
 #include <cucascade/log/logging.hpp>
+#include <cucascade/memory/stream_pool.hpp>
 
+#include <rmm/cuda_device.hpp>
+
+#include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
+#include <limits>
+#include <map>
 #include <memory>
+#include <mutex>
+#include <span>
 #include <stdexcept>
+#include <string>
+#include <string_view>
+#include <system_error>
 #include <utility>
+#include <vector>
 
 namespace cucascade::io {
+namespace detail {
+namespace {
+
+/// The stand-in streams of one device and the event that orders one after a
+/// per-thread default stream; recycled across calls and kept for the process.
+struct stand_in_pool {
+  explicit stand_in_pool(rmm::cuda_device_id device) : streams(device)
+  {
+    rmm::cuda_set_device_raii const guard{device};
+    ordering = std::make_unique<cuda::cuda_event>();
+  }
+
+  memory::exclusive_stream_pool streams;
+  std::mutex mutex;  ///< Guards @c ordering.
+  std::unique_ptr<cuda::cuda_event> ordering;
+};
+
+stand_in_pool& stand_ins_of(int device)
+{
+  static std::mutex mutex;
+  static auto* const pools = new std::map<int, std::unique_ptr<stand_in_pool>>{};
+  std::lock_guard const lock(mutex);
+  auto& pool = (*pools)[device];
+  if (pool == nullptr) { pool = std::make_unique<stand_in_pool>(rmm::cuda_device_id{device}); }
+  return *pool;
+}
+
+/// A pooled non-blocking stream ordered after the work the calling thread has
+/// queued on its per-thread default stream of @p device; usable from any thread.
+std::shared_ptr<memory::borrowed_stream> per_thread_stand_in(int device)
+{
+  using policy = memory::exclusive_stream_pool::stream_acquire_policy;
+  auto& pool   = stand_ins_of(device);
+  auto stand_in =
+    std::make_shared<memory::borrowed_stream>(pool.streams.acquire_stream(policy::GROW));
+  rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{device}};
+  // A stream waits on the event as recorded when the wait is queued, so the
+  // event is free for the next caller as soon as these two calls return.
+  std::lock_guard const lock(pool.mutex);
+  pool.ordering->record(::cuda::stream_ref{cudaStreamPerThread});  // this thread's own stream
+  pool.ordering->wait(stand_in->get());
+  return stand_in;
+}
+
+}  // namespace
+
+void resolve_default_streams(std::vector<prepared_io_slice>& slices)
+{
+  std::vector<std::pair<int, std::shared_ptr<memory::borrowed_stream>>> stand_ins;
+  for (auto& slice : slices) {
+    if (!slice.has_device_request()) continue;
+    if (slice.d_buffer.stream.get() == nullptr) {
+      slice.d_buffer.stream = ::cuda::stream_ref{cudaStreamLegacy};
+      continue;
+    }
+    if (slice.d_buffer.stream.get() != cudaStreamPerThread) continue;
+    auto const device =
+      slice.d_buffer.device_id >= 0 ? slice.d_buffer.device_id : current_cuda_device();
+    std::shared_ptr<memory::borrowed_stream> stand_in;
+    for (auto const& [served, existing] : stand_ins) {
+      if (served == device) stand_in = existing;
+    }
+    if (stand_in == nullptr) {
+      stand_in = per_thread_stand_in(device);
+      stand_ins.emplace_back(device, stand_in);
+    }
+    slice.d_buffer.stream       = stand_in->get();
+    slice.d_buffer.stream_owner = stand_in;
+  }
+}
+
+}  // namespace detail
+
 namespace {
 
 using nvtx_range = nvtx3::scoped_range_in<libcucascade_domain>;
@@ -40,6 +128,45 @@ using nvtx_range = nvtx3::scoped_range_in<libcucascade_domain>;
 struct io_read_to_host_message {
   static constexpr char const* message{"io:read_to_host"};
 };
+
+struct io_write_from_host_message {
+  static constexpr char const* message{"io:write_from_host"};
+};
+
+[[noreturn]] void throw_errc(std::errc code, std::string const& what)
+{
+  throw std::system_error(std::make_error_code(code), what);
+}
+
+/// Name of a backend in error messages.
+[[nodiscard]] std::string_view backend_name(io_context_type type) noexcept
+{
+  switch (type) {
+    case io_context_type::uring: return "uring";
+    case io_context_type::restful: return "rest";
+    case io_context_type::s3rdma: return "s3rdma";
+    case io_context_type::cufile: return "cufile";
+  }
+  return "ioctx";
+}
+
+/// Throw unless @p ctx can write @p obj (with a device source when @p device).
+/// A backend that cannot write at all reports @c not_implemented_error; one
+/// that writes host sources only reports a plain @c not_supported for a device
+/// source.
+void require_writable(ioctx const& ctx, io_object const& obj, bool device, char const* operation)
+{
+  if (!ctx.supports_write()) {
+    throw not_implemented_error(std::string(backend_name(ctx.type())) + ": " + operation);
+  }
+  if (device && !ctx.supports_device_write()) {
+    throw_errc(std::errc::not_supported, "ioctx: backend cannot write from device memory");
+  }
+  if (!obj.writable()) {
+    throw_errc(std::errc::bad_file_descriptor,
+               "ioctx: '" + obj.object_path() + "' was not opened for writing");
+  }
+}
 
 }  // namespace
 
@@ -219,6 +346,237 @@ exec::semi_future<size_t> ioctx::device_readv_async_io(const io_object& obj,
     return host_device_readv_async_io(obj, std::move(prepared_slices));
   } catch (...) {
     return exec::make_semi_future<size_t>(std::current_exception());
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Writes
+// ---------------------------------------------------------------------------
+
+std::shared_ptr<io_object> ioctx::open_io_object_for_write(std::string path,
+                                                           write_open_options options)
+{
+  auto stripped = strip_file_scheme(path);
+  // Truncating (or replacing) the file changes its bytes as much as a write.  A
+  // backend can truncate and still fail afterwards (building the object), so the
+  // path is invalidated on that exit too.
+  bool const destructive =
+    options.mode == write_mode::create_or_truncate || options.mode == write_mode::create_new;
+  std::shared_ptr<io_object> object;
+  try {
+    object = create_io_object_for_write(stripped, options);
+  } catch (...) {
+    if (destructive) invalidate_cached(stripped);
+    throw;
+  }
+  if (object == nullptr) return object;
+  if (destructive) invalidate_cached(object->object_path());
+  return stamped(std::move(object));
+}
+
+void ioctx::invalidate_cached(std::string_view object_path) noexcept
+{
+  if (_cache) { _cache->invalidate(object_path); }
+  _metadata_store->invalidate_written(object_path);
+}
+
+std::size_t ioctx::host_write(const io_object& obj,
+                              std::size_t offset,
+                              std::size_t size,
+                              const std::uint8_t* src)
+{
+  auto const& message =
+    nvtx3::registered_string_in<libcucascade_domain>::get<io_write_from_host_message>();
+  nvtx_range const write_range{message, nvtx3::payload{static_cast<std::uint64_t>(size)}};
+  if (size == 0) return 0;
+  if (src == nullptr) throw std::invalid_argument("host write source is null");
+  constexpr auto max_end = static_cast<std::size_t>(std::numeric_limits<off_t>::max());
+  if (size > max_end || offset > max_end - size) {
+    throw std::invalid_argument("host write range exceeds the largest file offset");
+  }
+  require_writable(*this, obj, false, "host_write");
+
+  // Drop cached bytes of the path before and after the write: the second pass
+  // catches a prefetch that read pre-write bytes while the write ran.
+  invalidate_cached(obj.object_path());
+  try {
+    auto const written = host_write_io(obj, offset, size, src);
+    invalidate_cached(obj.object_path());
+    return written;
+  } catch (...) {
+    invalidate_cached(obj.object_path());
+    throw;
+  }
+}
+
+exec::semi_future<std::size_t> ioctx::host_write_async(const io_object& obj,
+                                                       std::size_t offset,
+                                                       std::size_t size,
+                                                       const std::uint8_t* src,
+                                                       io_priority priority) noexcept
+{
+  write_slice const slice{offset, size, src};
+  return submit_write(
+    obj, std::span{&slice, 1}, {}, ::cuda::stream_ref{cudaStream_t{nullptr}}, priority);
+}
+
+exec::semi_future<std::size_t> ioctx::device_write_async(const io_object& obj,
+                                                         std::size_t offset,
+                                                         std::size_t size,
+                                                         const std::uint8_t* src,
+                                                         ::cuda::stream_ref stream,
+                                                         io_priority priority) noexcept
+{
+  write_slice const slice{offset, size, src};
+  return submit_write(obj, {}, std::span{&slice, 1}, stream, priority);
+}
+
+exec::semi_future<std::size_t> ioctx::host_writev_async(const io_object& obj,
+                                                        std::span<const write_slice> slices,
+                                                        io_priority priority) noexcept
+{
+  return submit_write(obj, slices, {}, ::cuda::stream_ref{cudaStream_t{nullptr}}, priority);
+}
+
+exec::semi_future<std::size_t> ioctx::device_writev_async(const io_object& obj,
+                                                          std::span<const write_slice> slices,
+                                                          ::cuda::stream_ref stream,
+                                                          io_priority priority) noexcept
+{
+  return submit_write(obj, {}, slices, stream, priority);
+}
+
+exec::semi_future<std::size_t> ioctx::mixed_writev_async(const io_object& obj,
+                                                         std::span<const write_slice> host_slices,
+                                                         std::span<const write_slice> device_slices,
+                                                         ::cuda::stream_ref stream,
+                                                         io_priority priority) noexcept
+{
+  return submit_write(obj, host_slices, device_slices, stream, priority);
+}
+
+exec::semi_future<std::size_t> ioctx::submit_write(const io_object& obj,
+                                                   std::span<const write_slice> host_slices,
+                                                   std::span<const write_slice> device_slices,
+                                                   ::cuda::stream_ref stream,
+                                                   io_priority priority) noexcept
+{
+  try {
+    auto const resolved = resolve_priority(priority, io_priority::high);
+    std::vector<prepared_io_slice> slices;
+    slices.reserve(host_slices.size() + device_slices.size());
+    for (auto const& current : host_slices) {
+      if (current.size() == 0) continue;
+      if (current.src == nullptr) throw std::invalid_argument("host write source is null");
+      slices.push_back(make_host_write_slice(current.rng, current.src, resolved));
+    }
+    bool const has_device = std::ranges::any_of(
+      device_slices, [](write_slice const& current) { return current.size() != 0; });
+    for (auto const& current : device_slices) {
+      if (current.size() == 0) continue;
+      if (current.src == nullptr) throw std::invalid_argument("device write source is null");
+      slices.push_back(make_device_write_slice(current.rng, current.src, stream, -1, resolved));
+    }
+    if (slices.empty()) return exec::make_semi_future<std::size_t>(0);
+    require_writable(*this, obj, has_device, "write");
+
+    auto const& path = obj.object_path();
+    invalidate_cached(path);
+    cache::fs_cache::pending_invalidation pending;
+    if (_cache) { pending = _cache->invalidate_later(path); }
+    // Everything the completion needs is allocated BEFORE the write is
+    // dispatched, so nothing can fail between starting physical work and
+    // attaching the second invalidation pass.  That pass runs once the write
+    // settled, before the caller sees it: a prefetch that raced the write may
+    // have cached pre-write bytes.  It runs on the completing thread; `pending`
+    // keeps the cache alive until then, and the metadata store is shared: a
+    // completion can run after this ioctx is gone, when it was destroyed on one
+    // of its own reactors' workers (see ~templated_ioctx).
+    exec::promise<std::size_t> bridge;
+    auto result = bridge.get_semi_future();
+    // The future's exact callback type, so installing it moves it in without
+    // allocating an adapter.
+    using terminal_type = exec::invocable<void(exec::try_t<std::size_t>&&)>;
+    terminal_type terminal{
+      [pending  = std::move(pending),
+       metadata = _metadata_store,
+       path     = std::string{path},
+       bridge   = std::move(bridge)](exec::try_t<std::size_t>&& outcome) mutable {
+        pending.fire();
+        metadata->invalidate_written(path);
+        bridge.set_try(std::move(outcome));
+      }};
+
+    auto backend = mixed_writev_async_io(obj, std::move(slices));
+    try {
+      std::move(backend).install_callback(std::move(terminal));
+    } catch (...) {
+      // Not expected (the hook returns a valid future and the install does not
+      // allocate), but never let the caller observe the write before the final
+      // invalidations: wait for it here and run them.
+      if (!backend.valid() || !terminal) throw;
+      terminal(std::move(backend).get_try());
+    }
+    return result;
+  } catch (...) {
+    return exec::make_semi_future<std::size_t>(std::current_exception());
+  }
+}
+
+void ioctx::flush(const io_object& obj)
+{
+  require_writable(*this, obj, false, "flush");
+  flush_io(obj);
+}
+
+exec::semi_future<void> ioctx::flush_async(const io_object& obj, io_priority priority) noexcept
+{
+  try {
+    require_writable(*this, obj, false, "flush_async");
+  } catch (...) {
+    return exec::make_semi_future<void>(exec::try_t<void>(std::current_exception()));
+  }
+  return flush_async_io(obj, resolve_priority(priority, io_priority::high));
+}
+
+// -- Default write hooks: not implemented ---------------------------------------
+
+std::shared_ptr<io_object> ioctx::create_io_object_for_write(std::string /*path*/,
+                                                             write_open_options /*options*/)
+{
+  throw not_implemented_error(std::string(backend_name(type())) + ": open_io_object_for_write");
+}
+
+std::size_t ioctx::host_write_io(const io_object& /*obj*/,
+                                 std::size_t /*offset*/,
+                                 std::size_t /*size*/,
+                                 const std::uint8_t* /*src*/)
+{
+  throw not_implemented_error(std::string(backend_name(type())) + ": host_write");
+}
+
+exec::semi_future<std::size_t> ioctx::mixed_writev_async_io(
+  const io_object& /*obj*/, std::vector<prepared_io_slice>&& /*slices*/) noexcept
+{
+  try {
+    throw not_implemented_error(std::string(backend_name(type())) + ": mixed_writev_async");
+  } catch (...) {
+    return exec::make_semi_future<std::size_t>(std::current_exception());
+  }
+}
+
+void ioctx::flush_io(const io_object& /*obj*/)
+{
+  throw not_implemented_error(std::string(backend_name(type())) + ": flush");
+}
+
+exec::semi_future<void> ioctx::flush_async_io(const io_object& /*obj*/,
+                                              io_priority /*priority*/) noexcept
+{
+  try {
+    throw not_implemented_error(std::string(backend_name(type())) + ": flush_async");
+  } catch (...) {
+    return exec::make_semi_future<void>(exec::try_t<void>(std::current_exception()));
   }
 }
 

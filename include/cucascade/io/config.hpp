@@ -18,6 +18,7 @@
 #pragma once
 
 #include <cucascade/io/cache/config.hpp>
+#include <cucascade/io/cufile/config.hpp>
 #include <cucascade/io/object_store_config.hpp>
 #include <cucascade/io/rest/config.hpp>
 #include <cucascade/io/uring/config.hpp>
@@ -30,6 +31,13 @@ namespace cucascade::io {
 enum class io_backend {
   /// cuCascade's own IO stack: uring for local paths, REST for @c s3:// URLs.
   native,
+  /// The cuFile / GPUDirect Storage reactors: local regular files are served by
+  /// @c cufile_ioctx instead of uring (device buffers through cuFile, host
+  /// buffers through each reactor's host-only uring reactor); @c s3:// URLs
+  /// still go to the REST backend.  Needs a build that found @c cufile.h
+  /// (@c CUCASCADE_HAS_CUFILE); without it no cuFile backend is registered and
+  /// local paths resolve to nothing rather than to another backend.
+  cufile,
 };
 
 /**
@@ -38,7 +46,9 @@ enum class io_backend {
  * Consumed by @c io_context_registry and the per-backend ioctx factories.
  *
  * @c backend selects the IO stack: @ref io_backend::native routes local paths
- * to @c uring_ioctx and @c s3:// URLs to the REST backend.
+ * to @c uring_ioctx and @c s3:// URLs to the REST backend, and
+ * @ref io_backend::cufile routes local regular files to @c cufile_ioctx
+ * (@c s3:// stays on REST).
  *
  * @c cache is the read path's whole caching configuration, and its only home;
  * @ref apply_cache_mode derives @c uring.use_odirect and @c cache.dispose_on_idle
@@ -47,6 +57,9 @@ enum class io_backend {
  * Sub-configs:
  *  - @c uring   — uring reactor tunables (local-disk IO path).
  *  - @c rest    — REST reactor tunables (S3/object-store IO path).
+ *  - @c cufile  — cuFile / GDS reactor tunables (local-disk GDS path);
+ *    always present for ABI stability; backend availability is gated by
+ *    @c CUCASCADE_HAS_CUFILE.
  *  - @c cache   — caching mode, eviction policy and prefetching-cache tunables.
  *  - @c object_store — object-store credentials and endpoint.
  */
@@ -54,7 +67,10 @@ struct io_config {
   /// IO backend that serves managed reads.
   io_backend backend{io_backend::native};
 
-  /// Number of uring reactor worker threads for the local-disk IO path.
+  /// Number of uring reactor worker threads for the local-disk IO path.  When the
+  /// reservation manager has GPU spaces, @c make_uring_ioctx_factory spreads them over the
+  /// GPUs as read reactors (`max(1, uring_n_reactors / #GPUs)` each) and adds one write
+  /// reactor per GPU, started by the first write.
   std::size_t uring_n_reactors{4};
 
   /// Number of REST reactor worker threads for the S3/object-store IO path (each its own
@@ -71,6 +87,11 @@ struct io_config {
   /// merge hints, retry policy, and connection limits.  Physical GET sizing is
   /// worker-owned.
   rest::config rest{};
+
+  /// cuFile / GDS reactor configuration (one reactor per GPU).  Only consulted
+  /// when @c backend == @ref io_backend::cufile.  Not derived from @ref cache:
+  /// the cuFile backend never arms the prefetching cache.
+  cufile::config cufile{};
 
   /// The read path's caching configuration: mode, eviction policy and the
   /// prefetching cache's tunables.  One block, rather than a mode here and the

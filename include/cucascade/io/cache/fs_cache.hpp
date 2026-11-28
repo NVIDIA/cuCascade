@@ -548,6 +548,58 @@ class fs_cache {
   /// means every retired generation has been reclaimed.
   [[nodiscard]] std::size_t retired_generation_count() const noexcept;
 
+  /// Drop everything cached for @p object_path because the object was written.
+  ///
+  /// Every live generation of the path is retired the way a superseding
+  /// generation retires it: it leaves the map, its idle chunks are reclaimed,
+  /// and it is never handed out again -- later reads miss and go to the
+  /// backend, a later prefetch builds a fresh generation.  Owners that still
+  /// hold it (cache handles, in-flight prefetch / demand IO, cached-copy
+  /// retirements) keep it and its pinned chunks alive until they let go, so
+  /// no reader loses a buffer under it.  A no-op on a path with no generation
+  /// or once the cache is shutting down.
+  void invalidate(std::string_view object_path) noexcept;
+
+  /**
+   * @brief An @ref invalidate of one path that runs later, when a write that
+   *        is still in flight settles.
+   *
+   * Holding one keeps the cache alive: its destructor waits for every pending
+   * invalidation the way it waits for in-flight IO, so @ref fire may run on a
+   * reactor thread after @c ioctx::shutdown_cache has begun.  Move-only;
+   * destroying an unfired one fires it.
+   */
+  class pending_invalidation {
+   public:
+    pending_invalidation() noexcept = default;
+    pending_invalidation(pending_invalidation&& other) noexcept;
+    pending_invalidation& operator=(pending_invalidation&& other) noexcept;
+    pending_invalidation(pending_invalidation const&)            = delete;
+    pending_invalidation& operator=(pending_invalidation const&) = delete;
+    ~pending_invalidation() { fire(); }
+
+    /// Invalidate the path (unless the cache is shutting down) and release the
+    /// cache.  Idempotent.
+    void fire() noexcept;
+
+    /// True until fired; false for one taken from a shutting-down cache.
+    explicit operator bool() const noexcept { return _cache != nullptr; }
+
+   private:
+    friend class fs_cache;
+    pending_invalidation(fs_cache* cache,
+                         std::string object_path,
+                         exec::completion_controller::slot slot) noexcept;
+
+    fs_cache* _cache{nullptr};
+    std::string _object_path;
+    exec::completion_controller::slot _slot;
+  };
+
+  /// A @ref pending_invalidation of @p object_path, or an empty one when the
+  /// cache is already shutting down (nothing left to invalidate).
+  [[nodiscard]] pending_invalidation invalidate_later(std::string object_path) noexcept;
+
  private:
   struct cached_copy_retirement;
 
@@ -614,6 +666,14 @@ class fs_cache {
   void retire_pins_after_stream(::cuda::stream_ref stream,
                                 cucascade::cuda::device_copy_batch const& copies,
                                 std::shared_ptr<cached_copy_retirement> retirement) noexcept;
+
+  /// Settle every retirement on @c _event_retirements whose event has completed
+  /// (or failed).  Any waiter may settle any of them, so a waiter whose own
+  /// request is held by a busy stream never keeps a ready one waiting.
+  void poll_event_retirements() noexcept;
+
+  /// Wait, polling, until @p retirement has settled (see the waiter pool).
+  void wait_for_retirement(cached_copy_retirement& retirement) noexcept;
 
   /// Pop every request still sitting in @p queue and retire its producer on
   /// @c producer_stage::abandoned, so a shutdown never leaves a request parked
@@ -730,6 +790,12 @@ class fs_cache {
   /// future can settle even when no later cache operation arrives to drain it.
   /// Declared before the waiters so their threads stop before its destructor.
   exec::cuda_event_completion_poll _completion_poll;
+  /// Cache-hit retirements tracked by their own event (per-thread default
+  /// stream; see retire_pins_after_stream), polled by every waiter.  Room for an
+  /// entry is reserved before its copies are enqueued, so adding it never throws.
+  std::mutex _event_retirements_mutex;
+  std::vector<std::shared_ptr<cached_copy_retirement>> _event_retirements;
+  std::size_t _event_retirements_reserved{0};
   exec::static_thread_pool _completion_waiters{2, "cache_complete"};
 };
 

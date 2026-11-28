@@ -244,6 +244,10 @@ TEST_CASE("Topology Discovery reports NUMA node capacities", "[hw_topology]")
     REQUIRE(node.id > previous_id);
     previous_id = node.id;
 
+    // A GB200 host lists placeholder nodes with neither CPUs nor memory; they carry nothing
+    // to check.
+    if (!node.has_cpus && node.memory_capacity == 0) { continue; }
+
     // /sys/devices/system/node/node<id>/meminfo always reports MemTotal and MemFree.
     REQUIRE(node.memory_capacity > 0);
     REQUIRE(node.free_memory <= node.memory_capacity);

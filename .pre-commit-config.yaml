@@ -13,6 +13,13 @@
 # See https://github.com/pre-commit/pre-commit
 
 repos:
+  - repo: local
+    hooks:
+      - id: check-cufile-profiles
+        name: Check commented cuFile JSON profiles
+        entry: python scripts/check_cufile_profiles.py
+        language: python
+        files: '^docs/io/cufile-profiles/.*\.json$'
   # Standard hooks
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v6.0.0
@@ -20,6 +27,8 @@ repos:
       - id: check-added-large-files
       - id: check-case-conflict
       - id: check-json
+        # Versioned cuFile examples contain full-line // documentation comments.
+        exclude: '^docs/io/cufile-profiles/.*\.json$'
       - id: check-merge-conflict
       - id: check-symlinks
       - id: check-toml
@@ -31,7 +40,7 @@ repos:
       - id: mixed-line-ending
       - id: pretty-format-json
         args: [--autofix]
-        exclude: 'CMakePresets\.json|.*\.ipynb$'
+        exclude: 'CMakePresets\.json|.*\.ipynb$|^docs/io/cufile-profiles/.*\.json$'
       - id: trailing-whitespace
   - repo: https://github.com/psf/black
     rev: 25.1.0

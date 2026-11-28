@@ -16,6 +16,7 @@
  * limitations under the License.
  */
 
+#include <cucascade/error.hpp>
 #include <cucascade/io/io_request.hpp>
 
 #include <catch2/catch_all.hpp>
@@ -73,6 +74,64 @@ TEST_CASE("the first error stops dispatch but fulfillment waits for drain", "[io
   coordinator.on_complete();
   CHECK(future.is_ready());
   CHECK_THROWS_WITH(std::move(future).get(2s), "first physical read failed");
+}
+
+TEST_CASE("a terminal CUDA failure is not masked by an ordinary first error", "[io][coordinator]")
+{
+  // Either order: an ordinary error first, or the terminal one first and an ordinary one after.
+  auto const terminal_first = GENERATE(false, true);
+  CAPTURE(terminal_first);
+  grouped_coordinator coordinator{128, 3};
+  auto future         = coordinator.get_future();
+  auto const ordinary = std::make_exception_ptr(std::runtime_error("ordinary read failure"));
+  if (terminal_first) {
+    coordinator.report_error(cudaErrorIllegalAddress);
+    coordinator.report_error(ordinary);
+  } else {
+    coordinator.report_error(ordinary);
+    coordinator.report_error(cudaErrorIllegalAddress);
+  }
+  // A later non-terminal CUDA error does not replace it either.
+  coordinator.report_error(cudaErrorMemoryAllocation);
+  REQUIRE(future.is_ready());
+  try {
+    std::ignore = std::move(future).get(2s);
+    FAIL("the request resolved despite its errors");
+  } catch (cucascade::cuda_status_error const& error) {
+    CHECK(error.error_code() == cudaErrorIllegalAddress);
+  }
+}
+
+TEST_CASE("the CUDA statuses documented as terminal are the ones classified so",
+          "[io][coordinator]")
+{
+  for (auto status : {cudaErrorIllegalAddress,
+                      cudaErrorLaunchTimeout,
+                      cudaErrorAssert,
+                      cudaErrorHardwareStackError,
+                      cudaErrorIllegalInstruction,
+                      cudaErrorMisalignedAddress,
+                      cudaErrorInvalidAddressSpace,
+                      cudaErrorInvalidPc,
+                      cudaErrorLaunchFailure,
+                      cudaErrorMpsClientTerminated,
+                      static_cast<cudaError_t>(226),
+                      static_cast<cudaError_t>(721)}) {
+    CAPTURE(static_cast<int>(status));
+    CHECK(cucascade::terminal_cuda_status(status));
+  }
+  // Not terminal, or not in every form: cudaErrorExternalDevice (911) is terminal only when
+  // reported asynchronously, which the status alone does not say.
+  for (auto status : {cudaSuccess,
+                      cudaErrorNotReady,
+                      cudaErrorMemoryAllocation,
+                      cudaErrorInvalidValue,
+                      cudaErrorECCUncorrectable,
+                      cudaErrorUnknown,
+                      static_cast<cudaError_t>(911)}) {
+    CAPTURE(static_cast<int>(status));
+    CHECK_FALSE(cucascade::terminal_cuda_status(status));
+  }
 }
 
 TEST_CASE("physical completion publishes cache state before the future", "[io][coordinator]")

@@ -62,7 +62,8 @@ static_credentials example_static_credentials()
 std::string query_string(std::string_view url)
 {
   auto pos = url.find('?');
-  REQUIRE(pos != std::string_view::npos);
+  // Also used by concurrent presign workers: Catch assertions are not thread-safe.
+  if (pos == std::string_view::npos) return {};
   return std::string{url.substr(pos + 1)};
 }
 

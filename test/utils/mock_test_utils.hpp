@@ -21,7 +21,6 @@
 
 #include <cucascade/cuda/stream.hpp>
 #include <cucascade/data/common.hpp>
-#include <cucascade/data/disk_io_backend.hpp>
 #include <cucascade/data/representation_converter.hpp>
 #include <cucascade/error.hpp>
 #include <cucascade/memory/common.hpp>
@@ -46,45 +45,23 @@
 namespace cucascade {
 namespace test {
 
-/** @brief Reject I/O for mock representations that only need a DISK memory-space descriptor. */
-class mock_no_io_backend : public idisk_io_backend {
- public:
-  void write(const std::filesystem::path&, const void*, size_t, size_t, ::cuda::stream_ref) override
-  {
-    throw std::logic_error("mock representation attempted disk I/O");
-  }
-  void read(const std::filesystem::path&, void*, size_t, size_t, ::cuda::stream_ref) override
-  {
-    throw std::logic_error("mock representation attempted disk I/O");
-  }
-  void write(const std::filesystem::path&, const void*, size_t, size_t) override
-  {
-    throw std::logic_error("mock representation attempted disk I/O");
-  }
-  void read(const std::filesystem::path&, void*, size_t, size_t) override
-  {
-    throw std::logic_error("mock representation attempted disk I/O");
-  }
-};
-
 /**
  * @brief Mock memory_space for testing - provides a simple memory_space without real allocators.
  *
  * This is a lightweight memory space that can be used in tests that don't need
- * actual memory allocation functionality.
- * @param disk_backend Optional DISK backend override. By default, DISK spaces retain their real
- * pipeline backend for converter and profiler tests; mock representations provide a no-I/O backend.
+ * actual memory allocation functionality.  A DISK space has no io_context, so it does no I/O.
  */
 
-inline std::shared_ptr<memory::memory_space> make_mock_memory_space(
-  memory::Tier tier, size_t device_id = 0, std::shared_ptr<idisk_io_backend> disk_backend = nullptr)
+inline std::shared_ptr<memory::memory_space> make_mock_memory_space(memory::Tier tier,
+                                                                    size_t device_id = 0)
 {
   if (tier == memory::Tier::GPU) {
     memory::gpu_memory_space_config config;
     config.device_id       = static_cast<int>(device_id);
     config.memory_capacity = 1024 * 1024 * 1024;
     config.mr_factory_fn   = [](int, size_t) {
-      return cuda::mr::any_resource<cuda::mr::device_accessible>{rmm::mr::cuda_memory_resource{}};
+      return ::cuda::mr::any_resource<::cuda::mr::device_accessible>{
+        rmm::mr::cuda_memory_resource{}};
     };
     return std::make_shared<memory::memory_space>(config);
   } else if (tier == memory::Tier::HOST) {
@@ -93,17 +70,13 @@ inline std::shared_ptr<memory::memory_space> make_mock_memory_space(
     config.memory_capacity      = 1024 * 1024 * 1024;
     config.initial_number_pools = 0;
     config.mr_factory_fn        = [](int, size_t) {
-      return cuda::mr::any_resource<cuda::mr::device_accessible>{
+      return ::cuda::mr::any_resource<::cuda::mr::device_accessible>{
         cucascade::memory::numa_region_pinned_host_memory_resource{-1}};
     };
     return std::make_shared<memory::memory_space>(config);
   } else if (tier == memory::Tier::DISK) {
-    memory::disk_memory_space_config config{
-      static_cast<int>(device_id), 1024 * 1024 * 1024, "/tmp"};
-    if (disk_backend) {
-      return std::make_shared<memory::memory_space>(config, std::move(disk_backend));
-    }
-    return std::make_shared<memory::memory_space>(config);
+    return std::make_shared<memory::memory_space>(
+      memory::disk_memory_space_config{static_cast<int>(device_id), 1024 * 1024 * 1024, "/tmp"});
   } else {
     throw std::invalid_argument("Unsupported tier for mock memory space");
   }
@@ -119,10 +92,7 @@ struct mock_memory_space_holder {
   std::shared_ptr<memory::memory_space> space;
 
   mock_memory_space_holder(memory::Tier tier, size_t device_id)
-    : space{make_mock_memory_space(
-        tier,
-        device_id,
-        tier == memory::Tier::DISK ? std::make_shared<mock_no_io_backend>() : nullptr)}
+    : space{make_mock_memory_space(tier, device_id)}
   {
   }
 };

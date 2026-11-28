@@ -1,0 +1,2 @@
+IoType: READ XferType: GPUD
+Throughput: 10.000000 GiB/s, Avg_Latency: 12.00 usecs

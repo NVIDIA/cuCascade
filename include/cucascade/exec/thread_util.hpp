@@ -94,6 +94,12 @@ inline constexpr std::size_t max_thread_name_len = 15;
 [[nodiscard]] std::vector<int> get_thread_affinity(pthread_t handle) noexcept;
 [[nodiscard]] std::vector<int> get_current_thread_affinity() noexcept;
 
+/// Pin the calling thread to those of @p cpu_ids its current affinity already allows, so a
+/// narrower binding it inherited (@c taskset, @c numactl) is kept.  When none are allowed, or
+/// the current affinity cannot be read, the thread is left as it is.  Returns @c false only
+/// when setting the affinity fails.
+[[nodiscard]] bool narrow_current_thread_affinity(std::span<int const> cpu_ids) noexcept;
+
 /// Apply an exact CPU mask to the calling thread for a startup scope, then restore its
 /// original mask. Does not change CUDA/device/TLS state. Empty is a no-op. Construction
 /// throws before user work if the requested mask cannot be applied exactly; destruction

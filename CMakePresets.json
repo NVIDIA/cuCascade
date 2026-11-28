@@ -49,6 +49,36 @@
       }
     },
     {
+      "name": "asan",
+      "displayName": "ASan + UBSan IO tests (CUDA host code)",
+      "inherits": "debug",
+      "binaryDir": "${sourceDir}/build/asan",
+      "cacheVariables": {
+        "CUCASCADE_BUILD_CUDF": "OFF",
+        "CUCASCADE_BUILD_BENCHMARKS": "OFF",
+        "CUCASCADE_BUILD_TESTS": "ON",
+        "CMAKE_CXX_FLAGS": "$env{CXXFLAGS} -fsanitize=address,undefined -fno-omit-frame-pointer",
+        "CMAKE_CUDA_FLAGS": "-Xcompiler=-fsanitize=address -Xcompiler=-fsanitize=undefined -Xcompiler=-fno-omit-frame-pointer",
+        "CMAKE_EXE_LINKER_FLAGS": "$env{LDFLAGS} -fsanitize=address,undefined",
+        "CMAKE_SHARED_LINKER_FLAGS": "$env{LDFLAGS} -fsanitize=address,undefined"
+      }
+    },
+    {
+      "name": "tsan",
+      "displayName": "TSan IO tests",
+      "inherits": "debug",
+      "binaryDir": "${sourceDir}/build/tsan",
+      "cacheVariables": {
+        "CUCASCADE_BUILD_CUDF": "OFF",
+        "CUCASCADE_BUILD_BENCHMARKS": "OFF",
+        "CUCASCADE_BUILD_TESTS": "ON",
+        "CMAKE_CXX_FLAGS": "$env{CXXFLAGS} -fsanitize=thread -fno-omit-frame-pointer -Wno-tsan",
+        "CMAKE_CUDA_FLAGS": "-Xcompiler=-fsanitize=thread -Xcompiler=-fno-omit-frame-pointer -Xcompiler=-Wno-tsan",
+        "CMAKE_EXE_LINKER_FLAGS": "$env{LDFLAGS} -fsanitize=thread",
+        "CMAKE_SHARED_LINKER_FLAGS": "$env{LDFLAGS} -fsanitize=thread"
+      }
+    },
+    {
       "name": "s3-bench",
       "displayName": "S3 benchmark (Release + aws-sdk-cpp)",
       "inherits": "release",
