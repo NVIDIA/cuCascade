@@ -90,6 +90,14 @@ std::atomic<int> copy_stream_query_failure{cudaSuccess};
   return cudaEventRecord(event, stream);
 }
 
+/// cudaStreamSynchronize(@p stream), or at once the status a test injects for the queries of a
+/// copy's stream (see detail::fail_copy_queries_for_testing).
+[[nodiscard]] cudaError_t synchronize_copy_stream(cudaStream_t stream) noexcept
+{
+  auto const status = copy_stream_query_failure.load(std::memory_order_relaxed);
+  return status != cudaSuccess ? static_cast<cudaError_t>(status) : cudaStreamSynchronize(stream);
+}
+
 // Staging geometry: the reactor stages through whole host-resource blocks, so the slot
 // count is derived from a fixed 64 MiB pinned budget per reactor (the footprint before
 // the slot size was tied to the resource's block size) and clamped to [1, MAX_NUM_SLOTS].
@@ -1288,6 +1296,20 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token, std::promise<
       return status;
     };
 
+    // Wait for the work queued on @p stream, where a copy that failed to start may have queued
+    // part of itself, before its buffers are released.  cudaStreamSynchronize also returns errors
+    // of earlier asynchronous work, so one that does not put the context out of service does not
+    // show the stream drained: the stream is asked until it does.
+    auto drain_stream = [&](cudaStream_t stream) noexcept {
+      auto status = synchronize_copy_stream(stream);
+      while (status != cudaSuccess && !cucascade::terminal_cuda_status(status)) {
+        std::ignore = cudaGetLastError();
+        std::this_thread::sleep_for(POLL_INTERVAL);
+        status = injected_or(cudaStreamQuery(stream), copy_stream_query_failure);
+      }
+      std::ignore = cudaGetLastError();
+    };
+
     auto start_device_copy = [&](io_slot& slot) noexcept {
       auto& copy = *slot.op->request.device_copy;
       int device = copy.device_id >= 0 ? copy.device_id : copy.d_buffer.device_id;
@@ -1313,8 +1335,7 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token, std::promise<
           // can fail part-way, or only the event record failed): they still read
           // the staging block and write the destination, so wait for them before
           // the slot (and its staging) is released and the request settles.
-          std::ignore = cudaStreamSynchronize(stream);
-          std::ignore = cudaGetLastError();
+          drain_stream(stream);
           settle_slot_error(slot, status, true);
           return;
         }
@@ -1553,12 +1574,13 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token, std::promise<
           slot.copy_event   = std::make_unique<cucascade::cuda::cuda_event>(cudaEventDisableTiming);
           slot.event_device = device;
         }
-        auto const status = copy.copy_to_host_async(
-          slot.op->request.io_rng, slot.op->request.iovecs, slot.copy_event->get());
+        auto const stream = copy.d_buffer.stream.get();
+        auto status = copy.copy_to_host_async(slot.op->request.io_rng, slot.op->request.iovecs);
+        if (status == cudaSuccess) status = record_copy_event(slot.copy_event->get(), stream);
         if (status != cudaSuccess) {
           // Part of the copy may already be queued into the staging blocks: let
           // the stream pass it before the blocks go back to the pool.
-          std::ignore = cudaStreamSynchronize(copy.d_buffer.stream.get());
+          drain_stream(stream);
           settle_slot_error(slot, status);
           return;
         }
@@ -1566,7 +1588,7 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token, std::promise<
         staging.push_back(slot.index);
         _queued_bytes.fetch_add(slot.op->request.io_rng.size, std::memory_order_relaxed);
       } catch (...) {
-        std::ignore = cudaStreamSynchronize(copy.d_buffer.stream.get());
+        drain_stream(copy.d_buffer.stream.get());
         settle_slot_error(slot, std::current_exception());
       }
     };

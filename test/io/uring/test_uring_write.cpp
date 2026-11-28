@@ -748,6 +748,35 @@ TEST_CASE("uring device writes whose staging copy event reports an error wait fo
   CHECK(std::all_of(contents.begin(), contents.end(), [](std::uint8_t b) { return b == 0xAB; }));
 }
 
+TEST_CASE("uring device writes whose staging copy fails to start wait out a non-fatal stream error",
+          "[io][uring][write]")
+{
+  // The event record fails after the D2H copy was queued.  cudaStreamSynchronize also returns
+  // errors of earlier asynchronous work, so one that does not put the context out of service
+  // does not show the queued copy done: the write settles (and its staging block goes back)
+  // only once the stream does.
+  write_context ctx;
+  scratch_path path;
+  auto object                 = ctx->open_io_object_for_write(path.str());
+  constexpr std::size_t bytes = MiB;
+  device_bytes device{std::vector<std::uint8_t>(bytes, 0x11)};
+  cuda_stream stream;
+  cucascade::io::uring::detail::set_copy_event_record_failure_for_testing(true);
+  struct restore {
+    ~restore()
+    {
+      cucascade::io::uring::detail::set_copy_event_record_failure_for_testing(false);
+      cucascade::io::uring::detail::fail_copy_queries_for_testing(0);
+    }
+  } const restored;
+  cucascade::io::uring::detail::fail_copy_queries_for_testing(cudaSuccess, cudaErrorInvalidValue);
+  auto pending = ctx->device_write_async(*object, 0, bytes, device.get(), stream.ref());
+  std::this_thread::sleep_for(std::chrono::milliseconds{300});
+  CHECK_FALSE(pending.is_ready());
+  cucascade::io::uring::detail::fail_copy_queries_for_testing(0);
+  CHECK_THROWS(std::move(pending).get());
+}
+
 TEST_CASE("uring vectored writes place every segment", "[io][uring][write]")
 {
   auto const split = GENERATE(std::size_t{0}, MiB, 32 * MiB);

@@ -141,14 +141,16 @@ inline void fill_remaining_iovecs(std::span<iovec const> source,
 }
 
 /// Make every uring reactor report a failed CUDA event record after enqueuing
-/// the H2D copy of a staged device read, so tests can check the request does
-/// not settle (and release its staging) while that copy may still run.
+/// the H2D copy of a staged device read or the D2H copy of a staged device
+/// write, so tests can check the request does not settle (and release its
+/// staging) while that copy may still run.
 /// Process-wide; tests only.
 void set_copy_event_record_failure_for_testing(bool enabled) noexcept;
 
 /// Make every uring reactor take @p event_error for each query of a staged copy's event, and
-/// @p stream_error (unless cudaSuccess) for each query of the stream the copy runs on, instead
-/// of the real status, so tests can check how such an error settles the copy.  0 for both
+/// @p stream_error (unless cudaSuccess) for each query of the stream the copy runs on (and at
+/// once for each wait on it after the copy failed to start), instead of the real status, so
+/// tests can check how such an error settles the copy.  0 for both
 /// restores the real queries.  Process-wide; tests only.
 void fail_copy_queries_for_testing(int event_error, int stream_error = 0) noexcept;
 

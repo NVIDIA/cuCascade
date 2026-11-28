@@ -1969,6 +1969,38 @@ TEST_CASE("io_uring device reads fail with the status that put the copy's contex
   ioctx.shutdown();
 }
 
+TEST_CASE("io_uring device reads whose copy fails to start wait out a non-fatal stream error",
+          "[io][uring][gpu]")
+{
+  int devices = 0;
+  if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) {
+    std::ignore = cudaGetLastError();
+    SKIP("requires a CUDA device");
+  }
+  // The event record fails after the H2D copy was queued.  cudaStreamSynchronize also returns
+  // errors of earlier asynchronous work, so one that does not put the context out of service
+  // does not show the queued copy done: the read settles only once the stream does.
+  constexpr std::size_t size = 1UL << 20;
+  pattern_file const file{size};
+  ioctx_staging staging{1};
+  uring_ioctx ioctx{1, staging.context()};
+  ioctx.start();
+  auto const object = file.open();
+  device_scratch dst{size};
+  auto const stream = ::cuda::stream_ref{cudaStream_t{nullptr}};
+
+  copy_event_record_failure const failing_record;
+  auto read = [&] {
+    failing_copy_queries const failing{cudaSuccess, cudaErrorInvalidValue};
+    auto pending = ioctx.device_read_async_io(*object, 0, size, dst.get(), stream);
+    std::this_thread::sleep_for(std::chrono::milliseconds{300});
+    CHECK_FALSE(pending.is_ready());
+    return pending;
+  }();
+  CHECK_THROWS(std::move(read).get(std::chrono::seconds(30)));
+  ioctx.shutdown();
+}
+
 TEST_CASE("io_uring device reads order after the caller's default streams", "[io][uring][gpu]")
 {
   int devices = 0;
